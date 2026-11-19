@@ -2,8 +2,8 @@ import { isDatabaseConfigured, pool } from '../database/pool';
 
 const DEFAULT_PUBLIC_SETTINGS = {
   branding: {
-    appName: 'Pipflowtrades',
-    tickerText: 'WELCOME TO PIPFLOWTRADES — YOUR HUB FOR TRADING KNOWLEDGE, DERIV INDICES, AND MORE',
+    appName: 'TradeDeriv',
+    tickerText: 'WELCOME TO TRADEDERIV — YOUR HUB FOR TRADING KNOWLEDGE, DERIV INDICES, AND MORE',
     kesRate: 130
   },
   global_settings: {
@@ -17,7 +17,7 @@ const DEFAULT_PUBLIC_SETTINGS = {
     withdrawUrl: 'https://app.deriv.com/cashier/withdrawal',
     cashierNote: 'Deposit or withdraw instantly via Official Deriv Cashier or M-Pesa / KES Payment Agent.',
     riskDisclaimerText:
-      'Pipflowtrades connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.',
+      'TradeDeriv connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.',
     enabledTabs: [
       'dashboard',
       'bot_builder',

@@ -20,7 +20,9 @@ import { closeDerivContract } from '../integrations/deriv/trade-execution';
 import { buildDerivOAuthUrl, resolveOAuthRedirectUri, usesNewDerivOAuth2 } from './derivController';
 
 export async function getAdminBootstrapStatus(_req: Request, res: Response) {
-  const q = await pool.query(`SELECT COUNT(*)::int AS cnt FROM users WHERE role_id = 2`);
+  const q = await pool.query(
+    `SELECT COUNT(*)::int AS cnt FROM users u JOIN roles r ON u.role_id = r.id WHERE r.name = 'admin'`
+  );
   const count = q.rows[0]?.cnt ?? 0;
   res.json({ initialized: count > 0 });
 }
@@ -36,39 +38,46 @@ export async function bootstrapAdmin(req: Request, res: Response) {
     return res.status(400).json({ error: 'Valid administrator email and password (min 8 chars) required' });
   }
 
-  const countRes = await pool.query(`SELECT COUNT(*)::int AS cnt FROM users WHERE role_id = 2`);
+  await pool.query(
+    `INSERT INTO roles (id, name, description) VALUES (2, 'admin', 'Platform administrator') ON CONFLICT (name) DO NOTHING`
+  );
+  const roleRes = await pool.query(`SELECT id FROM roles WHERE name = 'admin' LIMIT 1`);
+  const adminRoleId = Number(roleRes.rows[0]?.id ?? 2);
+
+  const countRes = await pool.query(
+    `SELECT COUNT(*)::int AS cnt FROM users u JOIN roles r ON u.role_id = r.id WHERE r.name = 'admin'`
+  );
   if ((countRes.rows[0]?.cnt ?? 0) > 0) {
     return res.status(409).json({
       error: 'Administrator is already configured in the database. Sign in with your database admin email and password.'
     });
   }
 
-  const existing = await pool.query(`SELECT * FROM users WHERE email = $1`, [cleanEmail]);
-  let adminUser = existing.rows[0];
-  let passwordHash = '';
+  const passwordHash = await bcrypt.hash(password, 10);
+  const existing = await pool.query(`SELECT id FROM users WHERE email = $1`, [cleanEmail]);
+  let adminUser;
 
-  if (adminUser) {
-    const validExisting = await bcrypt.compare(password, adminUser.password_hash);
-    if (!validExisting) {
-      return res.status(401).json({
-        error: 'An account with this email already exists. Enter its current password to promote it to administrator.'
-      });
-    }
-    passwordHash = adminUser.password_hash;
+  if (existing.rows[0]) {
     const updated = await pool.query(
-      `UPDATE users SET role_id = 2, is_email_verified = TRUE, is_active = TRUE, last_login_at = NOW(), updated_at = NOW()
-       WHERE id = $1
+      `UPDATE users
+       SET password_hash = $1,
+           full_name = COALESCE(NULLIF($2, ''), full_name, 'Platform Administrator'),
+           role_id = $3,
+           is_email_verified = TRUE,
+           is_active = TRUE,
+           last_login_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $4
        RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency`,
-      [adminUser.id]
+      [passwordHash, fullName?.trim() || '', adminRoleId, existing.rows[0].id]
     );
     adminUser = updated.rows[0];
   } else {
-    passwordHash = await bcrypt.hash(password, 10);
     const inserted = await pool.query(
-      `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, last_login_at)
-       VALUES ($1, $2, $3, 2, TRUE, NOW())
+      `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, is_active, last_login_at)
+       VALUES ($1, $2, $3, $4, TRUE, TRUE, NOW())
        RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency`,
-      [cleanEmail, passwordHash, fullName?.trim() || 'Platform Administrator']
+      [cleanEmail, passwordHash, fullName?.trim() || 'Platform Administrator', adminRoleId]
     );
     adminUser = inserted.rows[0];
   }

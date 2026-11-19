@@ -296,7 +296,9 @@ export const AdminDashboard: React.FC = () => {
   useEffect(() => {
     apiFetch<{ initialized: boolean }>('/admin/bootstrap-status')
       .then((res) => setAdminInitialized(res.initialized))
-      .catch(() => {})
+      .catch((err) => {
+        setError((err as Error).message || 'Unable to verify database bootstrap status');
+      })
       .finally(() => setBootstrapChecked(true));
   }, []);
 
@@ -436,9 +438,9 @@ export const AdminDashboard: React.FC = () => {
               <Shield className="w-5 h-5" />
               <span>
                 {!bootstrapChecked
-                  ? 'Pipflowtrades Owner Auth'
+                  ? 'Checking Database Setup...'
                   : adminInitialized
-                    ? 'Pipflowtrades Owner Console'
+                    ? 'TradeDeriv Owner Console'
                     : 'Initialize Owner Account'}
               </span>
             </div>
@@ -447,9 +449,11 @@ export const AdminDashboard: React.FC = () => {
             </button>
           </div>
           <p className="text-xs text-slate-400">
-            {adminInitialized
-              ? 'Sign in with your PostgreSQL owner/administrator credentials to manage live Deriv commissions, users, bots, and orders.'
-              : 'No administrator exists yet. Configure the platform owner credentials to initialize the console.'}
+            {!bootstrapChecked
+              ? 'Verifying PostgreSQL owner configuration...'
+              : adminInitialized
+                ? 'Sign in with your PostgreSQL owner/administrator credentials to manage live Deriv commissions, users, bots, and orders.'
+                : 'No administrator exists yet. Set your platform owner email and password below to initialize the console.'}
           </p>
           {error && (
             <div className="rounded-lg bg-rose-950/60 border border-rose-700 px-3 py-2 text-xs text-rose-300">
@@ -457,7 +461,7 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
           <form onSubmit={handleAdminAuth} className="space-y-3">
-            {!adminInitialized && (
+            {bootstrapChecked && !adminInitialized && (
               <input
                 type="text"
                 value={fullName}
@@ -478,20 +482,22 @@ export const AdminDashboard: React.FC = () => {
               type="password"
               value={loginPwd}
               onChange={(e) => setLoginPwd(e.target.value)}
-              placeholder={adminInitialized ? 'Owner Password' : 'Create Owner Password (min 8 chars)'}
+              placeholder={!bootstrapChecked || adminInitialized ? 'Owner Password' : 'Create Owner Password (min 8 chars)'}
               className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm"
               required
             />
             <button
               type="submit"
-              disabled={authSubmitting}
+              disabled={!bootstrapChecked || authSubmitting}
               className="w-full py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-60 font-bold text-sm"
             >
-              {authSubmitting
-                ? 'Authenticating...'
-                : adminInitialized
-                  ? 'Sign In to Owner Console'
-                  : 'Save Owner Credentials'}
+              {!bootstrapChecked
+                ? 'Checking Setup...'
+                : authSubmitting
+                  ? 'Authenticating...'
+                  : adminInitialized
+                    ? 'Sign In to Owner Console'
+                    : 'Save Owner Credentials'}
             </button>
           </form>
         </div>

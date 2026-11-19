@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pipflowtrades
+    name: tradederiv
     runtime: node
     plan: starter
     buildCommand: npm install --include=dev && npm run build
@@ -18,7 +18,7 @@ services:
       - key: BOT_GATE_JWT_SECRET
         generateValue: true
       - key: TOKEN_ENCRYPTION_KEY
-        sync: false
+        generateValue: true
       - key: DERIV_APP_ID
         sync: false
       - key: DERIV_CLIENT_SECRET
@@ -30,18 +30,14 @@ services:
       - key: DERIV_OAUTH_SCOPES
         value: trade account_manage
       - key: DERIV_WS_URL
-        value: wss://red.derivws.com/websockets/v3
+        value: wss://ws.derivws.com/websockets/v3
       - key: BREVO_API_KEY
         sync: false
       - key: BREVO_SENDER_EMAIL
         sync: false
       - key: BREVO_SENDER_NAME
-        value: Pipflowtrades
+        value: TradeDeriv
       - key: FRONTEND_URL
         sync: false
-      - key: ADMIN_PRIVATE_SLUG
-        value: pf-ops-9482
       - key: VITE_DERIV_APP_ID
         sync: false
-      - key: VITE_ADMIN_PRIVATE_SLUG
-        value: pf-ops-9482

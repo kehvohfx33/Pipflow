@@ -2,11 +2,12 @@ import crypto from 'crypto';
 import { env } from '../config/env';
 
 function getKeyBuffer(): Buffer {
-  const hex = env.tokenEncryptionKey.trim();
-  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
-    throw new Error('TOKEN_ENCRYPTION_KEY must be a 64-character hex string (32 bytes for AES-256-GCM)');
+  const raw = env.tokenEncryptionKey.trim();
+  if (/^[0-9a-fA-F]{64}$/.test(raw)) {
+    return Buffer.from(raw, 'hex');
   }
-  return Buffer.from(hex, 'hex');
+  const source = raw || env.jwtSecret;
+  return crypto.createHash('sha256').update(source).digest();
 }
 
 export function encryptToken(plainToken: string): { encrypted: string; iv: string; authTag: string } {

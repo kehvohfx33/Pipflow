@@ -252,13 +252,46 @@ async function fetchLegacyWsSupplementary(params: {
   }
 }
 
+function extractDerivRestError(rawText: string, status: number): {
+  message?: string;
+  meta?: PartnerMarkupRestResponse['meta'];
+  data?: PartnerMarkupRestResponse['data'];
+} {
+  if (!rawText) return {};
+  try {
+    const body = JSON.parse(rawText) as Omit<PartnerMarkupRestResponse, 'error' | 'errors'> & {
+      error_description?: string;
+      error?: string | { message?: string; code?: string };
+      errors?: Array<{ code?: string; message?: string; detail?: string; status?: number }>;
+    };
+    const errItem = body.errors?.[0];
+    const nestedErr =
+      body.error && typeof body.error === 'object'
+        ? body.error.message || body.error.code
+        : typeof body.error === 'string'
+          ? body.error
+          : undefined;
+    const message =
+      errItem?.message ||
+      errItem?.detail ||
+      body.error_description ||
+      body.message ||
+      nestedErr ||
+      (errItem?.code ? `${errItem.code} (HTTP ${status})` : undefined);
+    return { message, meta: body.meta, data: body.data };
+  } catch {
+    const clean = rawText.replace(/<[^>]+>/g, ' ').trim();
+    return { message: clean ? clean.slice(0, 220) : undefined };
+  }
+}
+
 export async function fetchDerivAppMarkupReport(params: {
   token: string;
   appId?: string;
   dateFrom: string;
   dateTo: string;
 }): Promise<DerivAppMarkupStats> {
-  const cleanToken = params.token.trim();
+  const cleanToken = params.token.trim().replace(/^Bearer\s+/i, '').trim();
   const configuredAppId = (params.appId?.trim() || env.derivAppId.trim() || '').trim();
   const numericWsAppId = /^\d+$/.test(configuredAppId) ? configuredAppId : '1089';
   const tokenType = detectTokenType(cleanToken);
@@ -290,11 +323,12 @@ export async function fetchDerivAppMarkupReport(params: {
     date_to: params.dateTo.slice(0, 10)
   });
   const restUrl = `https://api.derivws.com/applications/v1/markup-statistics?${qs.toString()}`;
-  const headers: Record<string, string> = {
+  const baseHeaders: Record<string, string> = {
     Authorization: `Bearer ${cleanToken}`,
     Accept: 'application/json'
   };
-  if (configuredAppId) {
+  const headers: Record<string, string> = { ...baseHeaders };
+  if (tokenType !== 'oauth2' && configuredAppId) {
     headers['Deriv-App-ID'] = configuredAppId;
   }
 
@@ -304,20 +338,33 @@ export async function fetchDerivAppMarkupReport(params: {
   let restMeta: PartnerMarkupRestResponse['meta'] | undefined;
 
   try {
-    const restRes = await fetch(restUrl, { method: 'GET', headers });
-    restHttpStatus = restRes.status;
-    const body = (await restRes.json().catch(() => ({}))) as PartnerMarkupRestResponse;
-    restMeta = body.meta;
+    let restRes = await fetch(restUrl, { method: 'GET', headers });
+    // If a non-prefixed OAuth2 JWT/Bearer token was classified as 'pat' and failed with Deriv-App-ID, retry once without it
+    if (restRes.status === 401 && tokenType === 'pat' && headers['Deriv-App-ID']) {
+      const retryRes = await fetch(restUrl, { method: 'GET', headers: baseHeaders });
+      if (retryRes.ok || retryRes.status !== 401) {
+        restRes = retryRes;
+      }
+    }
 
-    if (restRes.ok && body.data) {
-      restData = body.data;
+    restHttpStatus = restRes.status;
+    const rawText = await restRes.text().catch(() => '');
+    const parsed = extractDerivRestError(rawText, restRes.status);
+    restMeta = parsed.meta;
+
+    if (restRes.ok && parsed.data) {
+      restData = parsed.data;
+    } else if (restRes.status === 401) {
+      const upstreamDetail = parsed.message ? ` (${parsed.message})` : '';
+      if (tokenType === 'legacy') {
+        restError = `Deriv Partners API returned HTTP 401${upstreamDetail}. Your saved token (${cleanToken.length} chars) looks like a classic Deriv WebSocket API token rather than a developers.deriv.com token. Click "Connect Owner Token via Deriv (application_read)" above or paste a Personal Access Token (PAT) from developers.deriv.com.`;
+      } else if (tokenType === 'oauth2') {
+        restError = `Deriv Partners API returned HTTP 401${upstreamDetail}. Your Owner OAuth2 token may be expired or missing the "application_read" scope. Click "Reconnect Owner Token via Deriv OAuth2" above with the Deriv account that owns this app.`;
+      } else {
+        restError = `Deriv Partners API returned HTTP 401${upstreamDetail}. Verify that you pasted a valid developers.deriv.com Personal Access Token (PAT) with "application_read" scope (not a Client Secret or legacy app.deriv.com token) and that Deriv App ID / Client ID matches your registered app.`;
+      }
     } else {
-      const msg =
-        body.errors?.[0]?.message ||
-        body.message ||
-        body.error ||
-        `Deriv Partners API returned HTTP ${restRes.status}`;
-      restError = msg;
+      restError = parsed.message || `Deriv Partners API returned HTTP ${restRes.status}`;
     }
   } catch (err) {
     restError = `Deriv Partners REST request failed: ${(err as Error).message}`;

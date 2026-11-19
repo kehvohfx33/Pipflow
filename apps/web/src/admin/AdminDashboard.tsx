@@ -136,6 +136,7 @@ interface CommissionsResponse {
     usesNewOAuth2: boolean;
     hasOwnerToken: boolean;
     tokenType: 'oauth2' | 'pat' | 'legacy' | 'none';
+    tokenScopes?: string[];
     restHttpStatus: number | null;
     requiredScope: string;
     restEndpoint: string;
@@ -305,6 +306,18 @@ export const AdminDashboard: React.FC = () => {
   useEffect(() => {
     const hashQuery = window.location.hash.includes('?') ? window.location.hash.split('?')[1] : '';
     const params = new URLSearchParams(hashQuery);
+    const commErr = params.get('commission_error');
+    if (commErr) {
+      try {
+        sessionStorage.setItem('pf_secret_console', '1');
+      } catch {
+        // ignore
+      }
+      setError(`Deriv Owner OAuth error: ${commErr}`);
+      setActiveSection('commissions');
+      window.history.replaceState({}, document.title, window.location.pathname + '#/_console');
+      return;
+    }
     if (params.get('commission_connected') === '1') {
       try {
         sessionStorage.setItem('pf_secret_console', '1');
@@ -825,9 +838,16 @@ export const AdminDashboard: React.FC = () => {
                       <div className="text-[10px] text-slate-400 uppercase font-bold">Owner Token Status</div>
                       <div className="font-mono font-bold mt-0.5">
                         {commData?.diagnostics?.hasOwnerToken ? (
-                          <span className="text-emerald-600">
-                            Connected ({commData.diagnostics.tokenType.toUpperCase()})
-                          </span>
+                          <div className="space-y-0.5">
+                            <span className="text-emerald-600">
+                              Connected ({commData.diagnostics.tokenType.toUpperCase()})
+                            </span>
+                            {(commData.diagnostics.tokenScopes ?? []).length > 0 && (
+                              <div className="text-[10px] font-normal text-slate-500">
+                                Scopes: {commData.diagnostics.tokenScopes!.join(', ')}
+                              </div>
+                            )}
+                          </div>
                         ) : (
                           <span className="text-amber-600">Pending Owner Token</span>
                         )}

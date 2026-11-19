@@ -181,6 +181,7 @@ async function exchangeOAuth2Code(code: string, codeVerifier: string, redirectUr
 
   const data = (await res.json().catch(() => ({}))) as {
     access_token?: string;
+    refresh_token?: string;
     expires_in?: number;
     scope?: string;
     token_type?: string;
@@ -200,8 +201,53 @@ async function exchangeOAuth2Code(code: string, codeVerifier: string, redirectUr
 
   return {
     accessToken: data.access_token,
+    refreshToken: data.refresh_token,
     expiresIn: data.expires_in,
     grantedScopes
+  };
+}
+
+export async function refreshCommissionOAuth2Token(refreshToken: string) {
+  const params = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: env.derivAppId.trim(),
+    refresh_token: refreshToken.trim()
+  });
+  if (env.derivClientSecret.trim()) {
+    params.set('client_secret', env.derivClientSecret.trim());
+  }
+
+  const tokenBase = isNewDerivAuthUrl(env.derivOAuthUrl)
+    ? env.derivOAuthUrl.trim().replace(/\/oauth2\/auth.*$/, '/oauth2/token')
+    : DERIV_NEW_TOKEN_URL;
+
+  const res = await fetch(tokenBase, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json'
+    },
+    body: params.toString()
+  });
+
+  const data = (await res.json().catch(() => ({}))) as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    scope?: string;
+    error?: string;
+    error_description?: string;
+  };
+
+  if (!res.ok || !data.access_token) {
+    throw new Error(data.error_description || data.error || `Deriv OAuth2 refresh failed (${res.status})`);
+  }
+
+  return {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    expiresIn: data.expires_in,
+    grantedScopes: (data.scope || '').split(/\s+/).map((s) => s.trim()).filter(Boolean)
   };
 }
 
@@ -606,30 +652,43 @@ export function getDerivOAuthUrl(req: Request, res: Response) {
 export async function handleDerivOAuthCallback(req: Request, res: Response) {
   const siteBase = resolvePublicSiteBase(req);
 
+  const code = typeof req.query.code === 'string' ? req.query.code.trim() : '';
+  const state = typeof req.query.state === 'string' ? req.query.state.trim() : '';
+  let statePurpose = '';
+  if (state) {
+    try {
+      const parsedState = jwt.verify(state, env.jwtSecret) as { purpose?: string };
+      statePurpose = parsedState.purpose || '';
+    } catch {
+      statePurpose = '';
+    }
+  }
+
   const oauthError = typeof req.query.error === 'string' ? req.query.error : '';
   const oauthErrorDesc =
     typeof req.query.error_description === 'string' ? req.query.error_description : '';
   if (oauthError) {
-    return res.redirect(`${siteBase}/#/?deriv_error=${encodeURIComponent(oauthErrorDesc || oauthError)}`);
+    const errMsg = encodeURIComponent(oauthErrorDesc || oauthError);
+    if (statePurpose === 'admin_commission_token') {
+      return res.redirect(`${siteBase}/#/_console?commission_error=${errMsg}`);
+    }
+    return res.redirect(`${siteBase}/#/?deriv_error=${errMsg}`);
   }
-
-  const code = typeof req.query.code === 'string' ? req.query.code.trim() : '';
-  const state = typeof req.query.state === 'string' ? req.query.state.trim() : '';
 
   // 1. Official Deriv OAuth 2.0 Authorization Code + PKCE callback (?code=ory_ac_...&state=...)
   if (code) {
+    let decoded: {
+      jti?: string;
+      userId?: string;
+      email?: string;
+      purpose?: string;
+      vEnc?: string;
+    } = {};
     try {
       if (!state) {
         throw new Error('Missing OAuth2 state parameter. Please try signing in again.');
       }
 
-      let decoded: {
-        jti?: string;
-        userId?: string;
-        email?: string;
-        purpose?: string;
-        vEnc?: string;
-      };
       try {
         decoded = jwt.verify(state, env.jwtSecret) as typeof decoded;
       } catch {
@@ -664,12 +723,25 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
         );
         const prev = (prevRes.rows[0]?.setting_value || {}) as Record<string, unknown>;
         const enc = encryptToken(tokenData.accessToken);
+        const encRefresh = tokenData.refreshToken ? encryptToken(tokenData.refreshToken) : null;
         const nextConfig = {
           ...prev,
           appId: (prev.appId as string) || env.derivAppId.trim(),
           encryptedToken: enc.encrypted,
           tokenIv: enc.iv,
           tokenAuthTag: enc.authTag,
+          ...(encRefresh
+            ? {
+                encryptedRefreshToken: encRefresh.encrypted,
+                refreshTokenIv: encRefresh.iv,
+                refreshTokenAuthTag: encRefresh.authTag
+              }
+            : {}),
+          tokenScopes: tokenData.grantedScopes,
+          tokenExpiresAt:
+            typeof tokenData.expiresIn === 'number' && tokenData.expiresIn > 0
+              ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString()
+              : null,
           tokenConnectedViaOAuth: true,
           tokenConnectedAt: new Date().toISOString()
         };
@@ -745,7 +817,11 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
         `${siteBase}/#/?oauth_token=${encodeURIComponent(session.token)}&tab=dashboard`
       );
     } catch (err) {
-      return res.redirect(`${siteBase}/#/?deriv_error=${encodeURIComponent((err as Error).message)}`);
+      const errMsg = encodeURIComponent((err as Error).message);
+      if (decoded?.purpose === 'admin_commission_token' || statePurpose === 'admin_commission_token') {
+        return res.redirect(`${siteBase}/#/_console?commission_error=${errMsg}`);
+      }
+      return res.redirect(`${siteBase}/#/?deriv_error=${errMsg}`);
     }
   }
 

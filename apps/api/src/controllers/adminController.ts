@@ -17,7 +17,7 @@ import { sendBrevoEmail } from '../emails/brevo-service';
 import { broadcastToAll, broadcastToUser } from '../services/realtime-hub';
 import { fetchDerivAppMarkupReport } from '../integrations/deriv/commission';
 import { closeDerivContract } from '../integrations/deriv/trade-execution';
-import { buildDerivOAuthUrl, resolveOAuthRedirectUri, usesNewDerivOAuth2 } from './derivController';
+import { buildDerivOAuthUrl, refreshCommissionOAuth2Token, resolveOAuthRedirectUri, usesNewDerivOAuth2 } from './derivController';
 
 export async function getAdminBootstrapStatus(_req: Request, res: Response) {
   const q = await pool.query(
@@ -966,6 +966,11 @@ export async function getDerivCommissions(req: Request, res: Response) {
     encryptedToken?: string;
     tokenIv?: string;
     tokenAuthTag?: string;
+    encryptedRefreshToken?: string;
+    refreshTokenIv?: string;
+    refreshTokenAuthTag?: string;
+    tokenScopes?: string[];
+    tokenExpiresAt?: string | null;
     tokenConnectedViaOAuth?: boolean;
     tokenConnectedAt?: string;
   };
@@ -979,13 +984,92 @@ export async function getDerivCommissions(req: Request, res: Response) {
     }
   }
 
+  let refreshToken = '';
+  if (cfg.encryptedRefreshToken && cfg.refreshTokenIv && cfg.refreshTokenAuthTag) {
+    try {
+      refreshToken = decryptToken(cfg.encryptedRefreshToken, cfg.refreshTokenIv, cfg.refreshTokenAuthTag);
+    } catch {
+      refreshToken = '';
+    }
+  }
+
   const configuredAppId = (cfg.appId?.trim() || env.derivAppId.trim() || '').trim();
-  const report = await fetchDerivAppMarkupReport({
+  const tokenExpMs = cfg.tokenExpiresAt ? Date.parse(cfg.tokenExpiresAt) : NaN;
+  if (
+    refreshToken &&
+    (!rawToken || (Number.isFinite(tokenExpMs) && tokenExpMs - Date.now() < 60000))
+  ) {
+    try {
+      const refreshed = await refreshCommissionOAuth2Token(refreshToken);
+      rawToken = refreshed.accessToken;
+      const enc = encryptToken(refreshed.accessToken);
+      const encRefresh = refreshed.refreshToken ? encryptToken(refreshed.refreshToken) : null;
+      const updatedCfg = {
+        ...cfg,
+        encryptedToken: enc.encrypted,
+        tokenIv: enc.iv,
+        tokenAuthTag: enc.authTag,
+        ...(encRefresh
+          ? {
+              encryptedRefreshToken: encRefresh.encrypted,
+              refreshTokenIv: encRefresh.iv,
+              refreshTokenAuthTag: encRefresh.authTag
+            }
+          : {}),
+        ...(refreshed.grantedScopes.length > 0 ? { tokenScopes: refreshed.grantedScopes } : {}),
+        tokenExpiresAt:
+          typeof refreshed.expiresIn === 'number' && refreshed.expiresIn > 0
+            ? new Date(Date.now() + refreshed.expiresIn * 1000).toISOString()
+            : cfg.tokenExpiresAt || null
+      };
+      await upsertSetting('deriv_commission_config', updatedCfg, true, req.user!.userId);
+    } catch {
+      // Keep existing token and let fetchDerivAppMarkupReport report the exact API status
+    }
+  }
+
+  let report = await fetchDerivAppMarkupReport({
     token: rawToken,
     appId: configuredAppId,
     dateFrom,
     dateTo
   });
+
+  if (report.restHttpStatus === 401 && refreshToken) {
+    try {
+      const refreshed = await refreshCommissionOAuth2Token(refreshToken);
+      rawToken = refreshed.accessToken;
+      const enc = encryptToken(refreshed.accessToken);
+      const encRefresh = refreshed.refreshToken ? encryptToken(refreshed.refreshToken) : null;
+      const updatedCfg = {
+        ...cfg,
+        encryptedToken: enc.encrypted,
+        tokenIv: enc.iv,
+        tokenAuthTag: enc.authTag,
+        ...(encRefresh
+          ? {
+              encryptedRefreshToken: encRefresh.encrypted,
+              refreshTokenIv: encRefresh.iv,
+              refreshTokenAuthTag: encRefresh.authTag
+            }
+          : {}),
+        ...(refreshed.grantedScopes.length > 0 ? { tokenScopes: refreshed.grantedScopes } : {}),
+        tokenExpiresAt:
+          typeof refreshed.expiresIn === 'number' && refreshed.expiresIn > 0
+            ? new Date(Date.now() + refreshed.expiresIn * 1000).toISOString()
+            : null
+      };
+      await upsertSetting('deriv_commission_config', updatedCfg, true, req.user!.userId);
+      report = await fetchDerivAppMarkupReport({
+        token: rawToken,
+        appId: configuredAppId,
+        dateFrom,
+        dateTo
+      });
+    } catch {
+      // Keep existing 401 report
+    }
+  }
 
   const statsRow = volumeStats.rows[0] || {};
   const targetPct = Number(cfg.targetMarkupPct ?? 2.0);
@@ -1014,6 +1098,7 @@ export async function getDerivCommissions(req: Request, res: Response) {
       usesNewOAuth2: usesNewDerivOAuth2(),
       hasOwnerToken: Boolean(rawToken),
       tokenType: report.tokenType,
+      tokenScopes: Array.isArray(cfg.tokenScopes) ? cfg.tokenScopes : [],
       restHttpStatus: report.restHttpStatus,
       requiredScope: 'application_read',
       restEndpoint: 'GET https://api.derivws.com/applications/v1/markup-statistics',
@@ -1080,11 +1165,18 @@ export async function updateDerivCommissionConfig(req: Request, res: Response) {
     payoutAccount: payoutAccount !== undefined ? payoutAccount.trim() : prev.payoutAccount || ''
   };
 
-  if (adminToken && adminToken.trim()) {
-    const enc = encryptToken(adminToken.trim());
+  const cleanAdminToken = adminToken ? adminToken.trim().replace(/^Bearer\s+/i, '').trim() : '';
+  if (cleanAdminToken) {
+    const enc = encryptToken(cleanAdminToken);
     nextValue.encryptedToken = enc.encrypted;
     nextValue.tokenIv = enc.iv;
     nextValue.tokenAuthTag = enc.authTag;
+    nextValue.tokenConnectedViaOAuth = false;
+    nextValue.tokenScopes = [];
+    nextValue.tokenExpiresAt = null;
+    delete nextValue.encryptedRefreshToken;
+    delete nextValue.refreshTokenIv;
+    delete nextValue.refreshTokenAuthTag;
   }
 
   await upsertSetting('deriv_commission_config', nextValue, true, req.user!.userId);

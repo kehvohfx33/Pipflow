@@ -430,7 +430,10 @@ const HiddenAdminGate: React.FC = () => {
   }
 
   const hashQuery = window.location.hash.includes('?') ? window.location.hash.split('?')[1] : '';
-  const isOAuthReturn = user?.role === 'admin' && new URLSearchParams(hashQuery).get('commission_connected') === '1';
+  const hashParams = new URLSearchParams(hashQuery);
+  const isOAuthReturn =
+    user?.role === 'admin' &&
+    (hashParams.get('commission_connected') === '1' || Boolean(hashParams.get('commission_error')));
 
   if (!unlocked && !isOAuthReturn) {
     return <Navigate to="/" replace />;

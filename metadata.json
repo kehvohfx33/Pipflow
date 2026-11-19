@@ -1,0 +1,6 @@
+{
+  "name": "PIPFLOW",
+  "description": "PIPFLOW — Official Deriv API Trading Terminal, Market Analyser & Automated Paper Bot Platform",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

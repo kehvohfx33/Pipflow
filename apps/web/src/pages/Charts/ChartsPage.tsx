@@ -36,14 +36,29 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   onOpenTradingView,
   onSymbolChange
 }) => {
-  const { token, darkTheme, activeDerivAccount, refreshDerivAccounts, refreshProfile } = useAuth();
+  const {
+    token,
+    darkTheme,
+    activeDerivAccount,
+    refreshDerivAccounts,
+    refreshProfile,
+    orderVersion,
+    bumpOrderVersion
+  } = useAuth();
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
   const barrierLinesRef = useRef<IPriceLine[]>([]);
   const lastBarTimeRef = useRef<number>(0);
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
   const [symbol, setSymbol] = useState(symbolProp || 'R_25');
-  const [granularity, setGranularity] = useState(60);
+  const [granularity, setGranularityState] = useState(() => {
+    const saved = Number(localStorage.getItem('pipflow_chart_granularity'));
+    return Number.isFinite(saved) && saved > 0 ? saved : 60;
+  });
+  const setGranularity = (g: number) => {
+    setGranularityState(g);
+    localStorage.setItem('pipflow_chart_granularity', String(g));
+  };
   const [latestPrice, setLatestPrice] = useState(0);
   const [stake, setStake] = useState(10);
   const [side, setSide] = useState<'BUY' | 'SELL'>('BUY');
@@ -70,7 +85,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
 
   useEffect(() => {
     loadOpenOrders();
-  }, [token]);
+  }, [token, orderVersion]);
 
   useEffect(() => {
     let cancelled = false;
@@ -298,6 +313,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
       refreshDerivAccounts(false);
       refreshProfile();
       loadOpenOrders();
+      bumpOrderVersion();
       if (res.derivExecution) {
         setNotice(
           `Executed ${tradeSide} on ${activeDerivAccount?.account_type === 'real' ? 'Real' : 'Demo'} Account (#${res.derivExecution.contractId}) · ${symbol} @ ${latestPrice.toFixed(3)}.`

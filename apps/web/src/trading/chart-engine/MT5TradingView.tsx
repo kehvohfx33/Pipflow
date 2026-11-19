@@ -56,7 +56,16 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   onSymbolChange,
   onWatchSymbolsChange
 }) => {
-  const { token, user, darkTheme, activeDerivAccount, refreshProfile, refreshDerivAccounts } = useAuth();
+  const {
+    token,
+    user,
+    darkTheme,
+    activeDerivAccount,
+    refreshProfile,
+    refreshDerivAccounts,
+    orderVersion,
+    bumpOrderVersion
+  } = useAuth();
   const containerRef = useRef<HTMLDivElement>(null);
   const progressChartRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -68,7 +77,14 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   const activeToolRef = useRef<DrawingTool>('crosshair');
 
   const [symbol, setSymbol] = useState(symbolProp || 'R_25');
-  const [granularity, setGranularity] = useState(86400);
+  const [granularity, setGranularityState] = useState(() => {
+    const saved = Number(localStorage.getItem('pipflow_chart_granularity'));
+    return Number.isFinite(saved) && saved > 0 ? saved : 86400;
+  });
+  const setGranularity = (g: number) => {
+    setGranularityState(g);
+    localStorage.setItem('pipflow_chart_granularity', String(g));
+  };
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
   const [watchlist, setWatchlist] = useState<string[]>(['R_25', 'R_100', '1HZ90V']);
   const [activeTool, setActiveTool] = useState<DrawingTool>('crosshair');
@@ -88,7 +104,14 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   // MT5 Virtual & Deriv Order states (SL/TP default to USD currency count)
   const [lotSize, setLotSize] = useState(0.1);
   const [stake, setStake] = useState(10);
-  const [orderMode, setOrderMode] = useState<OrderTicketMode>('MT5');
+  const [orderMode, setOrderModeState] = useState<OrderTicketMode>(() => {
+    const saved = localStorage.getItem('pipflow_order_mode');
+    return saved === 'OVER_UNDER' || saved === 'RISE_FALL' ? saved : 'MT5';
+  });
+  const setOrderMode = (m: OrderTicketMode) => {
+    setOrderModeState(m);
+    localStorage.setItem('pipflow_order_mode', m);
+  };
   const [digitPrediction, setDigitPrediction] = useState(4);
   const [durationTicks, setDurationTicks] = useState(5);
   const [bulkCount, setBulkCount] = useState(1);
@@ -185,6 +208,12 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
       })
       .catch(() => {});
   };
+
+  useEffect(() => {
+    if (token && orderVersion > 0) {
+      loadOrders();
+    }
+  }, [token, orderVersion]);
 
   useEffect(() => {
     if (!token) return;
@@ -635,6 +664,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
         setOrderNotice(`Placed ${side} ${lotSize.toFixed(2)} lots on ${symbol} @ ${latestClose.toFixed(4)}`);
       }
       loadOrders();
+      bumpOrderVersion();
       refreshDerivAccounts(false);
       refreshProfile();
     } catch (err) {
@@ -652,6 +682,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
         body: JSON.stringify({ exitPrice: latestClose })
       });
       loadOrders();
+      bumpOrderVersion();
       refreshDerivAccounts(false);
       refreshProfile();
     } catch (err) {
@@ -678,6 +709,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
         }${res.totalPnl.toFixed(2)} USD`
       );
       loadOrders();
+      bumpOrderVersion();
       refreshDerivAccounts(false);
       refreshProfile();
     } catch (err) {

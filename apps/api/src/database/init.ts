@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS virtual_orders (
   take_profit NUMERIC(18, 8),
   exit_price NUMERIC(18, 8),
   pnl NUMERIC(18, 2) NOT NULL DEFAULT 0,
+  contract_meta JSONB,
   status VARCHAR(24) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED_TP', 'CLOSED_SL', 'CLOSED_MANUAL')),
   opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   closed_at TIMESTAMPTZ
@@ -168,6 +169,7 @@ ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS deriv_contract_id BIGINT;
 ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS execution_mode VARCHAR(24) NOT NULL DEFAULT 'virtual';
 ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS contract_type VARCHAR(32) DEFAULT 'MULTUP';
 ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS payout NUMERIC(18, 4);
+ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS contract_meta JSONB;
 
 CREATE TABLE IF NOT EXISTS bot_strategies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

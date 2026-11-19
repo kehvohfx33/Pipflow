@@ -3,6 +3,7 @@ import { pool } from '../database/pool';
 import { ensureLiveTickSubscription } from '../services/market-data-service';
 import { closeAllBotOrders, startBotSession, stopBotSession, getBotStatus } from '../services/bot-engine-service';
 import { createNotification } from '../services/notification-service';
+import { broadcastToUser } from '../services/realtime-hub';
 import { derivConnectionManager } from '../integrations/deriv/connection-manager';
 import { fetchTickHistory } from '../integrations/deriv/candles';
 import {
@@ -246,6 +247,7 @@ export async function placeVirtualOrder(req: Request, res: Response) {
         `${exec.accountType.toUpperCase()} Trade Executed (${symbol})`,
         `${side} ${exec.contractType} #${exec.contractId} · Stake ${exec.buyPrice} · Balance: ${exec.balanceAfter.toFixed(2)}`
       );
+      broadcastToUser(req.user!.userId, { type: 'bot_order_opened', order: q.rows[0] });
 
       return res.status(201).json({
         order: q.rows[0],
@@ -261,20 +263,33 @@ export async function placeVirtualOrder(req: Request, res: Response) {
   }
 
   // Fallback to Virtual Workspace Ledger when no Deriv account is connected or virtual mode is chosen
+  const resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
+  const isShortTermContract =
+    resolvedContract.startsWith('DIGIT') || resolvedContract === 'CALL' || resolvedContract === 'PUT';
+  const contractMeta = isShortTermContract
+    ? {
+        barrier: barrier !== undefined && barrier !== '' ? String(barrier) : null,
+        durationTicks: Math.max(1, Number(duration ?? 1)),
+        ticksElapsed: 0
+      }
+    : null;
+
   const q = await pool.query(
-    `INSERT INTO virtual_orders (user_id, execution_mode, contract_type, source, symbol, side, stake, entry_price, stop_loss, take_profit)
-     VALUES ($1, 'virtual', $2, 'manual', $3, $4, $5, $6, $7, $8) RETURNING *`,
+    `INSERT INTO virtual_orders (user_id, execution_mode, contract_type, source, symbol, side, stake, entry_price, stop_loss, take_profit, contract_meta)
+     VALUES ($1, 'virtual', $2, 'manual', $3, $4, $5, $6, $7, $8, $9::jsonb) RETURNING *`,
     [
       req.user!.userId,
-      contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN'),
+      resolvedContract,
       symbol,
       side,
       Number(stake),
       resolvedSpot,
       stopLoss ?? null,
-      takeProfit ?? null
+      takeProfit ?? null,
+      contractMeta ? JSON.stringify(contractMeta) : null
     ]
   );
+  broadcastToUser(req.user!.userId, { type: 'bot_order_opened', order: q.rows[0] });
   res.status(201).json({ order: q.rows[0] });
 }
 
@@ -384,18 +399,30 @@ export async function placeBulkOrders(req: Request, res: Response) {
       return;
     }
 
+    const resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
+    const isShortTermContract =
+      resolvedContract.startsWith('DIGIT') || resolvedContract === 'CALL' || resolvedContract === 'PUT';
+    const contractMeta = isShortTermContract
+      ? {
+          barrier: barrier !== undefined && barrier !== '' ? String(barrier) : null,
+          durationTicks: Math.max(1, Number(duration ?? 1)),
+          ticksElapsed: 0
+        }
+      : null;
+
     const q = await pool.query(
-      `INSERT INTO virtual_orders (user_id, execution_mode, contract_type, source, symbol, side, stake, entry_price, stop_loss, take_profit)
-       VALUES ($1, 'virtual', $2, 'manual', $3, $4, $5, $6, $7, $8) RETURNING *`,
+      `INSERT INTO virtual_orders (user_id, execution_mode, contract_type, source, symbol, side, stake, entry_price, stop_loss, take_profit, contract_meta)
+       VALUES ($1, 'virtual', $2, 'manual', $3, $4, $5, $6, $7, $8, $9::jsonb) RETURNING *`,
       [
         req.user!.userId,
-        contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN'),
+        resolvedContract,
         symbol,
         side,
         Number(stake),
         resolvedSpot,
         stopLoss ?? null,
-        takeProfit ?? null
+        takeProfit ?? null,
+        contractMeta ? JSON.stringify(contractMeta) : null
       ]
     );
     placed.push(q.rows[0]);
@@ -405,6 +432,10 @@ export async function placeBulkOrders(req: Request, res: Response) {
 
   if (placed.length === 0 && errors.length > 0) {
     return res.status(400).json({ error: errors[0], errors });
+  }
+
+  if (placed.length > 0) {
+    broadcastToUser(req.user!.userId, { type: 'bot_order_opened', order: placed[0] });
   }
 
   res.status(201).json({
@@ -505,6 +536,10 @@ export async function bulkCloseOrders(req: Request, res: Response) {
   }
 
   const userBal = await pool.query(`SELECT virtual_workspace_balance FROM users WHERE id = $1`, [req.user!.userId]);
+  if (closedOrders.length > 0) {
+    broadcastToUser(req.user!.userId, { type: 'account_updated' });
+    broadcastToUser(req.user!.userId, { type: 'order_closed', pnl: totalPnl });
+  }
   res.json({
     closedCount: closedOrders.length,
     failedCount: errors.length,
@@ -539,6 +574,14 @@ export async function closeVirtualOrder(req: Request, res: Response) {
          WHERE id = $4 RETURNING *`,
         [closed.status, closed.exitPrice, closed.pnl, order.id]
       );
+      broadcastToUser(req.user!.userId, {
+        type: 'order_closed',
+        orderId: order.id,
+        symbol: order.symbol,
+        status: closed.status,
+        exitPrice: closed.exitPrice,
+        pnl: closed.pnl
+      });
 
       return res.json({
         order: updated.rows[0],
@@ -550,17 +593,27 @@ export async function closeVirtualOrder(req: Request, res: Response) {
   }
 
   const entry = Number(order.entry_price);
-  const pct = order.side === 'BUY' ? (exitPrice - entry) / entry : (entry - exitPrice) / entry;
+  const resolvedExit = Number(exitPrice || entry);
+  const pct = order.side === 'BUY' ? (resolvedExit - entry) / entry : (entry - resolvedExit) / entry;
   const pnl = Number((Number(order.stake) * pct * 100).toFixed(2));
 
   const updated = await pool.query(
     `UPDATE virtual_orders SET status = 'CLOSED_MANUAL', exit_price = $1, pnl = $2, closed_at = NOW() WHERE id = $3 RETURNING *`,
-    [exitPrice, pnl, order.id]
+    [resolvedExit, pnl, order.id]
   );
   const bal = await pool.query(
-    `UPDATE users SET virtual_workspace_balance = virtual_workspace_balance + $1 WHERE id = $2 RETURNING virtual_workspace_balance`,
+    `UPDATE users SET virtual_workspace_balance = GREATEST(0, virtual_workspace_balance + $1) WHERE id = $2 RETURNING virtual_workspace_balance`,
     [pnl, req.user!.userId]
   );
+  broadcastToUser(req.user!.userId, { type: 'account_updated' });
+  broadcastToUser(req.user!.userId, {
+    type: 'order_closed',
+    orderId: order.id,
+    symbol: order.symbol,
+    status: 'CLOSED_MANUAL',
+    exitPrice: resolvedExit,
+    pnl
+  });
   res.json({
     order: updated.rows[0],
     virtual_workspace_balance: Number(bal.rows[0]?.virtual_workspace_balance ?? 0)
@@ -572,6 +625,7 @@ export async function resetVirtualBalance(req: Request, res: Response) {
     `UPDATE users SET virtual_workspace_balance = 10000.00 WHERE id = $1 RETURNING virtual_workspace_balance`,
     [req.user!.userId]
   );
+  broadcastToUser(req.user!.userId, { type: 'account_updated' });
   res.json({ virtual_workspace_balance: Number(updated.rows[0]?.virtual_workspace_balance ?? 10000) });
 }
 

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { HashRouter, Routes, Route, useSearchParams, useNavigate, Navigate } from 'react-router-dom';
-import { AuthProvider, UserProfile, useAuth } from './contexts/AuthContext';
+import { AuthProvider, DerivAccountSummary, UserProfile, useAuth } from './contexts/AuthContext';
 import { useDerivStream } from './hooks/useDerivStream';
 import { SplashScreen } from './components/SplashScreen';
 import { LandingPage } from './components/LandingPage';
@@ -104,6 +104,7 @@ const MainWorkspace: React.FC = () => {
     refreshProfile,
     refreshDerivAccounts,
     refreshBranding,
+    bumpOrderVersion,
     logout
   } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -111,17 +112,28 @@ const MainWorkspace: React.FC = () => {
   const [oauthExchanging, setOauthExchanging] = useState(false);
   const [oauthError, setOauthError] = useState('');
   const [publicMode, setPublicMode] = useState(false);
-  const [activeTab, setActiveTab] = useState('dashboard');
-  const [activeSymbol, setActiveSymbol] = useState('R_25');
+  const [activeTab, setActiveTabState] = useState(() => localStorage.getItem('pipflow_active_tab') || 'dashboard');
+  const [activeSymbol, setActiveSymbolState] = useState(() => localStorage.getItem('pipflow_active_symbol') || 'R_25');
   const [watchSymbols, setWatchSymbols] = useState<string[]>([]);
   const [botRunning, setBotRunning] = useState(false);
+
+  const setActiveTab = (tab: string) => {
+    setActiveTabState(tab);
+    localStorage.setItem('pipflow_active_tab', tab);
+  };
+
+  const setActiveSymbol = (sym: string) => {
+    setActiveSymbolState(sym);
+    localStorage.setItem('pipflow_active_symbol', sym);
+  };
 
   const {
     ticksBySymbol,
     lastOrderEvent,
     settingsVersion,
     accountVersion,
-    suspendedCount
+    suspendedCount,
+    botStoppedCount
   } = useDerivStream(token, activeSymbol, watchSymbols);
 
   const livePricesMap = useMemo(() => {
@@ -181,13 +193,13 @@ const MainWorkspace: React.FC = () => {
 
     if (directTokens.length > 0) {
       setOauthExchanging(true);
-      apiFetch<{ token?: string; user?: UserProfile }>('/deriv/oauth/exchange', {
+      apiFetch<{ token?: string; user?: UserProfile; accounts?: DerivAccountSummary[] }>('/deriv/oauth/exchange', {
         method: 'POST',
         body: JSON.stringify({ tokens: directTokens })
       })
         .then((res) => {
           if (res.token && res.user) {
-            setSession(res.token, res.user);
+            setSession(res.token, res.user, res.accounts);
           }
           setPublicMode(false);
           setActiveTab(targetTab);
@@ -213,8 +225,9 @@ const MainWorkspace: React.FC = () => {
     if (lastOrderEvent?.type === 'order_closed' || lastOrderEvent?.type === 'bot_order_opened') {
       refreshProfile();
       refreshDerivAccounts(false);
+      bumpOrderVersion();
     }
-  }, [lastOrderEvent, refreshProfile, refreshDerivAccounts]);
+  }, [lastOrderEvent, refreshProfile, refreshDerivAccounts, bumpOrderVersion]);
 
   // Instant reflection of Admin alterations across site and individual accounts
   useEffect(() => {
@@ -227,8 +240,15 @@ const MainWorkspace: React.FC = () => {
     if (accountVersion > 0) {
       refreshProfile();
       refreshDerivAccounts(false);
+      bumpOrderVersion();
     }
-  }, [accountVersion, refreshProfile, refreshDerivAccounts]);
+  }, [accountVersion, refreshProfile, refreshDerivAccounts, bumpOrderVersion]);
+
+  useEffect(() => {
+    if (botStoppedCount > 0) {
+      setBotRunning(false);
+    }
+  }, [botStoppedCount]);
 
   useEffect(() => {
     if (suspendedCount > 0) {

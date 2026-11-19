@@ -6,6 +6,7 @@ import { pool } from '../database/pool';
 import { env } from '../config/env';
 import { sendBrevoEmail } from '../emails/brevo-service';
 import { logSecurityEvent } from '../services/notification-service';
+import { getUserAccountsList, syncUserDerivAccountsFromStoredTokens } from './derivController';
 
 export async function register(req: Request, res: Response) {
   const { email, password, fullName } = req.body as {
@@ -71,7 +72,7 @@ export async function login(req: Request, res: Response) {
     `SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.email = $1`,
     [email.trim().toLowerCase()]
   );
-  const user = q.rows[0];
+  let user = q.rows[0];
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     await logSecurityEvent(user?.id ?? null, 'LOGIN_FAILED', 'warning', { email }, req.ip);
     return res.status(401).json({ error: 'Invalid email or password' });
@@ -81,6 +82,31 @@ export async function login(req: Request, res: Response) {
   }
 
   await pool.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [user.id]);
+
+  // On fresh login after sign-out, refresh real Deriv accounts, names, and balances into DB
+  let accounts: Array<Record<string, unknown>> = [];
+  try {
+    const syncResult = await Promise.race([
+      syncUserDerivAccountsFromStoredTokens(user.id, { clearAdminLock: true }),
+      new Promise<{ synced: false; accounts: Array<Record<string, unknown>> }>((resolve) =>
+        setTimeout(() => resolve({ synced: false, accounts: [] }), 6500)
+      )
+    ]);
+    accounts = syncResult.accounts;
+    if (accounts.length === 0) {
+      accounts = await getUserAccountsList(user.id);
+    }
+    const refreshed = await pool.query(
+      `SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
+      [user.id]
+    );
+    if (refreshed.rows[0]) {
+      user = refreshed.rows[0];
+    }
+  } catch {
+    accounts = await getUserAccountsList(user.id).catch(() => []);
+  }
+
   await logSecurityEvent(user.id, 'LOGIN_SUCCESS', 'info', { role: user.role_name }, req.ip);
 
   const token = jwt.sign(
@@ -100,7 +126,8 @@ export async function login(req: Request, res: Response) {
       virtual_workspace_balance: Number(user.virtual_workspace_balance),
       preferred_currency: user.preferred_currency,
       local_currency: user.local_currency
-    }
+    },
+    accounts
   });
 }
 

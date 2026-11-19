@@ -20,6 +20,26 @@ export interface AuthorizedTradeAccount {
   rawToken: string;
 }
 
+export interface SettledDerivOrderInfo {
+  orderId: string;
+  userId: string;
+  connectedAccountId: string;
+  contractId: number;
+  symbol: string;
+  source: string;
+  status: 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL';
+  exitPrice: number;
+  pnl: number;
+  balanceAfter: number | null;
+}
+
+type SettlementHandler = (info: SettledDerivOrderInfo) => void | Promise<void>;
+let derivSettlementHandler: SettlementHandler | null = null;
+
+export function registerDerivSettlementHandler(handler: SettlementHandler) {
+  derivSettlementHandler = handler;
+}
+
 export interface ExecuteDerivTradeInput {
   userId: string;
   connectedAccountId?: string | null;
@@ -270,32 +290,42 @@ async function requestProposalWithSymbolFallback(
 async function syncPostTradeBalance(
   userId: string,
   accountId: string,
-  derivBalanceAfter: number
+  derivBalanceAfter: number | null,
+  lockedDelta?: number
 ): Promise<number> {
+  const hasDelta = typeof lockedDelta === 'number' && Number.isFinite(lockedDelta);
+  const deltaVal = hasDelta ? Number(lockedDelta) : 0;
+  const hasDerivBal = typeof derivBalanceAfter === 'number' && Number.isFinite(derivBalanceAfter);
+
   const updated = await pool.query(
     `UPDATE connected_accounts
      SET last_known_balance = CASE
-           WHEN COALESCE(balance_locked_by_admin, FALSE) = TRUE THEN last_known_balance
-           ELSE $1
+           WHEN COALESCE(balance_locked_by_admin, FALSE) = TRUE THEN
+             CASE WHEN $4 = TRUE THEN GREATEST(0, last_known_balance + $5) ELSE last_known_balance END
+           WHEN $6 = TRUE THEN $1
+           WHEN $4 = TRUE THEN GREATEST(0, last_known_balance + $5)
+           ELSE last_known_balance
          END,
          last_synced_at = NOW(),
          updated_at = NOW()
      WHERE id = $2 AND user_id = $3
      RETURNING last_known_balance, COALESCE(balance_locked_by_admin, FALSE) AS balance_locked_by_admin`,
-    [derivBalanceAfter, accountId, userId]
+    [hasDerivBal ? derivBalanceAfter : 0, accountId, userId, hasDelta, deltaVal, hasDerivBal]
   );
 
   const locked = Boolean(updated.rows[0]?.balance_locked_by_admin);
-  const displayBalance = Number(updated.rows[0]?.last_known_balance ?? derivBalanceAfter);
+  const displayBalance = Number(updated.rows[0]?.last_known_balance ?? derivBalanceAfter ?? 0);
 
   if (!locked) {
-    await pool.query(
-      `UPDATE users SET virtual_workspace_balance = $1, updated_at = NOW()
-       WHERE id = $2 AND EXISTS (
-         SELECT 1 FROM connected_accounts WHERE id = $3 AND (is_primary = TRUE OR account_type = 'real')
-       )`,
-      [displayBalance, userId, accountId]
-    ).catch(() => {});
+    await pool
+      .query(
+        `UPDATE users SET virtual_workspace_balance = $1, updated_at = NOW()
+         WHERE id = $2 AND EXISTS (
+           SELECT 1 FROM connected_accounts WHERE id = $3 AND (is_primary = TRUE OR account_type = 'real')
+         )`,
+        [displayBalance, userId, accountId]
+      )
+      .catch(() => {});
   }
 
   broadcastToUser(userId, {
@@ -553,8 +583,14 @@ export async function executeDerivTrade(input: ExecuteDerivTradeInput): Promise<
       throw new Error('Deriv buy execution did not return a contract_id');
     }
 
-    const rawDerivBalanceAfter = Number(buyRes.buy.balance_after ?? account.lastKnownBalance - buyPrice);
-    const displayBalanceAfter = await syncPostTradeBalance(input.userId, account.id, rawDerivBalanceAfter);
+    const actualBuyPrice = Number(buyRes.buy.buy_price ?? buyPrice);
+    const rawDerivBalanceAfter = Number(buyRes.buy.balance_after ?? account.lastKnownBalance - actualBuyPrice);
+    const displayBalanceAfter = await syncPostTradeBalance(
+      input.userId,
+      account.id,
+      rawDerivBalanceAfter,
+      -actualBuyPrice
+    );
 
     return {
       connectedAccountId: account.id,
@@ -564,7 +600,7 @@ export async function executeDerivTrade(input: ExecuteDerivTradeInput): Promise<
       contractId: Number(buyRes.buy.contract_id),
       transactionId: Number(buyRes.buy.transaction_id ?? 0),
       contractType: finalContractType,
-      buyPrice: Number(buyRes.buy.buy_price ?? buyPrice),
+      buyPrice: actualBuyPrice,
       payout: buyRes.buy.payout !== undefined ? Number(buyRes.buy.payout) : null,
       spotPrice: Number(proposal.spot ?? input.entryPrice ?? 0),
       balanceAfter: displayBalanceAfter
@@ -594,6 +630,8 @@ export async function closeDerivContract(params: {
     const poc = pocRes.proposal_open_contract;
 
     let pnl = Number(poc?.profit ?? 0);
+    const buyPrice = Number(poc?.buy_price ?? 0);
+    let payoutCredit = Number(poc?.sell_price ?? Math.max(0, buyPrice + pnl));
     const exitPrice = Number(poc?.exit_tick ?? poc?.current_spot ?? params.fallbackExitPrice);
     let status: 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL' = 'CLOSED_MANUAL';
     let balanceAfter: number | null = null;
@@ -608,7 +646,7 @@ export async function closeDerivContract(params: {
         });
         if (sellRes.sell) {
           balanceAfter = Number(sellRes.sell.balance_after);
-          const buyPrice = Number(poc?.buy_price ?? 0);
+          payoutCredit = Number(sellRes.sell.sold_for ?? payoutCredit);
           if (buyPrice > 0) {
             pnl = Number((Number(sellRes.sell.sold_for) - buyPrice).toFixed(2));
           }
@@ -626,6 +664,8 @@ export async function closeDerivContract(params: {
           (rePoc.is_sold === 1 || rePoc.status === 'won' || rePoc.status === 'lost' || rePoc.status === 'sold')
         ) {
           pnl = Number(rePoc.profit ?? pnl);
+          const reBuy = Number(rePoc.buy_price ?? buyPrice);
+          payoutCredit = Number(rePoc.sell_price ?? Math.max(0, reBuy + pnl));
           status = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
         } else {
           throw sellErr;
@@ -646,11 +686,8 @@ export async function closeDerivContract(params: {
       }
     }
 
-    if (balanceAfter !== null) {
-      balanceAfter = await syncPostTradeBalance(params.userId, account.id, balanceAfter);
-    }
-
-    return { exitPrice, pnl, status, balanceAfter };
+    const syncedBal = await syncPostTradeBalance(params.userId, account.id, balanceAfter, payoutCredit);
+    return { exitPrice, pnl, status, balanceAfter: syncedBal };
   } finally {
     sock.close();
   }
@@ -667,7 +704,7 @@ export async function syncOpenDerivOrdersForUser(
 ): Promise<Record<string, LiveDerivContractSnapshot>> {
   const snapshots: Record<string, LiveDerivContractSnapshot> = {};
   const openRes = await pool.query(
-    `SELECT id, connected_account_id, deriv_contract_id, entry_price
+    `SELECT id, connected_account_id, deriv_contract_id, entry_price, stake, symbol, source
      FROM virtual_orders
      WHERE user_id = $1 AND status = 'OPEN' AND deriv_contract_id IS NOT NULL AND connected_account_id IS NOT NULL`,
     [userId]
@@ -675,13 +712,19 @@ export async function syncOpenDerivOrdersForUser(
 
   if (openRes.rows.length === 0) return snapshots;
 
-  const byAccount = new Map<string, Array<{ id: string; contractId: number; entryPrice: number }>>();
+  const byAccount = new Map<
+    string,
+    Array<{ id: string; contractId: number; entryPrice: number; stake: number; symbol: string; source: string }>
+  >();
   for (const row of openRes.rows) {
     const list = byAccount.get(row.connected_account_id) ?? [];
     list.push({
       id: row.id,
       contractId: Number(row.deriv_contract_id),
-      entryPrice: Number(row.entry_price)
+      entryPrice: Number(row.entry_price),
+      stake: Number(row.stake),
+      symbol: String(row.symbol),
+      source: String(row.source || 'manual')
     });
     byAccount.set(row.connected_account_id, list);
   }
@@ -693,7 +736,16 @@ export async function syncOpenDerivOrdersForUser(
     let sock: TradingSocketHandle | null = null;
     try {
       sock = await openAuthenticatedTradingSocket(account);
-      let anyClosed = false;
+      const closedItems: Array<{
+        orderId: string;
+        contractId: number;
+        symbol: string;
+        source: string;
+        status: 'CLOSED_TP' | 'CLOSED_SL';
+        exitPrice: number;
+        pnl: number;
+      }> = [];
+      let totalLockedDelta = 0;
 
       for (const item of items) {
         try {
@@ -707,14 +759,30 @@ export async function syncOpenDerivOrdersForUser(
           if (poc.is_sold === 1 || poc.status === 'won' || poc.status === 'lost' || poc.status === 'sold') {
             const pnl = Number(poc.profit ?? 0);
             const exitPrice = Number(poc.exit_tick ?? poc.current_spot ?? item.entryPrice);
-            const closeStatus = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
-            await pool.query(
+            const closeStatus: 'CLOSED_TP' | 'CLOSED_SL' = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
+
+            const upd = await pool.query(
               `UPDATE virtual_orders
                SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW()
-               WHERE id = $4`,
+               WHERE id = $4 AND status = 'OPEN'
+               RETURNING id`,
               [closeStatus, exitPrice, pnl, item.id]
             );
-            anyClosed = true;
+
+            if (upd.rows.length > 0) {
+              const buyPrice = Number(poc.buy_price ?? item.stake);
+              const payoutCredit = Number(poc.sell_price ?? Math.max(0, buyPrice + pnl));
+              totalLockedDelta += payoutCredit;
+              closedItems.push({
+                orderId: item.id,
+                contractId: item.contractId,
+                symbol: item.symbol,
+                source: item.source,
+                status: closeStatus,
+                exitPrice,
+                pnl
+              });
+            }
           } else {
             snapshots[item.id] = {
               currentSpot: Number(poc.current_spot ?? item.entryPrice),
@@ -727,7 +795,7 @@ export async function syncOpenDerivOrdersForUser(
         }
       }
 
-      if (anyClosed) {
+      if (closedItems.length > 0) {
         let newBal: number | null = null;
         if (isOAuth2AccessToken(account.rawToken)) {
           const list = await fetchNewDerivAccounts(account.rawToken, { isPat: false }).catch(() => []);
@@ -739,8 +807,33 @@ export async function syncOpenDerivOrdersForUser(
             newBal = Number(balRes.balance.balance);
           }
         }
-        if (newBal !== null) {
-          await syncPostTradeBalance(userId, accountId, newBal);
+        const finalBalance = await syncPostTradeBalance(userId, accountId, newBal, totalLockedDelta);
+
+        for (const closed of closedItems) {
+          if (derivSettlementHandler) {
+            await Promise.resolve(
+              derivSettlementHandler({
+                orderId: closed.orderId,
+                userId,
+                connectedAccountId: accountId,
+                contractId: closed.contractId,
+                symbol: closed.symbol,
+                source: closed.source,
+                status: closed.status,
+                exitPrice: closed.exitPrice,
+                pnl: closed.pnl,
+                balanceAfter: finalBalance
+              })
+            ).catch(() => {});
+          }
+          broadcastToUser(userId, {
+            type: 'order_closed',
+            orderId: closed.orderId,
+            symbol: closed.symbol,
+            status: closed.status,
+            exitPrice: closed.exitPrice,
+            pnl: closed.pnl
+          });
         }
       }
     } catch {

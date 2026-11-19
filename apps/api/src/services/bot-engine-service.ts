@@ -4,7 +4,9 @@ import { fetchTickHistory } from '../integrations/deriv/candles';
 import {
   closeDerivContract,
   executeDerivTrade,
-  getAuthorizedAccountForTrading
+  getAuthorizedAccountForTrading,
+  registerDerivSettlementHandler,
+  syncOpenDerivOrdersForUser
 } from '../integrations/deriv/trade-execution';
 import { ensureLiveTickSubscription } from './market-data-service';
 import { createNotification } from './notification-service';
@@ -85,8 +87,60 @@ interface ActiveBotSession {
 const activeBots = new Map<string, ActiveBotSession>();
 const closingOrderLocks = new Set<string>();
 const botTradeLocks = new Set<string>();
+const virtualTickCounters = new Map<string, number>();
 let listenerAttached = false;
 let broadcastFn: ((userId: string, event: unknown) => void) | null = null;
+
+function applyBotOrderSettlement(
+  userId: string,
+  source: string,
+  symbol: string,
+  pnl: number
+): ActiveBotSession | undefined {
+  const botSession = activeBots.get(userId);
+  if (!botSession || source !== 'bot') return botSession;
+
+  botSession.sessionPnl += pnl;
+  if (pnl >= 0) {
+    botSession.wins += 1;
+    botSession.currentStake = botSession.baseStake;
+    botSession.barrier = botSession.initialPrediction;
+  } else {
+    botSession.losses += 1;
+    if (botSession.useMartingale && botSession.martingale > 1) {
+      botSession.currentStake = Number((botSession.currentStake * botSession.martingale).toFixed(2));
+    }
+    if (botSession.recoveryPrediction !== undefined) {
+      botSession.barrier = botSession.recoveryPrediction;
+    }
+  }
+  botSession.lastAction = `Closed ${symbol} (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD)`;
+
+  if (botSession.maxWins !== null && botSession.wins >= botSession.maxWins) {
+    botSession.isRunning = false;
+    botSession.lastAction = `Target reached: ${botSession.wins} win(s) completed (+$${botSession.sessionPnl.toFixed(2)})`;
+    activeBots.delete(userId);
+    broadcastFn?.(userId, {
+      type: 'bot_stopped',
+      reason: botSession.lastAction,
+      botStatus: formatBotStatus(botSession)
+    });
+  } else if (
+    botSession.stopLossUsd !== null &&
+    botSession.sessionPnl <= -Math.abs(botSession.stopLossUsd)
+  ) {
+    botSession.isRunning = false;
+    botSession.lastAction = `Stop Loss reached ($${botSession.sessionPnl.toFixed(2)})`;
+    activeBots.delete(userId);
+    broadcastFn?.(userId, {
+      type: 'bot_stopped',
+      reason: botSession.lastAction,
+      botStatus: formatBotStatus(botSession)
+    });
+  }
+
+  return botSession;
+}
 
 function extractLastDigit(quote: number, pipSize = 2): number {
   const formatted = quote.toFixed(Math.max(0, Math.min(8, pipSize)));
@@ -307,11 +361,23 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
       }
     }
 
+    const isShortTermContract =
+      signal.contractType.startsWith('DIGIT') ||
+      signal.contractType === 'CALL' ||
+      signal.contractType === 'PUT';
+    const contractMeta = isShortTermContract
+      ? {
+          barrier: signal.barrier !== undefined && signal.barrier !== '' ? String(signal.barrier) : null,
+          durationTicks: Math.max(1, Number(session.duration || 1)),
+          ticksElapsed: 0
+        }
+      : null;
+
     for (let i = 0; i < tradesToOpen; i++) {
       const inserted = await pool.query(
         `INSERT INTO virtual_orders
-           (user_id, execution_mode, contract_type, source, bot_name, symbol, side, stake, entry_price, stop_loss, take_profit)
-         VALUES ($1, 'virtual', $2, 'bot', $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+           (user_id, execution_mode, contract_type, source, bot_name, symbol, side, stake, entry_price, stop_loss, take_profit, contract_meta)
+         VALUES ($1, 'virtual', $2, 'bot', $3, $4, $5, $6, $7, $8, $9, $10::jsonb) RETURNING *`,
         [
           session.userId,
           signal.contractType,
@@ -321,7 +387,8 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
           session.currentStake,
           quote,
           sl,
-          tp
+          tp,
+          contractMeta ? JSON.stringify(contractMeta) : null
         ]
       );
       session.tradesCount += 1;
@@ -376,13 +443,36 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
   if (listenerAttached) return;
   listenerAttached = true;
 
+  registerDerivSettlementHandler(async (info) => {
+    applyBotOrderSettlement(info.userId, info.source, info.symbol, info.pnl);
+  });
+
+  // Poll live open Deriv contracts (including 1-tick / N-tick Digit & Rise/Fall trades) every 2.5s
+  let derivPollBusy = false;
+  setInterval(async () => {
+    if (derivPollBusy || !isDatabaseConfigured) return;
+    derivPollBusy = true;
+    try {
+      const q = await pool.query(
+        `SELECT DISTINCT user_id FROM virtual_orders WHERE status = 'OPEN' AND deriv_contract_id IS NOT NULL`
+      );
+      for (const row of q.rows) {
+        await syncOpenDerivOrdersForUser(row.user_id).catch(() => {});
+      }
+    } catch {
+      // Ignore transient polling errors
+    } finally {
+      derivPollBusy = false;
+    }
+  }, 2500);
+
   const client = derivConnectionManager.getMarketClient();
   client.socket.on('tick', async (msg: { tick?: { symbol: string; quote: number; epoch: number; pip_size?: number } }) => {
     if (!msg.tick || !isDatabaseConfigured) return;
     const { symbol, quote } = msg.tick;
 
     try {
-      // 1. Evaluate all OPEN MT5/Bot orders for Take Profit / Stop Loss on live Deriv ticks
+      // 1. Evaluate all OPEN MT5/Bot/Virtual orders on live Deriv ticks
       const openOrders = await pool.query(
         `SELECT * FROM virtual_orders WHERE status = 'OPEN' AND symbol = $1`,
         [symbol]
@@ -393,6 +483,103 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
 
         const entry = Number(order.entry_price);
         const stake = Number(order.stake);
+        const cType = String(order.contract_type || '').toUpperCase();
+        const meta = (order.contract_meta && typeof order.contract_meta === 'object'
+          ? order.contract_meta
+          : null) as { barrier?: string | number | null; durationTicks?: number; ticksElapsed?: number } | null;
+
+        const isShortTermVirtual =
+          !order.deriv_contract_id &&
+          (Boolean(meta?.durationTicks) ||
+            cType.startsWith('DIGIT') ||
+            cType === 'CALL' ||
+            cType === 'PUT');
+
+        if (isShortTermVirtual) {
+          const targetTicks = Math.max(1, Number(meta?.durationTicks ?? 1));
+          const nextTicks = (virtualTickCounters.get(order.id) ?? Number(meta?.ticksElapsed ?? 0)) + 1;
+          if (nextTicks < targetTicks) {
+            virtualTickCounters.set(order.id, nextTicks);
+            continue;
+          }
+
+          closingOrderLocks.add(order.id);
+          try {
+            const pipSize = msg.tick.pip_size ?? 2;
+            const lastDigit = extractLastDigit(quote, pipSize);
+            const barrierNum = Number(meta?.barrier ?? 4);
+            let won = false;
+            let winRate = 0.95;
+
+            if (cType === 'DIGITOVER') {
+              won = lastDigit > barrierNum;
+              winRate = 0.85;
+            } else if (cType === 'DIGITUNDER') {
+              won = lastDigit < barrierNum;
+              winRate = 0.85;
+            } else if (cType === 'DIGITEVEN') {
+              won = lastDigit % 2 === 0;
+              winRate = 0.95;
+            } else if (cType === 'DIGITODD') {
+              won = lastDigit % 2 === 1;
+              winRate = 0.95;
+            } else if (cType === 'DIGITMATCH') {
+              won = lastDigit === barrierNum;
+              winRate = 8.0;
+            } else if (cType === 'DIGITDIFF') {
+              won = lastDigit !== barrierNum;
+              winRate = 0.09;
+            } else if (cType === 'CALL') {
+              won = quote > entry;
+              winRate = 0.95;
+            } else if (cType === 'PUT') {
+              won = quote < entry;
+              winRate = 0.95;
+            }
+
+            const pnl = won ? Number((stake * winRate).toFixed(2)) : Number((-stake).toFixed(2));
+            const finalStatus: 'CLOSED_TP' | 'CLOSED_SL' = won ? 'CLOSED_TP' : 'CLOSED_SL';
+            virtualTickCounters.delete(order.id);
+
+            const upd = await pool.query(
+              `UPDATE virtual_orders SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW() WHERE id = $4 AND status = 'OPEN' RETURNING id`,
+              [finalStatus, quote, pnl, order.id]
+            );
+
+            if (upd.rows.length > 0) {
+              await pool.query(
+                `UPDATE users SET virtual_workspace_balance = GREATEST(0, virtual_workspace_balance + $1) WHERE id = $2`,
+                [pnl, order.user_id]
+              );
+              const botSession = applyBotOrderSettlement(
+                order.user_id,
+                String(order.source || 'manual'),
+                symbol,
+                pnl
+              );
+              await createNotification(
+                order.user_id,
+                'trade_sim',
+                `${cType} ${won ? 'Won' : 'Lost'} (${symbol})`,
+                `Virtual ${cType} settled at ${quote} (digit ${lastDigit}) | P/L: ${pnl >= 0 ? '+' : ''}${pnl} USD`
+              );
+              broadcastToUser(order.user_id, { type: 'account_updated' });
+              broadcastToUser(order.user_id, {
+                type: 'order_closed',
+                orderId: order.id,
+                symbol,
+                status: finalStatus,
+                exitPrice: quote,
+                pnl,
+                botStatus: botSession ? formatBotStatus(botSession) : undefined
+              });
+            }
+          } finally {
+            closingOrderLocks.delete(order.id);
+          }
+          continue;
+        }
+
         const tp = order.take_profit ? Number(order.take_profit) : null;
         const sl = order.stop_loss ? Number(order.stop_loss) : null;
 
@@ -425,52 +612,45 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
             } else {
               const pctMove = order.side === 'BUY' ? (quote - entry) / entry : (entry - quote) / entry;
               pnl = Number((stake * pctMove * 100).toFixed(2));
-              await pool.query(
-                `UPDATE users SET virtual_workspace_balance = virtual_workspace_balance + $1 WHERE id = $2`,
-                [pnl, order.user_id]
-              );
             }
 
-            await pool.query(
-              `UPDATE virtual_orders SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW() WHERE id = $4`,
+            const upd = await pool.query(
+              `UPDATE virtual_orders SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW() WHERE id = $4 AND status = 'OPEN' RETURNING id`,
               [finalStatus, finalExitPrice, pnl, order.id]
             );
 
-            // Update bot session stats, prediction recovery & martingale sizing if this was a bot order
-            const botSession = activeBots.get(order.user_id);
-            if (botSession && order.source === 'bot') {
-              botSession.sessionPnl += pnl;
-              if (pnl >= 0) {
-                botSession.wins += 1;
-                botSession.currentStake = botSession.baseStake;
-                botSession.barrier = botSession.initialPrediction;
-              } else {
-                botSession.losses += 1;
-                if (botSession.useMartingale && botSession.martingale > 1) {
-                  botSession.currentStake = Number((botSession.currentStake * botSession.martingale).toFixed(2));
-                }
-                if (botSession.recoveryPrediction !== undefined) {
-                  botSession.barrier = botSession.recoveryPrediction;
-                }
+            if (upd.rows.length > 0) {
+              if (!order.deriv_contract_id || !order.connected_account_id) {
+                await pool.query(
+                  `UPDATE users SET virtual_workspace_balance = GREATEST(0, virtual_workspace_balance + $1) WHERE id = $2`,
+                  [pnl, order.user_id]
+                );
+                broadcastToUser(order.user_id, { type: 'account_updated' });
               }
-              botSession.lastAction = `Closed ${order.symbol} (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD)`;
-            }
 
-            await createNotification(
-              order.user_id,
-              'trade_sim',
-              `${finalStatus === 'CLOSED_TP' ? 'Take Profit Hit' : 'Stop Loss Hit'} (${symbol})`,
-              `${order.deriv_contract_id ? 'Deriv' : 'Virtual'} ${order.side} closed at ${finalExitPrice} | P/L: ${pnl >= 0 ? '+' : ''}${pnl} USD`
-            );
-            broadcastToUser(order.user_id, {
-              type: 'order_closed',
-              orderId: order.id,
-              symbol,
-              status: finalStatus,
-              exitPrice: finalExitPrice,
-              pnl,
-              botStatus: botSession ? formatBotStatus(botSession) : undefined
-            });
+              const botSession = applyBotOrderSettlement(
+                order.user_id,
+                String(order.source || 'manual'),
+                String(order.symbol || symbol),
+                pnl
+              );
+
+              await createNotification(
+                order.user_id,
+                'trade_sim',
+                `${finalStatus === 'CLOSED_TP' ? 'Take Profit Hit' : 'Stop Loss Hit'} (${symbol})`,
+                `${order.deriv_contract_id ? 'Deriv' : 'Virtual'} ${order.side} closed at ${finalExitPrice} | P/L: ${pnl >= 0 ? '+' : ''}${pnl} USD`
+              );
+              broadcastToUser(order.user_id, {
+                type: 'order_closed',
+                orderId: order.id,
+                symbol,
+                status: finalStatus,
+                exitPrice: finalExitPrice,
+                pnl,
+                botStatus: botSession ? formatBotStatus(botSession) : undefined
+              });
+            }
           } finally {
             closingOrderLocks.delete(order.id);
           }
@@ -624,17 +804,22 @@ export async function closeAllBotOrders(userId: string, fallbackPriceMap?: Recor
       const pct = order.side === 'BUY' ? (fallbackPrice - entry) / entry : (entry - fallbackPrice) / entry;
       pnl = Number((Number(order.stake) * pct * 100).toFixed(2));
       await pool.query(
-        `UPDATE users SET virtual_workspace_balance = virtual_workspace_balance + $1 WHERE id = $2`,
+        `UPDATE users SET virtual_workspace_balance = GREATEST(0, virtual_workspace_balance + $1) WHERE id = $2`,
         [pnl, userId]
       );
     }
 
     const updated = await pool.query(
-      `UPDATE virtual_orders SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW() WHERE id = $4 RETURNING *`,
+      `UPDATE virtual_orders SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW() WHERE id = $4 AND status = 'OPEN' RETURNING *`,
       [closeStatus, exitPrice, pnl, order.id]
     );
     if (updated.rows[0]) closedOrders.push(updated.rows[0]);
     totalPnl += pnl;
+  }
+
+  if (closedOrders.length > 0) {
+    broadcastFn?.(userId, { type: 'account_updated' });
+    broadcastFn?.(userId, { type: 'order_closed', pnl: Number(totalPnl.toFixed(2)) });
   }
 
   return {

@@ -53,6 +53,7 @@ export function useDerivStream(
   const [accountVersion, setAccountVersion] = useState(0);
   const [notificationVersion, setNotificationVersion] = useState(0);
   const [suspendedCount, setSuspendedCount] = useState(0);
+  const [botStoppedCount, setBotStoppedCount] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
 
   const mergedWatchList = useMemo(() => {
@@ -92,7 +93,14 @@ export function useDerivStream(
                 data?: { tick?: { symbol: string; quote: number; epoch: number; pip_size?: number } };
               }
             | BotOrderEvent
-            | { type: 'settings_updated' | 'account_updated' | 'account_suspended' | 'notification_created' };
+            | {
+                type:
+                  | 'settings_updated'
+                  | 'account_updated'
+                  | 'account_suspended'
+                  | 'notification_created'
+                  | 'bot_stopped';
+              };
 
           if (msg.type === 'tick' && 'data' in msg && msg.data?.tick) {
             const t = msg.data.tick;
@@ -113,6 +121,8 @@ export function useDerivStream(
             setAccountVersion((v) => v + 1);
           } else if (msg.type === 'account_suspended') {
             setSuspendedCount((v) => v + 1);
+          } else if (msg.type === 'bot_stopped') {
+            setBotStoppedCount((v) => v + 1);
           } else if (msg.type === 'notification_created') {
             setNotificationVersion((v) => v + 1);
           }
@@ -160,6 +170,7 @@ export function useDerivStream(
     settingsVersion,
     accountVersion,
     notificationVersion,
-    suspendedCount
+    suspendedCount,
+    botStoppedCount
   };
 }

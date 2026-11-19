@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { PipflowLogo } from './PipflowLogo';
 import { apiFetch } from '../services/api';
-import { useAuth, UserProfile } from '../contexts/AuthContext';
+import { useAuth, UserProfile, DerivAccountSummary } from '../contexts/AuthContext';
 
 interface LandingPageProps {
   onOpenPublicCharts: () => void;
@@ -58,11 +58,15 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onOpenPublicCharts, in
         setStatusMsg(res.message);
       } else {
         const path = modalMode === 'register' ? '/auth/register' : '/auth/login';
-        const res = await apiFetch<{ token: string; user: UserProfile }>(path, {
+        const res = await apiFetch<{
+          token: string;
+          user: UserProfile;
+          accounts?: DerivAccountSummary[];
+        }>(path, {
           method: 'POST',
           body: JSON.stringify({ email, password, fullName })
         });
-        setSession(res.token, res.user);
+        setSession(res.token, res.user, res.accounts);
         setModalMode('none');
       }
     } catch (err) {

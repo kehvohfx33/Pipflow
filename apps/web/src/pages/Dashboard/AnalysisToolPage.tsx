@@ -83,7 +83,7 @@ function computeRsi(prices: number[], period = 14): number {
 }
 
 export const AnalysisToolPage: React.FC = () => {
-  const { token, activeDerivAccount, refreshDerivAccounts, refreshProfile } = useAuth();
+  const { token, activeDerivAccount, refreshDerivAccounts, refreshProfile, bumpOrderVersion } = useAuth();
   const [subTab, setSubTab] = useState<'Dcircles' | 'Signals' | 'Over/Under' | 'Rise/Fall'>('Dcircles');
   const [instruments, setInstruments] = useState<InstrumentOption[]>([]);
   const [symbol, setSymbol] = useState('R_100');
@@ -247,6 +247,7 @@ export const AnalysisToolPage: React.FC = () => {
       );
       refreshDerivAccounts(false);
       refreshProfile();
+      bumpOrderVersion();
     } catch (err) {
       setTradeMsg((err as Error).message);
     } finally {

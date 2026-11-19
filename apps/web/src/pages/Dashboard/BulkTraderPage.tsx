@@ -54,7 +54,7 @@ function buildLiveStats(prices: number[], pipSize: number): DigitStats {
 }
 
 export const BulkTraderPage: React.FC = () => {
-  const { activeDerivAccount, refreshDerivAccounts, refreshProfile } = useAuth();
+  const { activeDerivAccount, refreshDerivAccounts, refreshProfile, bumpOrderVersion } = useAuth();
   const [instruments, setInstruments] = useState<InstrumentOption[]>([]);
   const [symbol, setSymbol] = useState('R_100');
   const [tradeType, setTradeType] = useState<'Even/Odd' | 'Over/Under' | 'Rise/Fall'>('Even/Odd');
@@ -170,6 +170,7 @@ export const BulkTraderPage: React.FC = () => {
       });
       refreshDerivAccounts(false);
       refreshProfile();
+      bumpOrderVersion();
       setOrderNotice(
         `Executed ${res.placedCount}x ${contractType} trade(s) on ${symbol}${
           activeDerivAccount ? ` (${activeDerivAccount.account_type.toUpperCase()})` : ''
@@ -195,6 +196,7 @@ export const BulkTraderPage: React.FC = () => {
       });
       refreshDerivAccounts(false);
       refreshProfile();
+      bumpOrderVersion();
       setOrderNotice(
         `Closed ${res.closedCount} (${filter}) trade(s) · Net P/L: ${
           res.totalPnl >= 0 ? '+' : ''

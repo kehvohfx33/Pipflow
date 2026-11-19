@@ -216,73 +216,12 @@ function extractOAuthTokensFromQuery(query: Request['query']): string[] {
   return Array.from(new Set(tokens));
 }
 
-async function saveDerivAccountInfos(
-  userId: string,
-  entries: Array<{ token: string; info: ReadOnlyDerivAccount }>,
-  options?: { preserveExistingBalances?: boolean }
-): Promise<{
-  primary: ReadOnlyDerivAccount;
-  saved: Array<Record<string, unknown>>;
-}> {
-  if (entries.length === 0) {
-    throw new Error('No valid Deriv authorization tokens found');
-  }
+function isDerivLoginIdLike(val?: string | null): boolean {
+  if (!val) return true;
+  return /^(CR|VRTC|MLT|MF|MX|CRW|MFW|MLTW)\d+$/i.test(val.trim());
+}
 
-  const preserveExisting = Boolean(options?.preserveExistingBalances);
-
-  // Prefer the Real account as primary when present, otherwise fall back to first Demo account
-  const preferred = entries.find((a) => !a.info.is_virtual) ?? entries[0];
-
-  await pool.query(`UPDATE connected_accounts SET is_primary = FALSE WHERE user_id = $1`, [userId]);
-
-  const saved: Array<Record<string, unknown>> = [];
-  for (const { token: rawToken, info } of entries) {
-    const accountType = info.is_virtual ? 'demo' : 'real';
-    const isPrimary = info.loginid === preferred.info.loginid;
-
-    const accRes = await pool.query(
-      `INSERT INTO connected_accounts (user_id, deriv_login_id, account_type, currency, last_known_balance, landing_company, connection_status, is_primary, last_synced_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'connected', $7, NOW())
-       ON CONFLICT (user_id, deriv_login_id) DO UPDATE SET
-         currency = EXCLUDED.currency,
-         last_known_balance = CASE
-           WHEN COALESCE(connected_accounts.balance_locked_by_admin, FALSE) = TRUE OR $8 = TRUE
-             THEN connected_accounts.last_known_balance
-           ELSE EXCLUDED.last_known_balance
-         END,
-         landing_company = COALESCE(EXCLUDED.landing_company, connected_accounts.landing_company),
-         connection_status = 'connected',
-         is_primary = EXCLUDED.is_primary,
-         last_synced_at = CASE
-           WHEN COALESCE(connected_accounts.balance_locked_by_admin, FALSE) = TRUE OR $8 = TRUE
-             THEN connected_accounts.last_synced_at
-           ELSE NOW()
-         END,
-         updated_at = NOW()
-       RETURNING id, deriv_login_id, account_type, currency, last_known_balance, balance_locked_by_admin, landing_company, connection_status, is_primary, last_synced_at`,
-      [
-        userId,
-        info.loginid,
-        accountType,
-        info.currency,
-        info.balance,
-        info.landing_company_name ?? null,
-        isPrimary,
-        preserveExisting
-      ]
-    );
-
-    const enc = encryptToken(rawToken);
-    await pool.query(
-      `INSERT INTO account_authorizations (connected_account_id, user_id, encrypted_token, token_iv, token_auth_tag, granted_scopes)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [accRes.rows[0].id, userId, enc.encrypted, enc.iv, enc.authTag, info.scopes]
-    );
-
-    saved.push(accRes.rows[0]);
-  }
-
-  // Re-fetch ordered rows from Neon PostgreSQL so app always displays DB state
+export async function getUserAccountsList(userId: string) {
   const ordered = await pool.query(
     `SELECT ca.id, ca.deriv_login_id, ca.account_type, ca.currency, ca.last_known_balance,
             COALESCE(ca.balance_locked_by_admin, FALSE) AS balance_locked_by_admin,
@@ -298,14 +237,108 @@ async function saveDerivAccountInfos(
      ORDER BY CASE WHEN ca.account_type = 'real' THEN 0 ELSE 1 END, ca.is_primary DESC, ca.updated_at DESC`,
     [userId]
   );
+  return ordered.rows;
+}
 
-  return { primary: preferred.info, saved: ordered.rows };
+async function saveDerivAccountInfos(
+  userId: string,
+  entries: Array<{ token: string; info: ReadOnlyDerivAccount }>,
+  options?: { preserveExistingBalances?: boolean; clearAdminLock?: boolean; markMissingDisconnected?: boolean }
+): Promise<{
+  primary: ReadOnlyDerivAccount;
+  saved: Array<Record<string, unknown>>;
+}> {
+  if (entries.length === 0) {
+    throw new Error('No valid Deriv authorization tokens found');
+  }
+
+  const preserveExisting = Boolean(options?.preserveExistingBalances);
+  const clearAdminLock = Boolean(options?.clearAdminLock);
+  const markMissingDisconnected = Boolean(options?.markMissingDisconnected);
+
+  // Deduplicate by deriv_login_id (preferring entry with explicit balance or real-name enrichment)
+  const dedupedMap = new Map<string, { token: string; info: ReadOnlyDerivAccount }>();
+  for (const item of entries) {
+    dedupedMap.set(item.info.loginid, item);
+  }
+  const uniqueEntries = Array.from(dedupedMap.values());
+
+  // Prefer the Real account as primary when present, otherwise fall back to first Demo account
+  const preferred = uniqueEntries.find((a) => !a.info.is_virtual) ?? uniqueEntries[0];
+
+  await pool.query(`UPDATE connected_accounts SET is_primary = FALSE WHERE user_id = $1`, [userId]);
+
+  for (const { token: rawToken, info } of uniqueEntries) {
+    const accountType = info.is_virtual ? 'demo' : 'real';
+    const isPrimary = info.loginid === preferred.info.loginid;
+
+    const accRes = await pool.query(
+      `INSERT INTO connected_accounts (user_id, deriv_login_id, account_type, currency, last_known_balance, balance_locked_by_admin, landing_company, connection_status, is_primary, last_synced_at)
+       VALUES ($1, $2, $3, $4, $5, FALSE, $6, 'connected', $7, NOW())
+       ON CONFLICT (user_id, deriv_login_id) DO UPDATE SET
+         account_type = EXCLUDED.account_type,
+         currency = EXCLUDED.currency,
+         balance_locked_by_admin = CASE
+           WHEN $9 = TRUE THEN FALSE
+           ELSE COALESCE(connected_accounts.balance_locked_by_admin, FALSE)
+         END,
+         last_known_balance = CASE
+           WHEN $9 = TRUE THEN EXCLUDED.last_known_balance
+           WHEN COALESCE(connected_accounts.balance_locked_by_admin, FALSE) = TRUE OR $8 = TRUE
+             THEN connected_accounts.last_known_balance
+           ELSE EXCLUDED.last_known_balance
+         END,
+         landing_company = COALESCE(EXCLUDED.landing_company, connected_accounts.landing_company),
+         connection_status = 'connected',
+         is_primary = EXCLUDED.is_primary,
+         last_synced_at = CASE
+           WHEN $9 = TRUE THEN NOW()
+           WHEN COALESCE(connected_accounts.balance_locked_by_admin, FALSE) = TRUE OR $8 = TRUE
+             THEN connected_accounts.last_synced_at
+           ELSE NOW()
+         END,
+         updated_at = NOW()
+       RETURNING id, deriv_login_id, account_type, currency, last_known_balance, balance_locked_by_admin, landing_company, connection_status, is_primary, last_synced_at`,
+      [
+        userId,
+        info.loginid,
+        accountType,
+        info.currency,
+        info.balance,
+        info.landing_company_name ?? null,
+        isPrimary,
+        preserveExisting,
+        clearAdminLock
+      ]
+    );
+
+    const enc = encryptToken(rawToken);
+    await pool.query(
+      `INSERT INTO account_authorizations (connected_account_id, user_id, encrypted_token, token_iv, token_auth_tag, granted_scopes)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [accRes.rows[0].id, userId, enc.encrypted, enc.iv, enc.authTag, info.scopes]
+    );
+  }
+
+  if (markMissingDisconnected && uniqueEntries.length > 0) {
+    const activeLoginIds = uniqueEntries.map((e) => e.info.loginid);
+    await pool.query(
+      `UPDATE connected_accounts
+       SET connection_status = 'disconnected', is_primary = FALSE, updated_at = NOW()
+       WHERE user_id = $1 AND NOT (deriv_login_id = ANY($2::text[])) AND connection_status = 'connected'`,
+      [userId, activeLoginIds]
+    );
+  }
+
+  // Re-fetch ordered rows from PostgreSQL so app always displays saved DB state
+  const orderedRows = await getUserAccountsList(userId);
+  return { primary: preferred.info, saved: orderedRows };
 }
 
 async function persistAuthorizedAccounts(
   userId: string,
   tokens: string[],
-  options?: { preserveExistingBalances?: boolean }
+  options?: { preserveExistingBalances?: boolean; clearAdminLock?: boolean; markMissingDisconnected?: boolean }
 ) {
   const authorizedInfos: Array<{ token: string; info: ReadOnlyDerivAccount }> = [];
   for (const rawToken of tokens) {
@@ -326,7 +359,7 @@ async function persistOAuth2Accounts(
   userId: string,
   accessToken: string,
   accounts: ReadOnlyDerivAccount[],
-  options?: { preserveExistingBalances?: boolean }
+  options?: { preserveExistingBalances?: boolean; clearAdminLock?: boolean; markMissingDisconnected?: boolean }
 ) {
   return saveDerivAccountInfos(
     userId,
@@ -335,8 +368,102 @@ async function persistOAuth2Accounts(
   );
 }
 
-async function findOrCreateOAuthUser(info: ReadOnlyDerivAccount, ip?: string) {
-  const email = (info.email || `${info.loginid.toLowerCase()}@deriv-oauth.local`).trim().toLowerCase();
+export async function syncUserDerivAccountsFromStoredTokens(
+  userId: string,
+  options?: { clearAdminLock?: boolean }
+): Promise<{ synced: boolean; accounts: Array<Record<string, unknown>>; resolvedFullName?: string }> {
+  const activeAuths = await pool.query(
+    `SELECT ca.id, ca.deriv_login_id, aa.encrypted_token, aa.token_iv, aa.token_auth_tag, aa.granted_scopes
+     FROM connected_accounts ca
+     JOIN LATERAL (
+       SELECT encrypted_token, token_iv, token_auth_tag, granted_scopes
+       FROM account_authorizations
+       WHERE connected_account_id = ca.id AND user_id = ca.user_id AND revoked_at IS NULL
+       ORDER BY created_at DESC LIMIT 1
+     ) aa ON TRUE
+     WHERE ca.user_id = $1 AND ca.connection_status IN ('connected', 'disconnected')`,
+    [userId]
+  );
+
+  if (activeAuths.rows.length === 0) {
+    const accounts = await getUserAccountsList(userId);
+    return { synced: false, accounts };
+  }
+
+  // Deduplicate raw tokens so OAuth2/PAT multi-account tokens are only fetched once
+  const uniqueTokens = new Map<string, string[]>();
+  for (const row of activeAuths.rows) {
+    try {
+      const rawToken = decryptToken(row.encrypted_token, row.token_iv, row.token_auth_tag);
+      if (!uniqueTokens.has(rawToken)) {
+        uniqueTokens.set(rawToken, Array.isArray(row.granted_scopes) ? row.granted_scopes : ['read', 'trade']);
+      }
+    } catch {
+      // Skip malformed/unreadable encrypted rows
+    }
+  }
+
+  const entries: Array<{ token: string; info: ReadOnlyDerivAccount }> = [];
+  await Promise.allSettled(
+    Array.from(uniqueTokens.entries()).map(async ([rawToken, grantedScopes]) => {
+      if (isOAuth2AccessToken(rawToken)) {
+        const list = await fetchNewDerivAccounts(rawToken, { isPat: false, grantedScopes });
+        for (const acc of list) {
+          entries.push({ token: rawToken, info: acc });
+        }
+      } else {
+        const info = await authorizeReadOnlyAccount(rawToken);
+        entries.push({ token: rawToken, info });
+      }
+    })
+  );
+
+  if (entries.length === 0) {
+    const accounts = await getUserAccountsList(userId);
+    return { synced: false, accounts };
+  }
+
+  const { primary, saved } = await saveDerivAccountInfos(userId, entries, {
+    preserveExistingBalances: false,
+    clearAdminLock: Boolean(options?.clearAdminLock),
+    markMissingDisconnected: false
+  });
+
+  const bestNameCandidate =
+    entries.map((e) => e.info.fullname?.trim()).find((n) => n && !isDerivLoginIdLike(n)) ||
+    primary.fullname?.trim();
+
+  if (bestNameCandidate && !isDerivLoginIdLike(bestNameCandidate)) {
+    await pool.query(
+      `UPDATE users SET full_name = $2, updated_at = NOW() WHERE id = $1`,
+      [userId, bestNameCandidate]
+    );
+  }
+
+  return { synced: true, accounts: saved, resolvedFullName: bestNameCandidate };
+}
+
+async function findOrCreateOAuthUser(
+  info: ReadOnlyDerivAccount,
+  ip?: string,
+  allAccounts?: ReadOnlyDerivAccount[]
+) {
+  const candidates = allAccounts && allAccounts.length > 0 ? allAccounts : [info];
+  const bestEmail =
+    candidates.map((c) => c.email?.trim().toLowerCase()).find((e) => e && !e.endsWith('@deriv-oauth.local')) ||
+    candidates.map((c) => c.email?.trim().toLowerCase()).find(Boolean) ||
+    `${info.loginid.toLowerCase()}@deriv-oauth.local`;
+
+  const bestHumanName =
+    candidates.map((c) => c.fullname?.trim()).find((n) => n && !isDerivLoginIdLike(n)) || '';
+  const bestFallbackName =
+    bestHumanName || candidates.map((c) => c.fullname?.trim()).find(Boolean) || info.loginid;
+
+  const demoAccount = candidates.find((c) => c.is_virtual);
+  const initialVirtualBal = Number(demoAccount?.balance ?? info.balance ?? 10000);
+
+  const loginIds = candidates.map((c) => c.loginid);
+
   const existing = await pool.query(
     `SELECT u.*, r.name as role_name
      FROM users u
@@ -344,11 +471,11 @@ async function findOrCreateOAuthUser(info: ReadOnlyDerivAccount, ip?: string) {
      WHERE u.email = $1
         OR EXISTS (
           SELECT 1 FROM connected_accounts ca
-          WHERE ca.user_id = u.id AND ca.deriv_login_id = $2
+          WHERE ca.user_id = u.id AND ca.deriv_login_id = ANY($2::text[])
         )
      ORDER BY CASE WHEN u.email = $1 THEN 0 ELSE 1 END
      LIMIT 1`,
-    [email, info.loginid]
+    [bestEmail, loginIds]
   );
 
   let userRow = existing.rows[0];
@@ -361,11 +488,11 @@ async function findOrCreateOAuthUser(info: ReadOnlyDerivAccount, ip?: string) {
       `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, virtual_workspace_balance, preferred_currency, last_login_at)
        VALUES ($1, $2, $3, 1, TRUE, $4, $5, NOW())
        RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, is_active`,
-      [email, randomPwd, info.fullname?.trim() || info.loginid, Number(info.balance ?? 10000), info.currency || 'USD']
+      [bestEmail, randomPwd, bestFallbackName, initialVirtualBal, info.currency || 'USD']
     );
     userRow = { ...inserted.rows[0], role_name: 'trader' };
 
-    if (info.email && !info.email.endsWith('@deriv-oauth.local')) {
+    if (!bestEmail.endsWith('@deriv-oauth.local')) {
       await sendBrevoEmail({
         userId: userRow.id,
         to: userRow.email,
@@ -375,16 +502,56 @@ async function findOrCreateOAuthUser(info: ReadOnlyDerivAccount, ip?: string) {
         htmlContent: `<p>Welcome to Pipflowtrades, ${userRow.full_name}. Your Deriv account (${info.loginid}) is connected and your balance has been synced to the workspace database.</p>`
       });
     }
-    await logSecurityEvent(userRow.id, 'DERIV_OAUTH_SIGNUP', 'info', { loginid: info.loginid, email }, ip);
+    await logSecurityEvent(userRow.id, 'DERIV_OAUTH_SIGNUP', 'info', { loginid: info.loginid, email: bestEmail }, ip);
   } else {
     if (!userRow.is_active) {
       throw new Error('Account suspended by administrator');
     }
-    await pool.query(
-      `UPDATE users SET last_login_at = NOW(), is_email_verified = TRUE, full_name = COALESCE(NULLIF($2, ''), full_name) WHERE id = $1`,
-      [userRow.id, info.fullname?.trim() || '']
+
+    const canUpgradeName =
+      bestHumanName.length > 0 ||
+      !userRow.full_name ||
+      userRow.full_name === 'Trader' ||
+      isDerivLoginIdLike(userRow.full_name);
+
+    const nextFullName = canUpgradeName ? bestFallbackName : userRow.full_name;
+    const canUpgradeEmail =
+      String(userRow.email || '').endsWith('@deriv-oauth.local') &&
+      !bestEmail.endsWith('@deriv-oauth.local');
+
+    const updatedUserRes = await pool.query(
+      `UPDATE users
+       SET last_login_at = NOW(),
+           is_email_verified = TRUE,
+           full_name = COALESCE(NULLIF($2, ''), full_name),
+           virtual_workspace_balance = COALESCE($3, virtual_workspace_balance),
+           email = CASE
+             WHEN $4 = TRUE AND NOT EXISTS (SELECT 1 FROM users u2 WHERE u2.email = $5 AND u2.id <> $1)
+               THEN $5
+             ELSE email
+           END,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, is_active`,
+      [
+        userRow.id,
+        nextFullName,
+        demoAccount ? Number(demoAccount.balance) : null,
+        canUpgradeEmail,
+        bestEmail
+      ]
     );
-    await logSecurityEvent(userRow.id, 'DERIV_OAUTH_LOGIN', 'info', { loginid: info.loginid, email }, ip);
+
+    if (updatedUserRes.rows[0]) {
+      userRow = { ...updatedUserRes.rows[0], role_name: userRow.role_name };
+    }
+    await logSecurityEvent(
+      userRow.id,
+      'DERIV_OAUTH_LOGIN',
+      'info',
+      { loginid: info.loginid, email: userRow.email },
+      ip
+    );
   }
 
   const jwtToken = jwt.sign(
@@ -533,32 +700,45 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
 
       if (decoded.userId) {
         const { primary } = await persistOAuth2Accounts(decoded.userId, tokenData.accessToken, accounts, {
-          preserveExistingBalances: true
+          preserveExistingBalances: false,
+          clearAdminLock: true
         });
+        const bestName =
+          accounts.map((c) => c.fullname?.trim()).find((n) => n && !isDerivLoginIdLike(n)) || '';
+        if (bestName) {
+          await pool.query(`UPDATE users SET full_name = $2, updated_at = NOW() WHERE id = $1`, [
+            decoded.userId,
+            bestName
+          ]);
+        }
         await createNotification(
           decoded.userId,
           'connection',
           'Deriv OAuth Accounts Synced',
-          `Linked ${accounts.length} Deriv account(s) (Primary: ${primary.loginid}).`
+          `Synced ${accounts.length} live Deriv account(s) (Primary: ${primary.loginid}).`
         );
         return res.redirect(
           `${siteBase}/#/?deriv_connected=${encodeURIComponent(primary.loginid)}&tab=dashboard`
         );
       }
 
-      const session = await findOrCreateOAuthUser(primaryInfo, req.ip);
+      const session = await findOrCreateOAuthUser(primaryInfo, req.ip, accounts);
       const { saved } = await persistOAuth2Accounts(session.user.id, tokenData.accessToken, accounts, {
-        preserveExistingBalances: !session.isNew
+        preserveExistingBalances: false,
+        clearAdminLock: true,
+        markMissingDisconnected: true
       });
-      const dbPrimary = (saved[0] as { deriv_login_id?: string; last_known_balance?: number; currency?: string } | undefined);
+      const dbPrimary = saved[0] as
+        | { deriv_login_id?: string; last_known_balance?: number; currency?: string }
+        | undefined;
       const displayLogin = dbPrimary?.deriv_login_id || primaryInfo.loginid;
       const displayBal = Number(dbPrimary?.last_known_balance ?? primaryInfo.balance);
       const displayCurr = dbPrimary?.currency || primaryInfo.currency;
       await createNotification(
         session.user.id,
         'connection',
-        session.isNew ? 'Signed In via Official Deriv OAuth2' : 'Welcome Back — Loaded Database Profile',
-        `${accounts.length} Deriv account(s) active. Primary ${displayLogin}: ${displayBal} ${displayCurr}.`
+        session.isNew ? 'Signed In via Official Deriv OAuth2' : 'Signed In — Live Deriv Accounts Synced',
+        `${accounts.length} Deriv account(s) synced. Primary ${displayLogin}: ${displayBal} ${displayCurr}.`
       );
 
       return res.redirect(
@@ -621,32 +801,37 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
 
     if (decoded?.userId) {
       const { primary } = await persistAuthorizedAccounts(decoded.userId, tokens, {
-        preserveExistingBalances: true
+        preserveExistingBalances: false,
+        clearAdminLock: true
       });
       await createNotification(
         decoded.userId,
         'connection',
         'Deriv OAuth Accounts Synced',
-        `Linked ${tokens.length} Deriv account(s) (Primary: ${primary.loginid}).`
+        `Synced ${tokens.length} live Deriv account(s) (Primary: ${primary.loginid}).`
       );
       return res.redirect(`${siteBase}/#/?deriv_connected=${encodeURIComponent(primary.loginid)}&tab=dashboard`);
     }
 
-    // Real Deriv Login -> Save on 1st login, load from Database on repeat login -> Redirect straight to App Dashboard
+    // Fresh Deriv Login -> Fetch live accounts, real name & real balances from Deriv, persist into DB -> Open Dashboard
     const firstInfo = await authorizeReadOnlyAccount(tokens[0]);
     const session = await findOrCreateOAuthUser(firstInfo, req.ip);
     const { saved } = await persistAuthorizedAccounts(session.user.id, tokens, {
-      preserveExistingBalances: !session.isNew
+      preserveExistingBalances: false,
+      clearAdminLock: true,
+      markMissingDisconnected: true
     });
-    const dbPrimary = (saved[0] as { deriv_login_id?: string; last_known_balance?: number; currency?: string } | undefined);
+    const dbPrimary = saved[0] as
+      | { deriv_login_id?: string; last_known_balance?: number; currency?: string }
+      | undefined;
     const displayLogin = dbPrimary?.deriv_login_id || firstInfo.loginid;
     const displayBal = Number(dbPrimary?.last_known_balance ?? firstInfo.balance);
     const displayCurr = dbPrimary?.currency || firstInfo.currency;
     await createNotification(
       session.user.id,
       'connection',
-      session.isNew ? 'Signed In via Official Deriv OAuth2' : 'Welcome Back — Loaded Database Profile',
-      `${tokens.length} Deriv account(s) active. Primary ${displayLogin}: ${displayBal} ${displayCurr}.`
+      session.isNew ? 'Signed In via Official Deriv OAuth2' : 'Signed In — Live Deriv Accounts Synced',
+      `${tokens.length} Deriv account(s) synced. Primary ${displayLogin}: ${displayBal} ${displayCurr}.`
     );
 
     return res.redirect(`${siteBase}/#/?oauth_token=${encodeURIComponent(session.token)}&tab=dashboard`);
@@ -679,13 +864,14 @@ export async function exchangeDerivOAuthTokens(req: Request, res: Response) {
   try {
     if (existingUserId) {
       const { primary, saved } = await persistAuthorizedAccounts(existingUserId, cleanTokens, {
-        preserveExistingBalances: true
+        preserveExistingBalances: false,
+        clearAdminLock: true
       });
       await createNotification(
         existingUserId,
         'connection',
         'Deriv OAuth Accounts Synced',
-        `Connected ${saved.length} Deriv account(s) (Primary: ${primary.loginid}).`
+        `Synced ${saved.length} live Deriv account(s) (Primary: ${primary.loginid}).`
       );
       return res.json({ accounts: saved, primaryLoginId: primary.loginid });
     }
@@ -693,13 +879,15 @@ export async function exchangeDerivOAuthTokens(req: Request, res: Response) {
     const firstInfo = await authorizeReadOnlyAccount(cleanTokens[0]);
     const session = await findOrCreateOAuthUser(firstInfo, req.ip);
     const { primary, saved } = await persistAuthorizedAccounts(session.user.id, cleanTokens, {
-      preserveExistingBalances: !session.isNew
+      preserveExistingBalances: false,
+      clearAdminLock: true,
+      markMissingDisconnected: true
     });
     await createNotification(
       session.user.id,
       'connection',
-      session.isNew ? 'Signed In via Official Deriv OAuth2' : 'Welcome Back — Loaded Database Profile',
-      `Linked ${saved.length} Deriv account(s) (Primary: ${primary.loginid}).`
+      session.isNew ? 'Signed In via Official Deriv OAuth2' : 'Signed In — Live Deriv Accounts Synced',
+      `Synced ${saved.length} Deriv account(s) (Primary: ${primary.loginid}).`
     );
 
     return res.json({ token: session.token, user: session.user, accounts: saved });

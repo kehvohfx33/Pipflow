@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { apiFetch } from '../services/api';
+import { ApiError, apiFetch } from '../services/api';
 
 export interface UserProfile {
   id: string;
@@ -163,7 +163,9 @@ interface AuthContextValue {
   setDarkTheme: (v: boolean) => void;
   currency: 'USD' | 'KSH';
   setCurrency: (c: 'USD' | 'KSH') => void;
-  setSession: (token: string, user: UserProfile) => void;
+  orderVersion: number;
+  bumpOrderVersion: () => void;
+  setSession: (token: string, user: UserProfile, freshAccounts?: DerivAccountSummary[]) => void;
   refreshProfile: () => Promise<void>;
   refreshDerivAccounts: (sync?: boolean) => Promise<void>;
   refreshBranding: () => Promise<void>;
@@ -183,13 +185,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   });
   const [derivAccounts, setDerivAccounts] = useState<DerivAccountSummary[]>([]);
-  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+  const [activeAccountId, setActiveAccountIdState] = useState<string | null>(() =>
+    localStorage.getItem('pipflow_active_account_id')
+  );
   const [botGateUnlocked, setBotGateUnlocked] = useState<boolean>(true);
   const [darkTheme, setDarkThemeState] = useState<boolean>(
     () => localStorage.getItem('pipflow_dark') === 'true'
   );
-  const [currency, setCurrency] = useState<'USD' | 'KSH'>('USD');
+  const [currency, setCurrencyState] = useState<'USD' | 'KSH'>(() =>
+    localStorage.getItem('pipflow_currency') === 'KSH' ? 'KSH' : 'USD'
+  );
+  const [orderVersion, setOrderVersion] = useState(0);
   const [fastExecution, setFastExecution] = useState<boolean>(true);
+
+  const setActiveAccountId = useCallback((id: string | null) => {
+    setActiveAccountIdState(id);
+    if (id) {
+      localStorage.setItem('pipflow_active_account_id', id);
+    } else {
+      localStorage.removeItem('pipflow_active_account_id');
+    }
+  }, []);
+
+  const setCurrency = useCallback((next: 'USD' | 'KSH') => {
+    setCurrencyState(next);
+    localStorage.setItem('pipflow_currency', next);
+  }, []);
+
+  const bumpOrderVersion = useCallback(() => {
+    setOrderVersion((v) => v + 1);
+  }, []);
   const [botConfig, setBotConfig] = useState<SharedBotConfig>(() => {
     try {
       const saved = localStorage.getItem('pipflow_bot_config');
@@ -271,6 +296,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     refreshBranding();
   }, [refreshBranding]);
 
+  const logout = useCallback(() => {
+    localStorage.removeItem('pipflow_token');
+    localStorage.removeItem('pipflow_user');
+    localStorage.removeItem('pipflow_active_account_id');
+    localStorage.removeItem('pipflow_active_tab');
+    localStorage.removeItem('pipflow_active_symbol');
+    localStorage.removeItem('pipflow_chart_granularity');
+    localStorage.removeItem('pipflow_order_mode');
+    setToken(null);
+    setUser(null);
+    setDerivAccounts([]);
+    setActiveAccountIdState(null);
+  }, []);
+
   const refreshProfile = useCallback(async () => {
     const activeToken = localStorage.getItem('pipflow_token') || token;
     if (!activeToken) return;
@@ -280,10 +319,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setUser(res.user);
         localStorage.setItem('pipflow_user', JSON.stringify(res.user));
       }
-    } catch {
-      // Keep existing state if transient error
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        logout();
+      }
     }
-  }, [token]);
+  }, [token, logout]);
 
   const refreshDerivAccounts = useCallback(async (sync = false) => {
     const activeToken = localStorage.getItem('pipflow_token') || token;
@@ -307,21 +348,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [token, refreshProfile, refreshDerivAccounts]);
 
-  const setSession = (newToken: string, newUser: UserProfile) => {
+  const setSession = (
+    newToken: string,
+    newUser: UserProfile,
+    freshAccounts?: DerivAccountSummary[]
+  ) => {
     localStorage.setItem('pipflow_token', newToken);
     localStorage.setItem('pipflow_user', JSON.stringify(newUser));
     setToken(newToken);
     setUser(newUser);
+    if (Array.isArray(freshAccounts)) {
+      setDerivAccounts(freshAccounts);
+      if (activeAccountId && !freshAccounts.some((a) => a.id === activeAccountId)) {
+        localStorage.removeItem('pipflow_active_account_id');
+        setActiveAccountIdState(null);
+      }
+    }
   };
-
-  const logout = useCallback(() => {
-    localStorage.removeItem('pipflow_token');
-    localStorage.removeItem('pipflow_user');
-    setToken(null);
-    setUser(null);
-    setDerivAccounts([]);
-    setActiveAccountId(null);
-  }, []);
 
   const safeDerivAccounts = Array.isArray(derivAccounts) ? derivAccounts : [];
 
@@ -353,6 +396,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setDarkTheme,
         currency,
         setCurrency,
+        orderVersion,
+        bumpOrderVersion,
         setSession,
         refreshProfile,
         refreshDerivAccounts,

@@ -10,7 +10,7 @@ interface DashboardPageProps {
 }
 
 export const DashboardPage: React.FC<DashboardPageProps> = ({ onSelectTab }) => {
-  const { token, user, currency, branding, darkTheme } = useAuth();
+  const { token, user, currency, branding, darkTheme, orderVersion } = useAuth();
   const [subTab, setSubTab] = useState<'summary' | 'transactions' | 'journal'>('summary');
   const [orders, setOrders] = useState<VirtualOrderItem[]>([]);
   const progressChartRef = useRef<HTMLDivElement>(null);
@@ -20,7 +20,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ onSelectTab }) => 
     apiFetch<{ orders?: VirtualOrderItem[] }>('/orders')
       .then((res) => setOrders(Array.isArray(res?.orders) ? res.orders : []))
       .catch(() => {});
-  }, [token]);
+  }, [token, orderVersion]);
 
   const safeOrders = Array.isArray(orders) ? orders : [];
   const greetingId = user?.full_name || user?.email?.split('@')[0] || 'Trader';

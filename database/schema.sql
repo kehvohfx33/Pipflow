@@ -23,12 +23,14 @@ CREATE TABLE IF NOT EXISTS users (
   preferred_currency VARCHAR(10) NOT NULL DEFAULT 'USD',
   local_currency VARCHAR(10) NOT NULL DEFAULT 'KES',
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  token_version INTEGER NOT NULL DEFAULT 1,
   last_login_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id);
 
--- 3. connected_accounts (Read-only Deriv account metadata; never stores passwords)
+-- 3. connected_accounts (Deriv account metadata; never stores passwords)
 CREATE TABLE IF NOT EXISTS connected_accounts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -46,8 +48,9 @@ CREATE TABLE IF NOT EXISTS connected_accounts (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (user_id, deriv_login_id)
 );
+CREATE INDEX IF NOT EXISTS idx_connected_accounts_user ON connected_accounts(user_id, is_primary DESC);
 
--- 4. account_authorizations (AES-256-GCM encrypted user-owned read-only token; never exposed to frontend or admins)
+-- 4. account_authorizations (AES-256-GCM encrypted Deriv token; never exposed to frontend)
 CREATE TABLE IF NOT EXISTS account_authorizations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   connected_account_id UUID NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE,
@@ -60,6 +63,9 @@ CREATE TABLE IF NOT EXISTS account_authorizations (
   revoked_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_account_auth_active
+  ON account_authorizations(connected_account_id, user_id, created_at DESC)
+  WHERE revoked_at IS NULL;
 
 -- 5. market_instruments
 CREATE TABLE IF NOT EXISTS market_instruments (
@@ -109,6 +115,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   is_read BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC);
 
 -- 9. email_logs
 CREATE TABLE IF NOT EXISTS email_logs (
@@ -122,6 +129,7 @@ CREATE TABLE IF NOT EXISTS email_logs (
   error_message TEXT,
   sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_email_logs_user_sent ON email_logs(user_id, sent_at DESC);
 
 -- 10. application_settings
 CREATE TABLE IF NOT EXISTS application_settings (
@@ -143,16 +151,22 @@ CREATE TABLE IF NOT EXISTS administrator_audit_logs (
   ip_address VARCHAR(64),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON administrator_audit_logs(created_at DESC);
 
--- Supporting tables for Virtual MT5 TP/SL Orders, Bot Strategies & Security Logs
+-- 12. virtual_orders
 CREATE TABLE IF NOT EXISTS virtual_orders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  connected_account_id UUID REFERENCES connected_accounts(id) ON DELETE SET NULL,
+  deriv_contract_id BIGINT,
+  execution_mode VARCHAR(24) NOT NULL DEFAULT 'virtual',
+  contract_type VARCHAR(32) DEFAULT 'MULTUP',
+  payout NUMERIC(18, 4),
   source VARCHAR(32) NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'bot')),
   bot_name VARCHAR(120),
   symbol VARCHAR(64) NOT NULL,
   side VARCHAR(8) NOT NULL CHECK (side IN ('BUY', 'SELL')),
-  stake NUMERIC(18, 2) NOT NULL,
+  stake NUMERIC(18, 2) NOT NULL CHECK (stake > 0),
   entry_price NUMERIC(18, 8) NOT NULL,
   stop_loss NUMERIC(18, 8),
   take_profit NUMERIC(18, 8),
@@ -163,7 +177,10 @@ CREATE TABLE IF NOT EXISTS virtual_orders (
   opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   closed_at TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_virtual_orders_user_status ON virtual_orders(user_id, status, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_virtual_orders_contract ON virtual_orders(deriv_contract_id) WHERE deriv_contract_id IS NOT NULL;
 
+-- 13. bot_strategies
 CREATE TABLE IF NOT EXISTS bot_strategies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   slug VARCHAR(100) UNIQUE NOT NULL,
@@ -176,6 +193,7 @@ CREATE TABLE IF NOT EXISTS bot_strategies (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 14. security_logs
 CREATE TABLE IF NOT EXISTS security_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -185,3 +203,4 @@ CREATE TABLE IF NOT EXISTS security_logs (
   ip_address VARCHAR(64),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_security_logs_user_created ON security_logs(user_id, created_at DESC);

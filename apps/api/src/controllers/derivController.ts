@@ -533,7 +533,7 @@ async function findOrCreateOAuthUser(
     const inserted = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, virtual_workspace_balance, preferred_currency, last_login_at)
        VALUES ($1, $2, $3, 1, TRUE, $4, $5, NOW())
-       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, is_active`,
+       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, is_active, COALESCE(token_version, 1) AS token_version`,
       [bestEmail, randomPwd, bestFallbackName, initialVirtualBal, info.currency || 'USD']
     );
     userRow = { ...inserted.rows[0], role_name: 'trader' };
@@ -578,7 +578,7 @@ async function findOrCreateOAuthUser(
            END,
            updated_at = NOW()
        WHERE id = $1
-       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, is_active`,
+       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, is_active, COALESCE(token_version, 1) AS token_version`,
       [
         userRow.id,
         nextFullName,
@@ -601,7 +601,7 @@ async function findOrCreateOAuthUser(
   }
 
   const jwtToken = jwt.sign(
-    { userId: userRow.id, email: userRow.email, role: userRow.role_name },
+    { userId: userRow.id, email: userRow.email, role: userRow.role_name, tv: Number(userRow.token_version ?? 1) },
     env.jwtSecret,
     { expiresIn: '7d' }
   );

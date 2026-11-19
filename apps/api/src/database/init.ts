@@ -2,7 +2,24 @@ import { isDatabaseConfigured, pool } from './pool';
 import { logError, logInfo } from '../utils/logger';
 import bcrypt from 'bcryptjs';
 
-const SCHEMA_SQL = `
+export const DROP_ALL_TABLES_SQL = `
+DROP TABLE IF EXISTS security_logs CASCADE;
+DROP TABLE IF EXISTS administrator_audit_logs CASCADE;
+DROP TABLE IF EXISTS email_logs CASCADE;
+DROP TABLE IF EXISTS notifications CASCADE;
+DROP TABLE IF EXISTS watchlists CASCADE;
+DROP TABLE IF EXISTS market_data_cache CASCADE;
+DROP TABLE IF EXISTS virtual_orders CASCADE;
+DROP TABLE IF EXISTS account_authorizations CASCADE;
+DROP TABLE IF EXISTS connected_accounts CASCADE;
+DROP TABLE IF EXISTS bot_strategies CASCADE;
+DROP TABLE IF EXISTS application_settings CASCADE;
+DROP TABLE IF EXISTS market_instruments CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
+DROP TABLE IF EXISTS roles CASCADE;
+`;
+
+export const SCHEMA_SQL = `
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -26,10 +43,14 @@ CREATE TABLE IF NOT EXISTS users (
   preferred_currency VARCHAR(10) NOT NULL DEFAULT 'USD',
   local_currency VARCHAR(10) NOT NULL DEFAULT 'KES',
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  token_version INTEGER NOT NULL DEFAULT 1,
   last_login_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id);
 
 CREATE TABLE IF NOT EXISTS connected_accounts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -50,6 +71,7 @@ CREATE TABLE IF NOT EXISTS connected_accounts (
 );
 
 ALTER TABLE connected_accounts ADD COLUMN IF NOT EXISTS balance_locked_by_admin BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_connected_accounts_user ON connected_accounts(user_id, is_primary DESC);
 
 CREATE TABLE IF NOT EXISTS account_authorizations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -63,6 +85,10 @@ CREATE TABLE IF NOT EXISTS account_authorizations (
   revoked_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_account_auth_active
+  ON account_authorizations(connected_account_id, user_id, created_at DESC)
+  WHERE revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS market_instruments (
   symbol VARCHAR(64) PRIMARY KEY,
@@ -108,6 +134,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   is_read BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS email_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -120,6 +147,7 @@ CREATE TABLE IF NOT EXISTS email_logs (
   error_message TEXT,
   sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_email_logs_user_sent ON email_logs(user_id, sent_at DESC);
 
 CREATE TABLE IF NOT EXISTS application_settings (
   setting_key VARCHAR(100) PRIMARY KEY,
@@ -139,6 +167,7 @@ CREATE TABLE IF NOT EXISTS administrator_audit_logs (
   ip_address VARCHAR(64),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON administrator_audit_logs(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS virtual_orders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -152,7 +181,7 @@ CREATE TABLE IF NOT EXISTS virtual_orders (
   bot_name VARCHAR(120),
   symbol VARCHAR(64) NOT NULL,
   side VARCHAR(8) NOT NULL CHECK (side IN ('BUY', 'SELL')),
-  stake NUMERIC(18, 2) NOT NULL,
+  stake NUMERIC(18, 2) NOT NULL CHECK (stake > 0),
   entry_price NUMERIC(18, 8) NOT NULL,
   stop_loss NUMERIC(18, 8),
   take_profit NUMERIC(18, 8),
@@ -170,6 +199,9 @@ ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS execution_mode VARCHAR(24) N
 ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS contract_type VARCHAR(32) DEFAULT 'MULTUP';
 ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS payout NUMERIC(18, 4);
 ALTER TABLE virtual_orders ADD COLUMN IF NOT EXISTS contract_meta JSONB;
+
+CREATE INDEX IF NOT EXISTS idx_virtual_orders_user_status ON virtual_orders(user_id, status, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_virtual_orders_contract ON virtual_orders(deriv_contract_id) WHERE deriv_contract_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS bot_strategies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -192,20 +224,23 @@ CREATE TABLE IF NOT EXISTS security_logs (
   ip_address VARCHAR(64),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_security_logs_user_created ON security_logs(user_id, created_at DESC);
 `;
 
-const SEED_SQL = `
+export const SEED_SQL = `
 INSERT INTO roles (id, name, description)
 VALUES
   (1, 'trader', 'Standard Pipflowtrades workspace user'),
   (2, 'admin', 'Platform administrator')
 ON CONFLICT (name) DO NOTHING;
 
+SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 2) FROM roles));
+
 INSERT INTO application_settings (setting_key, setting_value, is_secret)
 VALUES
-  ('branding', '{"appName":"TradeDeriv","tickerText":"WELCOME TO TRADEDERIV — YOUR HUB FOR TRADING KNOWLEDGE, DERIV INDICES, AND MORE","kesRate":130.0}'::jsonb, FALSE),
+  ('branding', '{"appName":"Pipflowtrades","tickerText":"WELCOME TO PIPFLOWTRADES — YOUR HUB FOR TRADING KNOWLEDGE, DERIV INDICES, AND MORE","kesRate":130.0}'::jsonb, FALSE),
   ('global_settings', '{"maintenanceMode":false,"allowRegistration":true,"defaultVirtualBalance":10000}'::jsonb, FALSE),
-  ('site_controls', '{"showDepositWithdraw":true,"depositUrl":"https://app.deriv.com/cashier/deposit","withdrawUrl":"https://app.deriv.com/cashier/withdrawal","cashierNote":"Deposit or withdraw instantly via Official Deriv Cashier or M-Pesa / KES Payment Agent.","riskDisclaimerText":"TradeDeriv connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.","enabledTabs":["dashboard","bot_builder","charts","freebots","bulk_trader","analysistool","reports","trading_plan","copy_trading","dtrader","trading_view"]}'::jsonb, FALSE),
+  ('site_controls', '{"showDepositWithdraw":true,"depositUrl":"https://app.deriv.com/cashier/deposit","withdrawUrl":"https://app.deriv.com/cashier/withdrawal","cashierNote":"Deposit or withdraw instantly via Official Deriv Cashier or M-Pesa / KES Payment Agent.","riskDisclaimerText":"Pipflowtrades connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.","enabledTabs":["dashboard","bot_builder","charts","freebots","bulk_trader","analysistool","reports","trading_plan","copy_trading","dtrader","trading_view"]}'::jsonb, FALSE),
   ('bot_analyser_password_hash', '{"hash":"$2a$10$c5k0i8lC5h7vT2Y5zN1N.O7jQ6N6K3vW9wP4B8K8X4X5q3J8H8Z6q"}'::jsonb, TRUE)
 ON CONFLICT (setting_key) DO NOTHING;
 
@@ -215,8 +250,18 @@ VALUES
   ('autodifferbylegoo', 'AutoDifferbylegoo', 'Free Bots', 'R_25', '{"tradeType":"Digits > Matches/Differs","stake":5,"tpPct":0.06,"slPct":0.04,"martingale":1.5}'::jsonb, TRUE),
   ('magic-recovery', 'MagicRecovery', 'SpeedBots', 'R_50', '{"tradeType":"EMA_CROSS","stake":15,"tpPct":0.10,"slPct":0.06,"martingale":2}'::jsonb, TRUE),
   ('autovolt5probot1', 'Autovolt5Probot1', 'Scalper Bots', '1HZ100V', '{"tradeType":"RSI_SCALP","stake":10,"tpPct":0.07,"slPct":0.04,"martingale":1.5}'::jsonb, TRUE),
+  ('04-20-over-edge-money-bot', '04_20_Over_Edge_Money_Bot', 'Free Bots', 'R_75', '{"tradeType":"Digits > Over/Under","stake":10,"tpPct":0.09,"slPct":0.05,"martingale":2}'::jsonb, TRUE),
+  ('expert-speed-bot', 'ExpertSpeedBotByCHOSENDOLLARPRINTERFX', 'SpeedBots', '1HZ90V', '{"tradeType":"TICK_IMBALANCE","stake":12,"tpPct":0.08,"slPct":0.05,"martingale":2}'::jsonb, TRUE),
+  ('martingale-matches-differs', 'martingale_matches_differs', 'Bots Store', 'R_10', '{"tradeType":"Digits > Matches/Differs","stake":5,"tpPct":0.07,"slPct":0.04,"martingale":2}'::jsonb, TRUE),
+  ('vx', 'Vx', 'Scalper Bots', 'R_50', '{"tradeType":"MOMENTUM","stake":10,"tpPct":0.08,"slPct":0.05,"martingale":1.5}'::jsonb, TRUE),
+  ('recover-over-bandwagon', 'Recover_Over_Bandwagon', 'Free Bots', 'R_100', '{"tradeType":"Digits > Over/Under","stake":10,"tpPct":0.08,"slPct":0.05,"martingale":2}'::jsonb, TRUE),
   ('alpha-version-2026', 'AlphaVersion2026Edition', 'Free Bots', 'R_75', '{"tradeType":"BREAKOUT","stake":20,"tpPct":0.10,"slPct":0.06,"martingale":2}'::jsonb, TRUE),
-  ('signal-sniper-autobot', 'SignalSniperAutoBot', 'Scalper Bots', '1HZ90V', '{"tradeType":"TICK_IMBALANCE","stake":10,"tpPct":0.08,"slPct":0.05,"martingale":1.5}'::jsonb, TRUE)
+  ('signal-sniper-autobot', 'SignalSniperAutoBot', 'Scalper Bots', '1HZ90V', '{"tradeType":"TICK_IMBALANCE","stake":10,"tpPct":0.08,"slPct":0.05,"martingale":1.5}'::jsonb, TRUE),
+  ('rise-fall-switcher-bot', 'RiseFallswitcherBot', 'Free Bots', 'R_25', '{"tradeType":"Up/Down > Rise/Fall","stake":10,"tpPct":0.07,"slPct":0.04,"martingale":2}'::jsonb, TRUE),
+  ('08-odd-myth-v3', '08_ODD_MYTH_V3_0', 'Free Bots', 'R_100', '{"tradeType":"Digits > Even/Odd","stake":10,"tpPct":0.08,"slPct":0.05,"martingale":2}'::jsonb, TRUE),
+  ('dstrike2', 'Dstrike2', 'SpeedBots', '1HZ100V', '{"tradeType":"MOMENTUM","stake":15,"tpPct":0.09,"slPct":0.05,"martingale":2}'::jsonb, TRUE),
+  ('hurmy-autobot', 'HuRmYAUTOBoTBYHURMYFXKE', 'Bots Store', 'R_75', '{"tradeType":"EMA_CROSS","stake":10,"tpPct":0.08,"slPct":0.05,"martingale":2}'::jsonb, TRUE),
+  ('hurmy-speedbot-pro-v2', 'HuRmYSPEEDBOTPROv2', 'SpeedBots', '1HZ100V', '{"tradeType":"RSI_SCALP","stake":10,"tpPct":0.08,"slPct":0.05,"martingale":2}'::jsonb, TRUE)
 ON CONFLICT (slug) DO NOTHING;
 `;
 
@@ -233,7 +278,7 @@ async function syncEnvAdminUser() {
   if ((existingAdmin.rows[0]?.cnt ?? 0) > 0) {
     return;
   }
-  const passwordHash = await bcrypt.hash(adminPassword, 10);
+  const passwordHash = await bcrypt.hash(adminPassword, 12);
   await pool.query(
     `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, is_active)
      VALUES ($1, $2, 'Platform Administrator', 2, TRUE, TRUE)
@@ -242,10 +287,43 @@ async function syncEnvAdminUser() {
        role_id = 2,
        is_email_verified = TRUE,
        is_active = TRUE,
+       token_version = users.token_version + 1,
        updated_at = NOW()`,
     [adminEmail, passwordHash]
   );
+  await pool.query(
+    `INSERT INTO application_settings (setting_key, setting_value, is_secret)
+     VALUES ('admin_credentials', $1::jsonb, TRUE)
+     ON CONFLICT (setting_key) DO UPDATE SET
+       setting_value = EXCLUDED.setting_value,
+       is_secret = TRUE,
+       updated_at = NOW()`,
+    [JSON.stringify({ email: adminEmail, passwordHash })]
+  );
   logInfo('database', `Seeded admin account in users table: ${adminEmail}`);
+}
+
+export async function rebuildDatabaseFromScratch(): Promise<void> {
+  if (!isDatabaseConfigured) {
+    throw new Error('DATABASE_URL is not configured');
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(DROP_ALL_TABLES_SQL);
+    await client.query(SCHEMA_SQL);
+    await client.query(SEED_SQL);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  await syncEnvAdminUser();
+  schemaReady = true;
+  schemaPromise = null;
+  logInfo('database', 'Clean PostgreSQL database rebuild completed from scratch');
 }
 
 export async function ensureDatabaseSchema(): Promise<void> {
@@ -263,10 +341,10 @@ export async function ensureDatabaseSchema(): Promise<void> {
         await pool.query(SEED_SQL);
         await syncEnvAdminUser();
         schemaReady = true;
-        logInfo('database', 'Neon PostgreSQL schema and seed verified');
+        logInfo('database', 'PostgreSQL schema and seed verified');
       } catch (err) {
         schemaPromise = null;
-        logError('database', 'Failed to initialize Neon PostgreSQL schema (check DATABASE_URL)', err);
+        logError('database', 'Failed to initialize PostgreSQL schema (check DATABASE_URL)', err);
       }
     })();
   }

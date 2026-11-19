@@ -30,14 +30,14 @@ export async function register(req: Request, res: Response) {
   }
   const initialBalance = Number(globalCfg.defaultVirtualBalance ?? 10000);
 
-  const hash = await bcrypt.hash(password, 10);
+  const hash = await bcrypt.hash(password, 12);
   const verifyToken = crypto.randomBytes(24).toString('hex');
 
   try {
     const result = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role_id, virtual_workspace_balance, email_verification_token)
        VALUES ($1, $2, $3, 1, $4, $5)
-       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency`,
+       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, COALESCE(token_version, 1) AS token_version`,
       [email.trim().toLowerCase(), hash, fullName?.trim() || 'Trader', initialBalance, verifyToken]
     );
     const user = result.rows[0];
@@ -53,9 +53,11 @@ export async function register(req: Request, res: Response) {
 
     await logSecurityEvent(user.id, 'USER_REGISTERED', 'info', { email: user.email }, req.ip);
 
-    const token = jwt.sign({ userId: user.id, email: user.email, role: 'trader' }, env.jwtSecret, {
-      expiresIn: '7d'
-    });
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: 'trader', tv: Number(user.token_version ?? 1) },
+      env.jwtSecret,
+      { expiresIn: '7d' }
+    );
     res.status(201).json({ token, user: { ...user, role: 'trader' } });
   } catch {
     res.status(409).json({ error: 'Email already registered' });
@@ -110,7 +112,7 @@ export async function login(req: Request, res: Response) {
   await logSecurityEvent(user.id, 'LOGIN_SUCCESS', 'info', { role: user.role_name }, req.ip);
 
   const token = jwt.sign(
-    { userId: user.id, email: user.email, role: user.role_name },
+    { userId: user.id, email: user.email, role: user.role_name, tv: Number(user.token_version ?? 1) },
     env.jwtSecret,
     { expiresIn: '7d' }
   );
@@ -188,9 +190,14 @@ export async function resetPassword(req: Request, res: Response) {
   if (!token || !newPassword || newPassword.length < 8) {
     return res.status(400).json({ error: 'Valid reset token and password (min 8 chars) required' });
   }
-  const hash = await bcrypt.hash(newPassword, 10);
+  const hash = await bcrypt.hash(newPassword, 12);
   const q = await pool.query(
-    `UPDATE users SET password_hash = $1, password_reset_token = NULL, password_reset_expires_at = NULL
+    `UPDATE users
+     SET password_hash = $1,
+         password_reset_token = NULL,
+         password_reset_expires_at = NULL,
+         token_version = COALESCE(token_version, 1) + 1,
+         updated_at = NOW()
      WHERE password_reset_token = $2 AND password_reset_expires_at > NOW() RETURNING id, email`,
     [hash, token]
   );

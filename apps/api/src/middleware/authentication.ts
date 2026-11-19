@@ -7,6 +7,7 @@ export interface AuthUser {
   userId: string;
   email: string;
   role: 'trader' | 'admin';
+  tv?: number;
 }
 
 declare global {
@@ -28,7 +29,8 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
     if (isDatabaseConfigured) {
       const q = await pool.query(
-        `SELECT u.email, u.is_active, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
+        `SELECT u.email, u.is_active, COALESCE(u.token_version, 1) AS token_version, r.name as role_name
+         FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
         [payload.userId]
       );
       const dbUser = q.rows[0];
@@ -38,10 +40,14 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       if (!dbUser.is_active) {
         return res.status(403).json({ error: 'Account suspended by administrator' });
       }
+      if (Number(payload.tv ?? 1) !== Number(dbUser.token_version)) {
+        return res.status(401).json({ error: 'Session invalidated. Please sign in again.' });
+      }
       req.user = {
         userId: payload.userId,
         email: dbUser.email,
-        role: dbUser.role_name
+        role: dbUser.role_name,
+        tv: Number(dbUser.token_version)
       };
     } else {
       req.user = payload;

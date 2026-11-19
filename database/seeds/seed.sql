@@ -6,11 +6,12 @@ ON CONFLICT (name) DO NOTHING;
 
 SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 2) FROM roles));
 
--- Default Market Analyser & Trading Bot gate password hash ("Pipflow@2026" — update via Admin Console)
+-- Default settings & Bot gate password hash ("Pipflow@2026" — rotate via Admin Console after first login)
 INSERT INTO application_settings (setting_key, setting_value, is_secret)
 VALUES
   ('branding', '{"appName":"Pipflowtrades","tickerText":"WELCOME TO PIPFLOWTRADES — YOUR HUB FOR TRADING KNOWLEDGE, DERIV INDICES, AND MORE","kesRate":130.0}'::jsonb, FALSE),
   ('global_settings', '{"maintenanceMode":false,"allowRegistration":true,"defaultVirtualBalance":10000}'::jsonb, FALSE),
+  ('site_controls', '{"showDepositWithdraw":true,"depositUrl":"https://app.deriv.com/cashier/deposit","withdrawUrl":"https://app.deriv.com/cashier/withdrawal","cashierNote":"Deposit or withdraw instantly via Official Deriv Cashier or M-Pesa / KES Payment Agent.","riskDisclaimerText":"Pipflowtrades connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.","enabledTabs":["dashboard","bot_builder","charts","freebots","bulk_trader","analysistool","reports","trading_plan","copy_trading","dtrader","trading_view"]}'::jsonb, FALSE),
   ('bot_analyser_password_hash', '{"hash":"$2a$10$c5k0i8lC5h7vT2Y5zN1N.O7jQ6N6K3vW9wP4B8K8X4X5q3J8H8Z6q"}'::jsonb, TRUE)
 ON CONFLICT (setting_key) DO NOTHING;
 

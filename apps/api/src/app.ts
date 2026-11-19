@@ -17,18 +17,30 @@ import { logInfo, logError } from './utils/logger';
 
 export function createApiApp() {
   const app = express();
+  app.disable('x-powered-by');
   app.set('trust proxy', 1);
   app.use(
     helmet({
-      contentSecurityPolicy: false
+      contentSecurityPolicy: false,
+      frameguard: false,
+      crossOriginEmbedderPolicy: false,
+      referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+      hsts: env.nodeEnv === 'production' ? { maxAge: 31536000, includeSubDomains: true } : false
     })
   );
   app.use(cors({ origin: true, credentials: true }));
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '256kb' }));
   app.use('/api', router);
   app.get(['/callback', '/callback/'], requireDb, (req: Request, res: Response, next: NextFunction) => {
     Promise.resolve(handleDerivOAuthCallback(req, res)).catch(next);
   });
+
+  if (env.nodeEnv === 'production' && (!process.env.JWT_SECRET || !process.env.TOKEN_ENCRYPTION_KEY)) {
+    logError(
+      'security',
+      'JWT_SECRET or TOKEN_ENCRYPTION_KEY is unset in production; ephemeral fallback keys invalidate sessions on restart'
+    );
+  }
 
   // Global Express JSON error handler so unhandled DB/API errors never crash the process
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

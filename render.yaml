@@ -1,8 +1,12 @@
+# Render Blueprint — deploys as a fresh new Pipflowtrades web service.
+# Connect a clean Neon / PostgreSQL database via DATABASE_URL and visit /#/_console on first boot
+# to initialize your Administrator email and password directly in the database.
 services:
   - type: web
-    name: tradederiv
+    name: pipflowtrades
     runtime: node
     plan: starter
+    autoDeploy: true
     buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
@@ -36,7 +40,7 @@ services:
       - key: BREVO_SENDER_EMAIL
         sync: false
       - key: BREVO_SENDER_NAME
-        value: TradeDeriv
+        value: Pipflowtrades
       - key: FRONTEND_URL
         sync: false
       - key: VITE_DERIV_APP_ID

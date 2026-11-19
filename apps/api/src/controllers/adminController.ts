@@ -53,7 +53,7 @@ export async function bootstrapAdmin(req: Request, res: Response) {
     });
   }
 
-  const passwordHash = await bcrypt.hash(password, 10);
+  const passwordHash = await bcrypt.hash(password, 12);
   const existing = await pool.query(`SELECT id FROM users WHERE email = $1`, [cleanEmail]);
   let adminUser;
 
@@ -65,10 +65,11 @@ export async function bootstrapAdmin(req: Request, res: Response) {
            role_id = $3,
            is_email_verified = TRUE,
            is_active = TRUE,
+           token_version = COALESCE(token_version, 1) + 1,
            last_login_at = NOW(),
            updated_at = NOW()
        WHERE id = $4
-       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency`,
+       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, COALESCE(token_version, 1) AS token_version`,
       [passwordHash, fullName?.trim() || '', adminRoleId, existing.rows[0].id]
     );
     adminUser = updated.rows[0];
@@ -76,7 +77,7 @@ export async function bootstrapAdmin(req: Request, res: Response) {
     const inserted = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, is_active, last_login_at)
        VALUES ($1, $2, $3, $4, TRUE, TRUE, NOW())
-       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency`,
+       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, COALESCE(token_version, 1) AS token_version`,
       [cleanEmail, passwordHash, fullName?.trim() || 'Platform Administrator', adminRoleId]
     );
     adminUser = inserted.rows[0];
@@ -91,7 +92,7 @@ export async function bootstrapAdmin(req: Request, res: Response) {
   await logSecurityEvent(adminUser.id, 'ADMIN_BOOTSTRAPPED', 'info', { email: cleanEmail }, req.ip);
 
   const token = jwt.sign(
-    { userId: adminUser.id, email: adminUser.email, role: 'admin' },
+    { userId: adminUser.id, email: adminUser.email, role: 'admin', tv: Number(adminUser.token_version ?? 1) },
     env.jwtSecret,
     { expiresIn: '7d' }
   );
@@ -147,7 +148,7 @@ export async function adminLogin(req: Request, res: Response) {
   await logSecurityEvent(user.id, 'ADMIN_LOGIN_SUCCESS', 'info', { email: cleanEmail }, req.ip);
 
   const token = jwt.sign(
-    { userId: user.id, email: user.email, role: 'admin' },
+    { userId: user.id, email: user.email, role: 'admin', tv: Number(user.token_version ?? 1) },
     env.jwtSecret,
     { expiresIn: '7d' }
   );
@@ -273,12 +274,17 @@ export async function updateAdminCredentials(req: Request, res: Response) {
   if (!current) return res.status(404).json({ error: 'Admin user not found' });
 
   const targetEmail = cleanEmail || current.email;
-  const targetHash = newPassword ? await bcrypt.hash(newPassword, 10) : current.password_hash;
+  const targetHash = newPassword ? await bcrypt.hash(newPassword, 12) : current.password_hash;
 
   try {
     const updated = await pool.query(
-      `UPDATE users SET email = $1, password_hash = $2, updated_at = NOW() WHERE id = $3
-       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency`,
+      `UPDATE users
+       SET email = $1,
+           password_hash = $2,
+           token_version = COALESCE(token_version, 1) + 1,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, COALESCE(token_version, 1) AS token_version`,
       [targetEmail, targetHash, req.user!.userId]
     );
     await upsertSetting('admin_credentials', { email: targetEmail, passwordHash: targetHash }, true, req.user!.userId);
@@ -290,7 +296,7 @@ export async function updateAdminCredentials(req: Request, res: Response) {
     await logSecurityEvent(req.user!.userId, 'ADMIN_CREDENTIALS_UPDATED', 'info', { email: targetEmail }, req.ip);
 
     const token = jwt.sign(
-      { userId: updated.rows[0].id, email: updated.rows[0].email, role: 'admin' },
+      { userId: updated.rows[0].id, email: updated.rows[0].email, role: 'admin', tv: Number(updated.rows[0].token_version ?? 1) },
       env.jwtSecret,
       { expiresIn: '7d' }
     );
@@ -319,7 +325,10 @@ export async function updateUserRole(req: Request, res: Response) {
     return res.status(400).json({ error: 'Cannot remove your own admin role while signed in' });
   }
   const roleId = role === 'admin' ? 2 : 1;
-  await pool.query(`UPDATE users SET role_id = $1, updated_at = NOW() WHERE id = $2`, [roleId, targetId]);
+  await pool.query(
+    `UPDATE users SET role_id = $1, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE id = $2`,
+    [roleId, targetId]
+  );
   await pool.query(
     `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
      VALUES ($1, 'UPDATE_USER_ROLE', 'user', $2, $3::jsonb, $4)`,
@@ -549,10 +558,15 @@ export async function adminConnectDerivToken(req: Request, res: Response) {
 export async function toggleUserStatus(req: Request, res: Response) {
   const targetId = String(req.params.id);
   const { isActive } = req.body as { isActive: boolean };
-  await pool.query(`UPDATE users SET is_active = $1, updated_at = NOW() WHERE id = $2`, [
-    Boolean(isActive),
-    targetId
-  ]);
+  const nextActive = Boolean(isActive);
+  await pool.query(
+    `UPDATE users
+     SET is_active = $1,
+         token_version = CASE WHEN $1 = FALSE THEN COALESCE(token_version, 1) + 1 ELSE token_version END,
+         updated_at = NOW()
+     WHERE id = $2`,
+    [nextActive, targetId]
+  );
   await pool.query(
     `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
      VALUES ($1, 'UPDATE_USER_STATUS', 'user', $2, $3::jsonb, $4)`,
@@ -714,15 +728,24 @@ export async function updateUser(req: Request, res: Response) {
       ? Number(virtualBalance)
       : Number(cur.virtual_workspace_balance);
   const nextActive = isActive !== undefined ? Boolean(isActive) : cur.is_active;
-  const nextHash = newPassword && newPassword.length >= 6 ? await bcrypt.hash(newPassword, 10) : cur.password_hash;
+  const passwordChanged = Boolean(newPassword && newPassword.length >= 6);
+  const nextHash = passwordChanged ? await bcrypt.hash(newPassword!, 12) : cur.password_hash;
+  const shouldRotateTokens = passwordChanged || nextRoleId !== cur.role_id || !nextActive;
 
   try {
     const updated = await pool.query(
       `UPDATE users
-       SET email = $1, full_name = $2, role_id = $3, virtual_workspace_balance = $4, is_active = $5, password_hash = $6, updated_at = NOW()
-       WHERE id = $7
+       SET email = $1,
+           full_name = $2,
+           role_id = $3,
+           virtual_workspace_balance = $4,
+           is_active = $5,
+           password_hash = $6,
+           token_version = CASE WHEN $7 = TRUE THEN COALESCE(token_version, 1) + 1 ELSE token_version END,
+           updated_at = NOW()
+       WHERE id = $8
        RETURNING id, email, full_name, virtual_workspace_balance, is_active, is_email_verified, last_login_at, created_at`,
-      [nextEmail, nextName, nextRoleId, nextBalance, nextActive, nextHash, targetId]
+      [nextEmail, nextName, nextRoleId, nextBalance, nextActive, nextHash, shouldRotateTokens, targetId]
     );
     if (virtualBalance !== undefined && !Number.isNaN(Number(virtualBalance))) {
       await pool.query(

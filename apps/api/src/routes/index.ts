@@ -4,6 +4,7 @@ import { derivConnectionManager } from '../integrations/deriv/connection-manager
 import { getPublicSettings } from '../services/settings-service';
 import { requireAuth } from '../middleware/authentication';
 import { requireAdmin, requireDb } from '../middleware/authorization';
+import { adminAuthRateLimiter, authRateLimiter } from '../middleware/rate-limit';
 import * as authCtrl from '../controllers/authController';
 import * as derivCtrl from '../controllers/derivController';
 import * as marketCtrl from '../controllers/marketController';
@@ -40,13 +41,13 @@ router.get(
 );
 
 // Authentication & Password Gate
-router.post('/auth/register', requireDb, asyncHandler(authCtrl.register));
-router.post('/auth/login', requireDb, asyncHandler(authCtrl.login));
+router.post('/auth/register', authRateLimiter, requireDb, asyncHandler(authCtrl.register));
+router.post('/auth/login', authRateLimiter, requireDb, asyncHandler(authCtrl.login));
 router.get('/auth/me', requireDb, asyncHandler(requireAuth), asyncHandler(authCtrl.getMe));
 router.get('/auth/verify-email', requireDb, asyncHandler(authCtrl.verifyEmail));
-router.post('/auth/forgot-password', requireDb, asyncHandler(authCtrl.forgotPassword));
-router.post('/auth/reset-password', requireDb, asyncHandler(authCtrl.resetPassword));
-router.post('/bot-gate/unlock', requireDb, asyncHandler(requireAuth), asyncHandler(authCtrl.unlockBotAnalyserGate));
+router.post('/auth/forgot-password', authRateLimiter, requireDb, asyncHandler(authCtrl.forgotPassword));
+router.post('/auth/reset-password', authRateLimiter, requireDb, asyncHandler(authCtrl.resetPassword));
+router.post('/bot-gate/unlock', authRateLimiter, requireDb, asyncHandler(requireAuth), asyncHandler(authCtrl.unlockBotAnalyserGate));
 
 // Official Deriv OAuth2 Sign-Up / Login & Read-Only Account Management
 router.get('/deriv/oauth-url/public', asyncHandler(derivCtrl.getPublicDerivOAuthUrl));
@@ -89,8 +90,8 @@ router.patch('/notifications/:id/read', requireDb, asyncHandler(requireAuth), as
 
 // Server-Side Database-Backed Administrator Authentication & Modules
 router.get('/admin/bootstrap-status', requireDb, asyncHandler(adminCtrl.getAdminBootstrapStatus));
-router.post('/admin/bootstrap', requireDb, asyncHandler(adminCtrl.bootstrapAdmin));
-router.post('/admin/login', requireDb, asyncHandler(adminCtrl.adminLogin));
+router.post('/admin/bootstrap', adminAuthRateLimiter, requireDb, asyncHandler(adminCtrl.bootstrapAdmin));
+router.post('/admin/login', adminAuthRateLimiter, requireDb, asyncHandler(adminCtrl.adminLogin));
 
 router.get('/admin/overview', requireDb, asyncHandler(requireAuth), asyncHandler(requireAdmin), asyncHandler(adminCtrl.getAdminOverview));
 router.put(

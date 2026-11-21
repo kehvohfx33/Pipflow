@@ -8,8 +8,46 @@ import {
 } from '../integrations/deriv/market-data';
 
 const subscribedSymbols = new Set<string>();
+const desiredSymbols = new Set<string>();
+const latestTicks = new Map<string, { symbol: string; quote: number; epoch: number; pip_size?: number }>();
 let cachedSymbols: NormalizedSymbol[] = [];
 let lastSyncAt = 0;
+let socketListenersBound = false;
+
+function bindMarketSocketListeners() {
+  if (socketListenersBound) return;
+  socketListenersBound = true;
+  const client = derivConnectionManager.getMarketClient();
+
+  client.socket.on('tick', (msg: { tick?: { symbol: string; quote: number; epoch: number; pip_size?: number } }) => {
+    if (msg?.tick?.symbol) {
+      latestTicks.set(msg.tick.symbol, msg.tick);
+    }
+  });
+
+  client.socket.on('close', () => {
+    subscribedSymbols.clear();
+  });
+
+  client.socket.on('open', () => {
+    subscribedSymbols.clear();
+    const list = Array.from(desiredSymbols);
+    list.forEach((sym, idx) => {
+      setTimeout(() => {
+        ensureLiveTickSubscription(sym).catch(() => {});
+      }, idx * 30);
+    });
+  });
+}
+
+export function getLatestTicksForSymbols(symbols: string[]) {
+  const out: Array<{ symbol: string; quote: number; epoch: number; pip_size?: number }> = [];
+  for (const sym of symbols) {
+    const tick = latestTicks.get(sym.trim());
+    if (tick) out.push(tick);
+  }
+  return out;
+}
 
 function persistInstrumentsToDb(symbols: NormalizedSymbol[]) {
   if (!isDatabaseConfigured || symbols.length === 0) return;
@@ -84,8 +122,10 @@ export async function getInstrumentsFromDbOrDeriv() {
 }
 
 export async function ensureLiveTickSubscription(symbol: string) {
+  bindMarketSocketListeners();
   const clean = symbol.trim();
   if (!clean) return;
+  desiredSymbols.add(clean);
   const client = derivConnectionManager.getMarketClient();
   if (!client.socket.isOpen()) {
     subscribedSymbols.clear();

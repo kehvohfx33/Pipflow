@@ -222,8 +222,8 @@ export const AdminDashboard: React.FC = () => {
   const [commData, setCommData] = useState<CommissionsResponse | null>(null);
   const [loadingComm, setLoadingComm] = useState(false);
   const [commAppId, setCommAppId] = useState('');
-  const [commAppName, setCommAppName] = useState('TradeDeriv');
-  const [commDomain, setCommDomain] = useState('https://tradederiv-eiiy.onrender.com');
+  const [commAppName, setCommAppName] = useState('Pipflowtrades');
+  const [commDomain, setCommDomain] = useState('https://pipflowtrade.site');
   const [commTargetPct, setCommTargetPct] = useState(2.0);
   const [commAffiliateUrl, setCommAffiliateUrl] = useState('');
   const [commSidc, setCommSidc] = useState('');
@@ -340,8 +340,8 @@ export const AdminDashboard: React.FC = () => {
         setCommData(res);
         if (res.config) {
           setCommAppId(res.config.appId || '');
-          setCommAppName(res.config.appName || 'TradeDeriv');
-          setCommDomain(res.config.domain || 'https://tradederiv-eiiy.onrender.com');
+          setCommAppName(res.config.appName || 'Pipflowtrades');
+          setCommDomain(res.config.domain || 'https://pipflowtrade.site');
           setCommTargetPct(Number(res.config.targetMarkupPct ?? 2.0));
           setCommAffiliateUrl(res.config.affiliateUrl || '');
           setCommSidc(res.config.sidcCode || '');
@@ -453,7 +453,7 @@ export const AdminDashboard: React.FC = () => {
                 {!bootstrapChecked
                   ? 'Checking Database Setup...'
                   : adminInitialized
-                    ? 'TradeDeriv Owner Console'
+                    ? 'Pipflowtrades Owner Console'
                     : 'Initialize Owner Account'}
               </span>
             </div>
@@ -1070,7 +1070,7 @@ export const AdminDashboard: React.FC = () => {
                     <input
                       value={commDomain}
                       onChange={(e) => setCommDomain(e.target.value)}
-                      placeholder="https://pipflow.site"
+                      placeholder="https://pipflowtrade.site"
                       className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 font-mono"
                     />
                   </div>

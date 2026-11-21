@@ -41,7 +41,7 @@ export const PipflowLogo: React.FC<PipflowLogoProps> = ({
     >
       <img
         src="/assets/aistudio/IMG-20261115-WA0009_aca2a037.jpg"
-        alt="Pipflow.site Logo"
+        alt="Pipflowtrades Logo"
         className="h-9 w-9 rounded-full object-cover border border-emerald-500/60 shadow-sm shrink-0 bg-black"
         draggable={false}
       />

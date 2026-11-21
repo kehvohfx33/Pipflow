@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /_console
+Disallow: /callback
+
+Sitemap: https://pipflowtrade.site/sitemap.xml

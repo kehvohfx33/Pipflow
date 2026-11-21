@@ -93,200 +93,200 @@ router.get('/admin/bootstrap-status', requireDb, asyncHandler(adminCtrl.getAdmin
 router.post('/admin/bootstrap', adminAuthRateLimiter, requireDb, asyncHandler(adminCtrl.bootstrapAdmin));
 router.post('/admin/login', adminAuthRateLimiter, requireDb, asyncHandler(adminCtrl.adminLogin));
 
-router.get('/admin/overview', requireDb, asyncHandler(requireAuth), asyncHandler(requireAdmin), asyncHandler(adminCtrl.getAdminOverview));
+router.get('/admin/overview', asyncHandler(requireAuth), requireDb, asyncHandler(requireAdmin), asyncHandler(adminCtrl.getAdminOverview));
 router.put(
   '/admin/settings/admin-credentials',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateAdminCredentials)
 );
 router.patch(
   '/admin/users/:id/role',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateUserRole)
 );
 router.patch(
   '/admin/users/:id/virtual-balance',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateUserVirtualBalance)
 );
 router.patch(
   '/admin/connected-accounts/:id/balance',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateConnectedAccountBalance)
 );
 router.post(
   '/admin/connected-accounts/:id/sync',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.adminSyncConnectedAccount)
 );
 router.post(
   '/admin/connected-accounts/:id/disconnect',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.adminDisconnectConnectedAccount)
 );
 router.post(
   '/admin/connected-accounts/:id/revoke',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.adminRevokeConnectedAccount)
 );
 router.post(
   '/admin/connected-accounts/connect',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.adminConnectDerivToken)
 );
 router.patch(
   '/admin/users/:id/status',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.toggleUserStatus)
 );
 router.put(
   '/admin/settings/bot-password',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateBotGatePassword)
 );
 router.put(
   '/admin/settings/branding',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateBrandingSettings)
 );
 router.put(
   '/admin/settings/global',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateGlobalSettings)
 );
 router.put(
   '/admin/settings/site-controls',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateSiteControls)
 );
 router.post(
   '/admin/announcements',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.broadcastAnnouncement)
 );
 router.delete(
   '/admin/announcements/:id',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.deleteAnnouncement)
 );
 router.post(
   '/admin/users',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.createUser)
 );
 router.patch(
   '/admin/users/:id',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateUser)
 );
 router.delete(
   '/admin/users/:id',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.deleteUser)
 );
 router.delete(
   '/admin/connected-accounts/:id',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.deleteConnectedAccount)
 );
 router.post(
   '/admin/strategies',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.createStrategy)
 );
 router.patch(
   '/admin/strategies/:id',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateStrategy)
 );
 router.delete(
   '/admin/strategies/:id',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.deleteStrategy)
 );
 router.post(
   '/admin/orders/close-all',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.closeAllAdminOrders)
 );
 router.post(
   '/admin/orders/:id/close',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.closeAdminOrder)
 );
 router.delete(
   '/admin/orders/:id',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.deleteAdminOrder)
 );
 router.get(
   '/admin/commissions',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.getDerivCommissions)
 );
 router.get(
   '/admin/commissions/oauth-url',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.getAdminCommissionOAuthUrl)
 );
 router.put(
   '/admin/commissions/config',
-  requireDb,
   asyncHandler(requireAuth),
+  requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateDerivCommissionConfig)
 );

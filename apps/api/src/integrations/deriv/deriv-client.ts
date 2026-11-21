@@ -22,6 +22,8 @@ export class DerivClient {
 
 export class OtpDerivClient {
   private ws: WebSocket | null = null;
+  private connectPromise: Promise<void> | null = null;
+  private pingTimer: NodeJS.Timeout | null = null;
   private reqSeq = 1;
   private pending = new Map<
     number,
@@ -30,9 +32,36 @@ export class OtpDerivClient {
 
   constructor(private readonly otpUrl: string) {}
 
+  isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  private startKeepalive() {
+    this.stopKeepalive();
+    this.pingTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send(JSON.stringify({ ping: 1 }));
+        } catch {
+          // ignore
+        }
+      }
+    }, 25000);
+    this.pingTimer.unref?.();
+  }
+
+  private stopKeepalive() {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
   async connect(timeoutMs = 10000): Promise<void> {
     if (this.ws?.readyState === WebSocket.OPEN) return;
-    await new Promise<void>((resolve, reject) => {
+    if (this.connectPromise) return this.connectPromise;
+
+    this.connectPromise = new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(this.otpUrl, {
         headers: {
           Origin: 'https://app.deriv.com',
@@ -41,24 +70,39 @@ export class OtpDerivClient {
         handshakeTimeout: timeoutMs
       });
 
+      let settled = false;
       const timer = setTimeout(() => {
-        try {
-          ws.terminate();
-        } catch {
-          // ignore
+        if (!settled) {
+          settled = true;
+          try {
+            ws.terminate();
+          } catch {
+            // ignore
+          }
+          reject(new Error('Timeout connecting to Deriv OTP trading WebSocket'));
         }
-        reject(new Error('Timeout connecting to Deriv OTP trading WebSocket'));
       }, timeoutMs);
 
       ws.once('open', () => {
         clearTimeout(timer);
-        this.ws = ws;
-        resolve();
+        if (!settled) {
+          settled = true;
+          this.ws = ws;
+          this.startKeepalive();
+          resolve();
+        }
       });
 
       ws.once('error', (err) => {
         clearTimeout(timer);
-        reject(err);
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      });
+
+      ws.on('error', () => {
+        // Prevent unhandled error crashes after socket is open
       });
 
       ws.on('message', (raw) => {
@@ -77,14 +121,21 @@ export class OtpDerivClient {
       });
 
       ws.on('close', () => {
+        this.stopKeepalive();
         for (const [id, p] of this.pending.entries()) {
           clearTimeout(p.timer);
           p.reject(new Error('Deriv OTP WebSocket closed'));
           this.pending.delete(id);
         }
-        this.ws = null;
+        if (this.ws === ws) {
+          this.ws = null;
+        }
       });
+    }).finally(() => {
+      this.connectPromise = null;
     });
+
+    return this.connectPromise;
   }
 
   async request<T extends DerivMessage = DerivMessage>(payload: Record<string, unknown>, timeoutMs = 15000): Promise<T> {
@@ -108,6 +159,7 @@ export class OtpDerivClient {
   }
 
   close() {
+    this.stopKeepalive();
     if (this.ws) {
       try {
         this.ws.close();

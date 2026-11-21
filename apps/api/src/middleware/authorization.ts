@@ -7,7 +7,7 @@ import { ensureDatabaseSchema } from '../database/init';
 export async function requireDb(_req: Request, res: Response, next: NextFunction) {
   if (!isDatabaseConfigured) {
     return res.status(503).json({
-      error: 'Neon PostgreSQL DATABASE_URL is not configured. Configure DATABASE_URL to enable account and persistence features.'
+      error: 'Service storage is temporarily unavailable.'
     });
   }
   await ensureDatabaseSchema();

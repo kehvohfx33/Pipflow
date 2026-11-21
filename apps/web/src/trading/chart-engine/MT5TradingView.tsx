@@ -10,7 +10,7 @@ import {
   CandlestickData,
   Time
 } from 'lightweight-charts';
-import { Undo2, Redo2, Save, Settings as GearIcon, Plus, XCircle } from 'lucide-react';
+import { Undo2, Redo2, Save, Settings as GearIcon, Plus, XCircle, Maximize2, Minimize2 } from 'lucide-react';
 import { apiFetch } from '../../services/api';
 import {
   fetchDerivCandlesDirect,
@@ -131,6 +131,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   const [orderError, setOrderError] = useState('');
   const [orderNotice, setOrderNotice] = useState('');
   const [dockTab, setDockTab] = useState<'open' | 'history' | 'summary'>('open');
+  const [chartExpanded, setChartExpanded] = useState(false);
 
   useEffect(() => {
     activeToolRef.current = activeTool;
@@ -225,11 +226,19 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
     return () => clearInterval(id);
   }, [token, orders.length]);
 
+  const openWatchKey = orders
+    .filter((o) => o.status === 'OPEN')
+    .map((o) => o.symbol)
+    .sort()
+    .join(',');
+  const visibleMarketKey = visibleMarketSymbols.join(',');
+  const watchlistKey = watchlist.join(',');
+
   useEffect(() => {
     if (!onWatchSymbolsChange) return;
-    const openSyms = orders.filter((o) => o.status === 'OPEN').map((o) => o.symbol);
+    const openSyms = openWatchKey ? openWatchKey.split(',') : [];
     onWatchSymbolsChange([...visibleMarketSymbols, ...watchlist, ...openSyms, symbol]);
-  }, [visibleMarketSymbols, watchlist, orders, symbol, onWatchSymbolsChange]);
+  }, [visibleMarketKey, watchlistKey, openWatchKey, symbol, onWatchSymbolsChange]);
 
   // Initialize Lightweight Charts instance once per theme change
   useEffect(() => {
@@ -238,7 +247,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
 
     const chart = createChart(el, {
       width: Math.max(260, el.clientWidth || 320),
-      height: 460,
+      height: Math.max(420, el.clientHeight || 560),
       layout: {
         background: { color: darkTheme ? '#0f172a' : '#ffffff' },
         textColor: darkTheme ? '#cbd5e1' : '#1e293b'
@@ -286,7 +295,10 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
     const ro = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect;
       if (rect && rect.width > 0) {
-        chart.applyOptions({ width: Math.floor(rect.width) });
+        chart.applyOptions({
+          width: Math.floor(rect.width),
+          ...(rect.height > 0 ? { height: Math.floor(rect.height) } : {})
+        });
       }
     });
     ro.observe(el);
@@ -301,7 +313,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
     };
   }, [darkTheme]);
 
-  // Fetch real Deriv historical candlesticks whenever symbol or timeframe changes
+  // Fetch real Deriv historical candlesticks directly first for fastest lightweight rendering, with API fallback
   useEffect(() => {
     let cancelled = false;
     setLoadingChart(true);
@@ -309,13 +321,15 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
 
     const loadCandles = async () => {
       try {
+        const directBars = await fetchDerivCandlesDirect(symbol, granularity, 240);
+        if (directBars && directBars.length > 0) return directBars;
+        throw new Error('Empty direct candle feed');
+      } catch {
         const res = await apiFetch<{
           candles: Array<{ time: number; open: number; high: number; low: number; close: number }>;
-        }>(`/market/candles?symbol=${encodeURIComponent(symbol)}&granularity=${granularity}&count=300`);
+        }>(`/market/candles?symbol=${encodeURIComponent(symbol)}&granularity=${granularity}&count=240`);
         if (res.candles && res.candles.length > 0) return res.candles;
-        throw new Error('Empty candle feed from backend');
-      } catch {
-        return fetchDerivCandlesDirect(symbol, granularity, 300);
+        throw new Error('Candle feed temporarily unavailable');
       }
     };
 
@@ -361,12 +375,11 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
     };
   }, [symbol, granularity, darkTheme]);
 
-  // Render technical indicators, MT5 TP/SL order lines, and custom lines cleanly without duplicating
+  // Rebuild lightweight indicators only when candle dataset or indicator toggles change
   useEffect(() => {
     const chart = chartRef.current;
-    const candleSeries = candleSeriesRef.current;
     const bars = barsRef.current;
-    if (!chart || !candleSeries || bars.length === 0) return;
+    if (!chart || bars.length === 0) return;
 
     indicatorSeriesRef.current.forEach((s) => {
       try {
@@ -376,15 +389,6 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
       }
     });
     indicatorSeriesRef.current = [];
-
-    priceLinesRef.current.forEach((line) => {
-      try {
-        candleSeries.removePriceLine(line);
-      } catch {
-        // ignore
-      }
-    });
-    priceLinesRef.current = [];
 
     if (indicators.sma20 && bars.length > 20) {
       const sma = chart.addSeries(LineSeries, { color: '#2563eb', lineWidth: 2, priceLineVisible: false });
@@ -426,6 +430,21 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
       lower.setData(lowerData);
       indicatorSeriesRef.current.push(upper, lower);
     }
+  }, [barsVersion, indicators, darkTheme]);
+
+  // Render MT5 TP/SL order lines and custom lines cleanly
+  useEffect(() => {
+    const candleSeries = candleSeriesRef.current;
+    if (!candleSeries || barsRef.current.length === 0) return;
+
+    priceLinesRef.current.forEach((line) => {
+      try {
+        candleSeries.removePriceLine(line);
+      } catch {
+        // ignore
+      }
+    });
+    priceLinesRef.current = [];
 
     orders
       .filter((o) => o.status === 'OPEN' && o.symbol === symbol)
@@ -525,7 +544,6 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
     }
   }, [
     barsVersion,
-    indicators,
     orders,
     customLines,
     showDrawings,
@@ -851,7 +869,11 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
         {/* Main MT5 Chart Canvas */}
-        <div className="lg:col-span-8 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#141a23] overflow-hidden shadow-xs">
+        <div
+          className={`${
+            chartExpanded ? 'lg:col-span-12' : 'lg:col-span-8 xl:col-span-9'
+          } rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#141a23] overflow-hidden shadow-xs`}
+        >
           {/* Chart Top Toolbar */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 border-b border-slate-200 dark:border-slate-800">
             <div className="flex flex-wrap items-center gap-2">
@@ -913,6 +935,14 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
               <button type="button" title="Redo" className="p-1 text-slate-400">
                 <Redo2 className="w-3.5 h-3.5" />
               </button>
+              <button
+                type="button"
+                onClick={() => setChartExpanded((v) => !v)}
+                title={chartExpanded ? 'Restore MT5 split layout' : 'Expand MT5 chart'}
+                className="p-1.5 rounded-md border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                {chartExpanded ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+              </button>
               <span className="text-[11px] font-semibold text-blue-600 flex items-center gap-1">
                 <Save className="w-3.5 h-3.5" /> Save
               </span>
@@ -952,12 +982,19 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
               onToggleShow={() => setShowDrawings((s) => !s)}
               onClearDrawings={() => setCustomLines([])}
             />
-            <div ref={containerRef} className="min-w-0 flex-1 w-full h-[340px] sm:h-[420px] lg:h-[460px] relative overflow-hidden" />
+            <div
+              ref={containerRef}
+              className={`min-w-0 flex-1 w-full relative overflow-hidden ${
+                chartExpanded
+                  ? 'h-[62vh] min-h-[520px] sm:h-[70vh] lg:h-[76vh]'
+                  : 'h-[460px] sm:h-[560px] lg:h-[640px] xl:h-[700px]'
+              }`}
+            />
           </div>
         </div>
 
         {/* Right Side MT5 Order Ticket + Market Watch */}
-        <div className="lg:col-span-4 space-y-3">
+        <div className={`${chartExpanded ? 'lg:col-span-12 grid grid-cols-1 lg:grid-cols-2 gap-3' : 'lg:col-span-4 xl:col-span-3 space-y-3'}`}>
           <OrderTicket
             symbol={symbol}
             latestPrice={latestClose}

@@ -148,7 +148,7 @@ async function fetchLegacyWsSupplementary(params: {
     const candidate = new WebSocket(wsUrl, {
       headers: {
         Origin: 'https://app.deriv.com',
-        'User-Agent': 'Mozilla/5.0 (compatible; TradeDeriv/1.0)'
+        'User-Agent': 'Mozilla/5.0 (compatible; Pipflowtrades/1.0)'
       },
       handshakeTimeout: 5000
     });

@@ -1,10 +1,10 @@
+import crypto from 'crypto';
 import { pool } from '../../database/pool';
 import { decryptToken } from '../../utils/crypto';
 import { broadcastToUser } from '../../services/realtime-hub';
 import { DerivClient, OtpDerivClient } from './deriv-client';
 import { DerivMessage } from './websocket';
 import {
-  fetchNewDerivAccounts,
   getApiDerivAccountOtpUrl,
   isOAuth2AccessToken
 } from './account-data';
@@ -148,6 +148,7 @@ interface BalanceRes extends DerivMessage {
 interface TradingSocketHandle {
   isOtpGateway: boolean;
   symbolField: 'underlying_symbol' | 'symbol';
+  isOpen: () => boolean;
   request: <T extends DerivMessage = DerivMessage>(payload: Record<string, unknown>) => Promise<T>;
   close: () => void;
   scopes: string[];
@@ -155,33 +156,106 @@ interface TradingSocketHandle {
   actualDerivBalance: number | null;
 }
 
-async function openAuthenticatedTradingSocket(account: AuthorizedTradeAccount): Promise<TradingSocketHandle> {
+interface PooledSocketEntry {
+  key: string;
+  tokenHash: string;
+  handle: TradingSocketHandle;
+  lastUsedAt: number;
+}
+
+const SOCKET_IDLE_TTL_MS = 5 * 60 * 1000;
+const OTP_COOLDOWN_MS = 20 * 1000;
+const ORDER_SYNC_TTL_MS = 5 * 1000;
+
+const tradingSocketPool = new Map<string, PooledSocketEntry>();
+const inFlightSocketOpens = new Map<string, Promise<TradingSocketHandle>>();
+const otpCooldownByUser = new Map<string, number>();
+const inFlightOrderSyncs = new Map<string, Promise<Record<string, LiveDerivContractSnapshot>>>();
+const lastOrderSyncCache = new Map<string, { at: number; snapshots: Record<string, LiveDerivContractSnapshot> }>();
+
+const socketReaper = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of tradingSocketPool.entries()) {
+    if (!entry.handle.isOpen() || now - entry.lastUsedAt > SOCKET_IDLE_TTL_MS) {
+      try {
+        entry.handle.close();
+      } catch {
+        // ignore
+      }
+      tradingSocketPool.delete(key);
+    }
+  }
+}, 60 * 1000);
+socketReaper.unref?.();
+
+function hashToken(rawToken: string): string {
+  return crypto.createHash('sha256').update(rawToken).digest('hex').slice(0, 16);
+}
+
+function isRateLimitError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes('(429)') || msg.includes('rate limit') || msg.includes('ratelimit');
+}
+
+function isSocketTransportError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('websocket closed') ||
+    msg.includes('websocket not open') ||
+    msg.includes('not connected') ||
+    msg.includes('disconnected')
+  );
+}
+
+function markOtpCooldown(userId: string) {
+  otpCooldownByUser.set(userId, Date.now() + OTP_COOLDOWN_MS);
+}
+
+function isOtpInCooldown(userId: string): boolean {
+  const until = otpCooldownByUser.get(userId);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    otpCooldownByUser.delete(userId);
+    return false;
+  }
+  return true;
+}
+
+function evictTradingSocket(userId: string, accountId: string) {
+  const key = `${userId}:${accountId}`;
+  const entry = tradingSocketPool.get(key);
+  if (entry) {
+    try {
+      entry.handle.close();
+    } catch {
+      // ignore
+    }
+    tradingSocketPool.delete(key);
+  }
+}
+
+async function createAuthenticatedTradingSocket(account: AuthorizedTradeAccount): Promise<TradingSocketHandle> {
   const cleanToken = account.rawToken.trim();
 
-  // 1. OAuth2 Bearer `ory_at_...` uses the REST OTP endpoint + `api.derivws.com` gateway
+  // 1. OAuth2 Bearer `ory_at_...` uses ONE REST OTP request + persistent `api.derivws.com` gateway WebSocket
   if (isOAuth2AccessToken(cleanToken)) {
-    const [otpUrl, liveList] = await Promise.all([
-      getApiDerivAccountOtpUrl(cleanToken, account.derivLoginId, false),
-      fetchNewDerivAccounts(cleanToken, { isPat: false }).catch(() => [])
-    ]);
-    const matchedLive = liveList.find((a) => a.loginid === account.derivLoginId);
+    const otpUrl = await getApiDerivAccountOtpUrl(cleanToken, account.derivLoginId, false);
     const otpClient = new OtpDerivClient(otpUrl);
     await otpClient.connect();
-    let actualBal: number | null = matchedLive ? Number(matchedLive.balance) : null;
-    if (actualBal === null) {
-      const balRes = await otpClient.request<BalanceRes>({ balance: 1 }).catch(() => null);
-      if (balRes?.balance?.balance !== undefined) {
-        actualBal = Number(balRes.balance.balance);
-      }
+    let actualBal: number | null = null;
+    const balRes = await otpClient.request<BalanceRes>({ balance: 1 }).catch(() => null);
+    if (balRes?.balance?.balance !== undefined) {
+      actualBal = Number(balRes.balance.balance);
     }
     return {
       isOtpGateway: true,
       symbolField: 'underlying_symbol',
+      isOpen: () => otpClient.isOpen(),
       request: <T extends DerivMessage = DerivMessage>(payload: Record<string, unknown>) =>
         otpClient.request<T>(payload),
       close: () => otpClient.close(),
       scopes: account.grantedScopes.length > 0 ? account.grantedScopes : ['read', 'trade'],
-      currency: matchedLive?.currency || account.currency || 'USD',
+      currency: balRes?.balance?.currency || account.currency || 'USD',
       actualDerivBalance: actualBal
     };
   }
@@ -193,6 +267,7 @@ async function openAuthenticatedTradingSocket(account: AuthorizedTradeAccount): 
     return {
       isOtpGateway: false,
       symbolField: 'symbol',
+      isOpen: () => legacyClient.socket.isOpen(),
       request: <T extends DerivMessage = DerivMessage>(payload: Record<string, unknown>) =>
         legacyClient.request<T>(payload),
       close: () => legacyClient.socket.close(),
@@ -204,34 +279,79 @@ async function openAuthenticatedTradingSocket(account: AuthorizedTradeAccount): 
   } catch (legacyErr) {
     legacyClient.socket.close();
     try {
-      const [otpUrl, liveList] = await Promise.all([
-        getApiDerivAccountOtpUrl(cleanToken, account.derivLoginId, true),
-        fetchNewDerivAccounts(cleanToken, { isPat: true }).catch(() => [])
-      ]);
-      const matchedLive = liveList.find((a) => a.loginid === account.derivLoginId);
+      const otpUrl = await getApiDerivAccountOtpUrl(cleanToken, account.derivLoginId, true);
       const otpClient = new OtpDerivClient(otpUrl);
       await otpClient.connect();
-      let actualBal: number | null = matchedLive ? Number(matchedLive.balance) : null;
-      if (actualBal === null) {
-        const balRes = await otpClient.request<BalanceRes>({ balance: 1 }).catch(() => null);
-        if (balRes?.balance?.balance !== undefined) {
-          actualBal = Number(balRes.balance.balance);
-        }
+      let actualBal: number | null = null;
+      const balRes = await otpClient.request<BalanceRes>({ balance: 1 }).catch(() => null);
+      if (balRes?.balance?.balance !== undefined) {
+        actualBal = Number(balRes.balance.balance);
       }
       return {
         isOtpGateway: true,
         symbolField: 'underlying_symbol',
+        isOpen: () => otpClient.isOpen(),
         request: <T extends DerivMessage = DerivMessage>(payload: Record<string, unknown>) =>
           otpClient.request<T>(payload),
         close: () => otpClient.close(),
         scopes: account.grantedScopes.length > 0 ? account.grantedScopes : ['read', 'trade'],
-        currency: matchedLive?.currency || account.currency || 'USD',
+        currency: balRes?.balance?.currency || account.currency || 'USD',
         actualDerivBalance: actualBal
       };
     } catch {
       throw legacyErr;
     }
   }
+}
+
+async function getPooledTradingSocket(
+  userId: string,
+  account: AuthorizedTradeAccount,
+  options?: { bypassPool?: boolean }
+): Promise<TradingSocketHandle> {
+  const key = `${userId}:${account.id}`;
+  const tHash = hashToken(account.rawToken.trim());
+
+  if (!options?.bypassPool) {
+    const existing = tradingSocketPool.get(key);
+    if (existing && existing.tokenHash === tHash && existing.handle.isOpen()) {
+      existing.lastUsedAt = Date.now();
+      return existing.handle;
+    }
+    if (existing) {
+      evictTradingSocket(userId, account.id);
+    }
+  } else {
+    evictTradingSocket(userId, account.id);
+  }
+
+  const inflight = inFlightSocketOpens.get(key);
+  if (inflight) {
+    return inflight;
+  }
+
+  const openPromise = createAuthenticatedTradingSocket(account)
+    .then((handle) => {
+      tradingSocketPool.set(key, {
+        key,
+        tokenHash: tHash,
+        handle,
+        lastUsedAt: Date.now()
+      });
+      return handle;
+    })
+    .catch((err) => {
+      if (isRateLimitError(err)) {
+        markOtpCooldown(userId);
+      }
+      throw err;
+    })
+    .finally(() => {
+      inFlightSocketOpens.delete(key);
+    });
+
+  inFlightSocketOpens.set(key, openPromise);
+  return openPromise;
 }
 
 function parseAcceptedMultipliers(errMsg: string): number[] {
@@ -387,26 +507,29 @@ export async function executeDerivTrade(input: ExecuteDerivTradeInput): Promise<
     throw new Error('No active trading account found. Please log in via Deriv OAuth2.');
   }
 
-  const sock = await openAuthenticatedTradingSocket(account);
-  try {
-    if (!sock.scopes.includes('trade')) {
-      throw new Error(
-        `Trading account does not have "trade" permission (${sock.scopes.join(', ')}). Re-authorize via Deriv login.`
-      );
-    }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sock = await getPooledTradingSocket(input.userId, account, { bypassPool: attempt > 0 });
+    try {
+      if (!sock.scopes.includes('trade')) {
+        throw new Error(
+          `Trading account does not have "trade" permission (${sock.scopes.join(', ')}). Re-authorize via Deriv login.`
+        );
+      }
 
-    // Strict Real-Account Guard:
-    // Admin-altered real balances sync visually across all views, but live real orders
-    // require actual real funds on Deriv to place orders.
-    if (
-      account.accountType === 'real' &&
-      sock.actualDerivBalance !== null &&
-      sock.actualDerivBalance < Number(input.stake)
-    ) {
-      throw new Error(
-        `Insufficient actual live Deriv balance ($${sock.actualDerivBalance.toFixed(2)} ${sock.currency}) on Real account to place a $${Number(input.stake).toFixed(2)} order on Deriv.`
-      );
-    }
+      // Strict Real-Account Guard:
+      // Admin-altered real balances sync visually across all views, but live real orders
+      // require actual real funds on Deriv to place orders.
+      if (account.accountType === 'real') {
+        const balRes = await sock.request<BalanceRes>({ balance: 1 }).catch(() => null);
+        if (balRes?.balance?.balance !== undefined) {
+          sock.actualDerivBalance = Number(balRes.balance.balance);
+        }
+        if (sock.actualDerivBalance !== null && sock.actualDerivBalance < Number(input.stake)) {
+          throw new Error(
+            `Insufficient actual live Deriv balance ($${sock.actualDerivBalance.toFixed(2)} ${sock.currency}) on Real account to place a $${Number(input.stake).toFixed(2)} order on Deriv.`
+          );
+        }
+      }
 
     const currency = sock.currency || account.currency || 'USD';
     let requestedType = input.contractType?.toUpperCase();
@@ -592,22 +715,43 @@ export async function executeDerivTrade(input: ExecuteDerivTradeInput): Promise<
       -actualBuyPrice
     );
 
-    return {
-      connectedAccountId: account.id,
-      derivLoginId: account.derivLoginId,
-      accountType: account.accountType,
-      executionMode: account.accountType === 'real' ? 'deriv_real' : 'deriv_demo',
-      contractId: Number(buyRes.buy.contract_id),
-      transactionId: Number(buyRes.buy.transaction_id ?? 0),
-      contractType: finalContractType,
-      buyPrice: actualBuyPrice,
-      payout: buyRes.buy.payout !== undefined ? Number(buyRes.buy.payout) : null,
-      spotPrice: Number(proposal.spot ?? input.entryPrice ?? 0),
-      balanceAfter: displayBalanceAfter
-    };
-  } finally {
-    sock.close();
+      if (buyRes.buy.balance_after !== undefined) {
+        sock.actualDerivBalance = Number(buyRes.buy.balance_after);
+      }
+
+      return {
+        connectedAccountId: account.id,
+        derivLoginId: account.derivLoginId,
+        accountType: account.accountType,
+        executionMode: account.accountType === 'real' ? 'deriv_real' : 'deriv_demo',
+        contractId: Number(buyRes.buy.contract_id),
+        transactionId: Number(buyRes.buy.transaction_id ?? 0),
+        contractType: finalContractType,
+        buyPrice: actualBuyPrice,
+        payout: buyRes.buy.payout !== undefined ? Number(buyRes.buy.payout) : null,
+        spotPrice: Number(proposal.spot ?? input.entryPrice ?? 0),
+        balanceAfter: displayBalanceAfter
+      };
+    } catch (err) {
+      if (attempt === 0 && isSocketTransportError(err)) {
+        evictTradingSocket(input.userId, account.id);
+        continue;
+      }
+      throw err;
+    }
   }
+  throw new Error('Deriv trade execution failed after socket reconnect');
+}
+
+function isContractSettled(poc?: OpenContractRes['proposal_open_contract']): boolean {
+  if (!poc) return false;
+  return (
+    poc.is_sold === 1 ||
+    poc.is_expired === 1 ||
+    poc.status === 'won' ||
+    poc.status === 'lost' ||
+    poc.status === 'sold'
+  );
 }
 
 export async function closeDerivContract(params: {
@@ -621,76 +765,83 @@ export async function closeDerivContract(params: {
     throw new Error('Active Deriv account authorization not found to close contract');
   }
 
-  const sock = await openAuthenticatedTradingSocket(account);
-  try {
-    const pocRes = await sock.request<OpenContractRes>({
-      proposal_open_contract: 1,
-      contract_id: params.contractId
-    });
-    const poc = pocRes.proposal_open_contract;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sock = await getPooledTradingSocket(params.userId, account, { bypassPool: attempt > 0 });
+    try {
+      const pocRes = await sock.request<OpenContractRes>({
+        proposal_open_contract: 1,
+        contract_id: params.contractId
+      });
+      const poc = pocRes.proposal_open_contract;
 
-    let pnl = Number(poc?.profit ?? 0);
-    const buyPrice = Number(poc?.buy_price ?? 0);
-    let payoutCredit = Number(poc?.sell_price ?? Math.max(0, buyPrice + pnl));
-    const exitPrice = Number(poc?.exit_tick ?? poc?.current_spot ?? params.fallbackExitPrice);
-    let status: 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL' = 'CLOSED_MANUAL';
-    let balanceAfter: number | null = null;
+      let pnl = Number(poc?.profit ?? 0);
+      const buyPrice = Number(poc?.buy_price ?? 0);
+      let payoutCredit = Number(poc?.sell_price ?? Math.max(0, buyPrice + pnl));
+      let exitPrice = Number(poc?.exit_tick ?? poc?.current_spot ?? params.fallbackExitPrice);
+      let status: 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL' = 'CLOSED_MANUAL';
+      let balanceAfter: number | null = null;
 
-    if (poc && (poc.is_sold === 1 || poc.status === 'won' || poc.status === 'lost' || poc.status === 'sold')) {
-      status = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
-    } else {
-      try {
-        const sellRes = await sock.request<SellRes>({
-          sell: params.contractId,
-          price: 0
-        });
-        if (sellRes.sell) {
-          balanceAfter = Number(sellRes.sell.balance_after);
-          payoutCredit = Number(sellRes.sell.sold_for ?? payoutCredit);
-          if (buyPrice > 0) {
-            pnl = Number((Number(sellRes.sell.sold_for) - buyPrice).toFixed(2));
+      if (isContractSettled(poc)) {
+        status = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
+      } else {
+        try {
+          const sellRes = await sock.request<SellRes>({
+            sell: params.contractId,
+            price: 0
+          });
+          if (sellRes.sell) {
+            balanceAfter = Number(sellRes.sell.balance_after);
+            sock.actualDerivBalance = balanceAfter;
+            payoutCredit = Number(sellRes.sell.sold_for ?? payoutCredit);
+            if (buyPrice > 0) {
+              pnl = Number((Number(sellRes.sell.sold_for) - buyPrice).toFixed(2));
+            }
+          }
+        } catch (sellErr) {
+          const recheck = await sock
+            .request<OpenContractRes>({
+              proposal_open_contract: 1,
+              contract_id: params.contractId
+            })
+            .catch(() => null);
+          const rePoc = recheck?.proposal_open_contract;
+          const sellErrLower = ((sellErr as Error).message || '').toLowerCase();
+          const alreadySettledMsg =
+            sellErrLower.includes('already sold') ||
+            sellErrLower.includes('already settled') ||
+            sellErrLower.includes('contract has expired');
+          if (isContractSettled(rePoc) || alreadySettledMsg) {
+            pnl = Number(rePoc?.profit ?? pnl);
+            const reBuy = Number(rePoc?.buy_price ?? buyPrice);
+            payoutCredit = Number(rePoc?.sell_price ?? Math.max(0, reBuy + pnl));
+            exitPrice = Number(rePoc?.exit_tick ?? rePoc?.current_spot ?? exitPrice);
+            status = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
+          } else {
+            throw sellErr;
           }
         }
-      } catch (sellErr) {
-        const recheck = await sock
-          .request<OpenContractRes>({
-            proposal_open_contract: 1,
-            contract_id: params.contractId
-          })
-          .catch(() => null);
-        const rePoc = recheck?.proposal_open_contract;
-        if (
-          rePoc &&
-          (rePoc.is_sold === 1 || rePoc.status === 'won' || rePoc.status === 'lost' || rePoc.status === 'sold')
-        ) {
-          pnl = Number(rePoc.profit ?? pnl);
-          const reBuy = Number(rePoc.buy_price ?? buyPrice);
-          payoutCredit = Number(rePoc.sell_price ?? Math.max(0, reBuy + pnl));
-          status = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
-        } else {
-          throw sellErr;
-        }
       }
-    }
 
-    if (balanceAfter === null) {
-      if (isOAuth2AccessToken(account.rawToken)) {
-        const list = await fetchNewDerivAccounts(account.rawToken, { isPat: false }).catch(() => []);
-        const match = list.find((a) => a.loginid === account.derivLoginId);
-        if (match) balanceAfter = match.balance;
-      } else {
+      if (balanceAfter === null) {
         const balRes = await sock.request<BalanceRes>({ balance: 1 }).catch(() => null);
         if (balRes?.balance?.balance !== undefined) {
           balanceAfter = Number(balRes.balance.balance);
+          sock.actualDerivBalance = balanceAfter;
         }
       }
-    }
 
-    const syncedBal = await syncPostTradeBalance(params.userId, account.id, balanceAfter, payoutCredit);
-    return { exitPrice, pnl, status, balanceAfter: syncedBal };
-  } finally {
-    sock.close();
+      const syncedBal = await syncPostTradeBalance(params.userId, account.id, balanceAfter, payoutCredit);
+      lastOrderSyncCache.delete(params.userId);
+      return { exitPrice, pnl, status, balanceAfter: syncedBal };
+    } catch (err) {
+      if (attempt === 0 && isSocketTransportError(err)) {
+        evictTradingSocket(params.userId, account.id);
+        continue;
+      }
+      throw err;
+    }
   }
+  throw new Error('Failed to close Deriv contract after socket reconnect');
 }
 
 export interface LiveDerivContractSnapshot {
@@ -702,146 +853,169 @@ export interface LiveDerivContractSnapshot {
 export async function syncOpenDerivOrdersForUser(
   userId: string
 ): Promise<Record<string, LiveDerivContractSnapshot>> {
-  const snapshots: Record<string, LiveDerivContractSnapshot> = {};
-  const openRes = await pool.query(
-    `SELECT id, connected_account_id, deriv_contract_id, entry_price, stake, symbol, source
-     FROM virtual_orders
-     WHERE user_id = $1 AND status = 'OPEN' AND deriv_contract_id IS NOT NULL AND connected_account_id IS NOT NULL`,
-    [userId]
-  );
-
-  if (openRes.rows.length === 0) return snapshots;
-
-  const byAccount = new Map<
-    string,
-    Array<{ id: string; contractId: number; entryPrice: number; stake: number; symbol: string; source: string }>
-  >();
-  for (const row of openRes.rows) {
-    const list = byAccount.get(row.connected_account_id) ?? [];
-    list.push({
-      id: row.id,
-      contractId: Number(row.deriv_contract_id),
-      entryPrice: Number(row.entry_price),
-      stake: Number(row.stake),
-      symbol: String(row.symbol),
-      source: String(row.source || 'manual')
-    });
-    byAccount.set(row.connected_account_id, list);
+  const cached = lastOrderSyncCache.get(userId);
+  if (cached && Date.now() - cached.at < ORDER_SYNC_TTL_MS) {
+    return cached.snapshots;
   }
 
-  for (const [accountId, items] of byAccount.entries()) {
-    const account = await getAuthorizedAccountForTrading(userId, accountId).catch(() => null);
-    if (!account) continue;
+  const inflight = inFlightOrderSyncs.get(userId);
+  if (inflight) {
+    return inflight;
+  }
 
-    let sock: TradingSocketHandle | null = null;
-    try {
-      sock = await openAuthenticatedTradingSocket(account);
-      const closedItems: Array<{
-        orderId: string;
-        contractId: number;
-        symbol: string;
-        source: string;
-        status: 'CLOSED_TP' | 'CLOSED_SL';
-        exitPrice: number;
-        pnl: number;
-      }> = [];
-      let totalLockedDelta = 0;
+  const runSync = async (): Promise<Record<string, LiveDerivContractSnapshot>> => {
+    const snapshots: Record<string, LiveDerivContractSnapshot> = {};
+    const openRes = await pool.query(
+      `SELECT id, connected_account_id, deriv_contract_id, entry_price, stake, symbol, source
+       FROM virtual_orders
+       WHERE user_id = $1 AND status = 'OPEN' AND deriv_contract_id IS NOT NULL AND connected_account_id IS NOT NULL`,
+      [userId]
+    );
 
-      for (const item of items) {
-        try {
-          const pocRes = await sock.request<OpenContractRes>({
-            proposal_open_contract: 1,
-            contract_id: item.contractId
-          });
-          const poc = pocRes.proposal_open_contract;
-          if (!poc) continue;
+    if (openRes.rows.length === 0) {
+      lastOrderSyncCache.set(userId, { at: Date.now(), snapshots });
+      return snapshots;
+    }
 
-          if (poc.is_sold === 1 || poc.status === 'won' || poc.status === 'lost' || poc.status === 'sold') {
-            const pnl = Number(poc.profit ?? 0);
-            const exitPrice = Number(poc.exit_tick ?? poc.current_spot ?? item.entryPrice);
-            const closeStatus: 'CLOSED_TP' | 'CLOSED_SL' = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
+    const byAccount = new Map<
+      string,
+      Array<{ id: string; contractId: number; entryPrice: number; stake: number; symbol: string; source: string }>
+    >();
+    for (const row of openRes.rows) {
+      const list = byAccount.get(row.connected_account_id) ?? [];
+      list.push({
+        id: row.id,
+        contractId: Number(row.deriv_contract_id),
+        entryPrice: Number(row.entry_price),
+        stake: Number(row.stake),
+        symbol: String(row.symbol),
+        source: String(row.source || 'manual')
+      });
+      byAccount.set(row.connected_account_id, list);
+    }
 
-            const upd = await pool.query(
-              `UPDATE virtual_orders
-               SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW()
-               WHERE id = $4 AND status = 'OPEN'
-               RETURNING id`,
-              [closeStatus, exitPrice, pnl, item.id]
-            );
-
-            if (upd.rows.length > 0) {
-              const buyPrice = Number(poc.buy_price ?? item.stake);
-              const payoutCredit = Number(poc.sell_price ?? Math.max(0, buyPrice + pnl));
-              totalLockedDelta += payoutCredit;
-              closedItems.push({
-                orderId: item.id,
-                contractId: item.contractId,
-                symbol: item.symbol,
-                source: item.source,
-                status: closeStatus,
-                exitPrice,
-                pnl
-              });
-            }
-          } else {
-            snapshots[item.id] = {
-              currentSpot: Number(poc.current_spot ?? item.entryPrice),
-              profit: Number(poc.profit ?? 0),
-              bidPrice: Number(poc.bid_price ?? 0)
-            };
-          }
-        } catch {
-          // Skip transient per-contract lookup failures
-        }
+    for (const [accountId, items] of byAccount.entries()) {
+      const existingPoolEntry = tradingSocketPool.get(`${userId}:${accountId}`);
+      if ((!existingPoolEntry || !existingPoolEntry.handle.isOpen()) && isOtpInCooldown(userId)) {
+        // Avoid consuming OTP quota during rate-limit cooldown so manual opens/closes recover cleanly
+        continue;
       }
 
-      if (closedItems.length > 0) {
-        let newBal: number | null = null;
-        if (isOAuth2AccessToken(account.rawToken)) {
-          const list = await fetchNewDerivAccounts(account.rawToken, { isPat: false }).catch(() => []);
-          const match = list.find((a) => a.loginid === account.derivLoginId);
-          if (match) newBal = match.balance;
-        } else {
+      const account = await getAuthorizedAccountForTrading(userId, accountId).catch(() => null);
+      if (!account) continue;
+
+      try {
+        const sock = await getPooledTradingSocket(userId, account);
+        const closedItems: Array<{
+          orderId: string;
+          contractId: number;
+          symbol: string;
+          source: string;
+          status: 'CLOSED_TP' | 'CLOSED_SL';
+          exitPrice: number;
+          pnl: number;
+        }> = [];
+        let totalLockedDelta = 0;
+
+        for (const item of items) {
+          try {
+            const pocRes = await sock.request<OpenContractRes>({
+              proposal_open_contract: 1,
+              contract_id: item.contractId
+            });
+            const poc = pocRes.proposal_open_contract;
+            if (!poc) continue;
+
+            if (isContractSettled(poc)) {
+              const pnl = Number(poc.profit ?? 0);
+              const exitPrice = Number(poc.exit_tick ?? poc.current_spot ?? item.entryPrice);
+              const closeStatus: 'CLOSED_TP' | 'CLOSED_SL' = pnl >= 0 ? 'CLOSED_TP' : 'CLOSED_SL';
+
+              const upd = await pool.query(
+                `UPDATE virtual_orders
+                 SET status = $1, exit_price = $2, pnl = $3, closed_at = NOW()
+                 WHERE id = $4 AND status = 'OPEN'
+                 RETURNING id`,
+                [closeStatus, exitPrice, pnl, item.id]
+              );
+
+              if (upd.rows.length > 0) {
+                const buyPrice = Number(poc.buy_price ?? item.stake);
+                const payoutCredit = Number(poc.sell_price ?? Math.max(0, buyPrice + pnl));
+                totalLockedDelta += payoutCredit;
+                closedItems.push({
+                  orderId: item.id,
+                  contractId: item.contractId,
+                  symbol: item.symbol,
+                  source: item.source,
+                  status: closeStatus,
+                  exitPrice,
+                  pnl
+                });
+              }
+            } else {
+              snapshots[item.id] = {
+                currentSpot: Number(poc.current_spot ?? item.entryPrice),
+                profit: Number(poc.profit ?? 0),
+                bidPrice: Number(poc.bid_price ?? 0)
+              };
+            }
+          } catch (itemErr) {
+            if (isSocketTransportError(itemErr)) {
+              evictTradingSocket(userId, accountId);
+              break;
+            }
+          }
+        }
+
+        if (closedItems.length > 0) {
+          let newBal: number | null = null;
           const balRes = await sock.request<BalanceRes>({ balance: 1 }).catch(() => null);
           if (balRes?.balance?.balance !== undefined) {
             newBal = Number(balRes.balance.balance);
+            sock.actualDerivBalance = newBal;
           }
-        }
-        const finalBalance = await syncPostTradeBalance(userId, accountId, newBal, totalLockedDelta);
+          const finalBalance = await syncPostTradeBalance(userId, accountId, newBal, totalLockedDelta);
 
-        for (const closed of closedItems) {
-          if (derivSettlementHandler) {
-            await Promise.resolve(
-              derivSettlementHandler({
-                orderId: closed.orderId,
-                userId,
-                connectedAccountId: accountId,
-                contractId: closed.contractId,
-                symbol: closed.symbol,
-                source: closed.source,
-                status: closed.status,
-                exitPrice: closed.exitPrice,
-                pnl: closed.pnl,
-                balanceAfter: finalBalance
-              })
-            ).catch(() => {});
+          for (const closed of closedItems) {
+            if (derivSettlementHandler) {
+              await Promise.resolve(
+                derivSettlementHandler({
+                  orderId: closed.orderId,
+                  userId,
+                  connectedAccountId: accountId,
+                  contractId: closed.contractId,
+                  symbol: closed.symbol,
+                  source: closed.source,
+                  status: closed.status,
+                  exitPrice: closed.exitPrice,
+                  pnl: closed.pnl,
+                  balanceAfter: finalBalance
+                })
+              ).catch(() => {});
+            }
+            broadcastToUser(userId, {
+              type: 'order_closed',
+              orderId: closed.orderId,
+              symbol: closed.symbol,
+              status: closed.status,
+              exitPrice: closed.exitPrice,
+              pnl: closed.pnl
+            });
           }
-          broadcastToUser(userId, {
-            type: 'order_closed',
-            orderId: closed.orderId,
-            symbol: closed.symbol,
-            status: closed.status,
-            exitPrice: closed.exitPrice,
-            pnl: closed.pnl
-          });
         }
+      } catch {
+        // Ignore transient errors during background sync
       }
-    } catch {
-      // Ignore transient errors during background sync
-    } finally {
-      sock?.close();
     }
-  }
 
-  return snapshots;
+    lastOrderSyncCache.set(userId, { at: Date.now(), snapshots });
+    return snapshots;
+  };
+
+  const syncPromise = runSync().finally(() => {
+    inFlightOrderSyncs.delete(userId);
+  });
+  inFlightOrderSyncs.set(userId, syncPromise);
+  return syncPromise;
 }

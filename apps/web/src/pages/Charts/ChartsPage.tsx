@@ -139,7 +139,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
     if (!el) return;
     const chart = createChart(el, {
       width: Math.max(260, el.clientWidth || 320),
-      height: 430,
+      height: Math.max(430, el.clientHeight || 540),
       layout: {
         background: { color: darkTheme ? '#0f172a' : '#ffffff' },
         textColor: darkTheme ? '#cbd5e1' : '#334155'
@@ -163,7 +163,12 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
 
     const ro = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect;
-      if (rect && rect.width > 0) chart.applyOptions({ width: Math.floor(rect.width) });
+      if (rect && rect.width > 0) {
+        chart.applyOptions({
+          width: Math.floor(rect.width),
+          ...(rect.height > 0 ? { height: Math.floor(rect.height) } : {})
+        });
+      }
     });
     ro.observe(el);
 
@@ -181,13 +186,15 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
 
     const load = async () => {
       try {
+        const direct = await fetchDerivCandlesDirect(symbol, granularity, 180);
+        if (direct && direct.length > 0) return direct;
+        throw new Error('Empty direct feed');
+      } catch {
         const res = await apiFetch<{ candles: Array<{ time: number; close: number }> }>(
           `/market/candles?symbol=${encodeURIComponent(symbol)}&granularity=${granularity}&count=180`
         );
         if (res.candles && res.candles.length > 0) return res.candles;
-        throw new Error('Empty feed');
-      } catch {
-        return fetchDerivCandlesDirect(symbol, granularity, 180);
+        throw new Error('Candle feed temporarily unavailable');
       }
     };
 
@@ -398,7 +405,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
       )}
 
       <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
-        <div ref={chartContainerRef} className="w-full h-[430px]" />
+        <div ref={chartContainerRef} className="w-full h-[460px] sm:h-[560px] lg:h-[640px]" />
       </div>
 
       {mode === 'dtrader' && (

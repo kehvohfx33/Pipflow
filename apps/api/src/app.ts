@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import http from 'http';
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
@@ -10,10 +12,69 @@ import { handleDerivOAuthCallback } from './controllers/derivController';
 import { requireDb } from './middleware/authorization';
 import { ensureDatabaseSchema } from './database/init';
 import { derivConnectionManager } from './integrations/deriv/connection-manager';
-import { ensureLiveTickSubscription } from './services/market-data-service';
+import { ensureLiveTickSubscription, getLatestTicksForSymbols } from './services/market-data-service';
 import { attachTickEvaluator } from './services/bot-engine-service';
 import { registerWsClient, unregisterWsClient, broadcastToUser } from './services/realtime-hub';
 import { logInfo, logError } from './utils/logger';
+
+const SITEMAP_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://pipflowtrade.site/</loc>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://pipflowtrade.site/charts</loc>
+    <changefreq>daily</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://pipflowtrade.site/trading-view</loc>
+    <changefreq>daily</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://pipflowtrade.site/bots</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://pipflowtrade.site/analysis</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://pipflowtrade.site/learning</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.7</priority>
+  </url>
+</urlset>
+`;
+
+const ROBOTS_TXT = `User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /_console
+Disallow: /callback
+
+Sitemap: https://pipflowtrade.site/sitemap.xml
+`;
+
+function isAllowedCorsOrigin(origin?: string): boolean {
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'pipflowtrade.site' || host === 'www.pipflowtrade.site') return true;
+    const configuredHost = new URL(env.publicSiteUrl).hostname.toLowerCase();
+    if (host === configuredHost) return true;
+    if (host === 'localhost' || host === '127.0.0.1' || host.endsWith('.aistudio.dev')) return true;
+  } catch {
+    return false;
+  }
+  return false;
+}
 
 export function createApiApp() {
   const app = express();
@@ -28,9 +89,55 @@ export function createApiApp() {
       hsts: env.nodeEnv === 'production' ? { maxAge: 31536000, includeSubDomains: true } : false
     })
   );
-  app.use(cors({ origin: true, credentials: true }));
+  app.use((_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+  });
+  app.use(
+    cors({
+      origin: (origin, callback) => {
+        if (isAllowedCorsOrigin(origin)) {
+          callback(null, true);
+        } else {
+          callback(null, false);
+        }
+      },
+      credentials: true
+    })
+  );
   app.use(express.json({ limit: '256kb' }));
-  app.use('/api', router);
+
+  app.get('/sitemap.xml', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(SITEMAP_XML);
+  });
+
+  app.get('/robots.txt', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(ROBOTS_TXT);
+  });
+
+  app.get('/favicon.ico', (_req: Request, res: Response) => {
+    const candidates = [
+      path.resolve(process.cwd(), 'public/assets/aistudio/IMG-20261115-WA0009_aca2a037.jpg'),
+      path.resolve(process.cwd(), 'dist/assets/aistudio/IMG-20261115-WA0009_aca2a037.jpg')
+    ];
+    const match = candidates.find((p) => fs.existsSync(p));
+    if (match) {
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=604800');
+      return res.sendFile(match);
+    }
+    res.status(204).end();
+  });
+
+  app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+    next();
+  }, router);
+
   app.get(['/callback', '/callback/'], requireDb, (req: Request, res: Response, next: NextFunction) => {
     Promise.resolve(handleDerivOAuthCallback(req, res)).catch(next);
   });
@@ -42,11 +149,16 @@ export function createApiApp() {
     );
   }
 
-  // Global Express JSON error handler so unhandled DB/API errors never crash the process
+  // Global Express JSON error handler so unhandled DB/API errors never leak stack traces or infra details
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     logError('express', 'Unhandled API error', err);
-    const message = err instanceof Error ? err.message : 'Internal server error';
-    res.status(500).json({ error: message });
+    const safeMessage =
+      env.nodeEnv === 'production'
+        ? 'Internal server error'
+        : err instanceof Error
+          ? err.message
+          : 'Internal server error';
+    res.status(500).json({ error: safeMessage });
   });
 
   ensureDatabaseSchema().catch(() => {});
@@ -73,16 +185,26 @@ export function attachWebSocketRelay(server: http.Server) {
 
     registerWsClient(ws, userId);
 
+    const flushCachedTicks = (symbols: string[]) => {
+      const cached = getLatestTicksForSymbols(symbols);
+      for (const tick of cached) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'tick', data: { tick } }));
+        }
+      }
+    };
+
     ws.on('message', async (raw) => {
       try {
         const msg = JSON.parse(raw.toString()) as { type?: string; symbol?: string; symbols?: string[] };
         if (msg.type === 'subscribe' && msg.symbol) {
+          flushCachedTicks([msg.symbol]);
           await ensureLiveTickSubscription(msg.symbol).catch(() => {});
         } else if (msg.type === 'subscribe_many' && Array.isArray(msg.symbols)) {
+          const list = msg.symbols.slice(0, 40).map((s) => String(s));
+          flushCachedTicks(list);
           await Promise.allSettled(
-            msg.symbols
-              .slice(0, 40)
-              .map((s) => ensureLiveTickSubscription(String(s)).catch(() => {}))
+            list.map((s) => ensureLiveTickSubscription(s).catch(() => {}))
           );
         }
       } catch {

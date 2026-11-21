@@ -59,20 +59,40 @@ function decryptPkceData(blob: string): { codeVerifier: string; redirectUri: str
 }
 
 export function resolvePublicSiteBase(req: Request): string {
-  const host = req.get('host');
+  const rawHost = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  const lowerHost = rawHost.toLowerCase();
+  const isLocalReq = lowerHost.startsWith('localhost') || lowerHost.startsWith('127.0.0.1');
   const protoHeader = req.get('x-forwarded-proto');
   const proto = (protoHeader ? protoHeader.split(',')[0].trim() : req.protocol) || 'https';
-  if (host && (!process.env.FRONTEND_URL || env.frontendUrl.includes('localhost'))) {
-    return `${proto}://${host}`;
+
+  if (isLocalReq) {
+    return `${proto}://${rawHost}`;
   }
-  return env.frontendUrl.replace(/\/$/, '');
+
+  // Never expose internal hosting provider domains (*.onrender.com, *.run.app) in OAuth redirects or links
+  if (
+    rawHost &&
+    !lowerHost.includes('.onrender.com') &&
+    !lowerHost.includes('.run.app') &&
+    !lowerHost.includes('tradederiv')
+  ) {
+    return `https://${rawHost}`;
+  }
+
+  return env.publicSiteUrl.replace(/\/$/, '');
 }
 
 export function resolveOAuthRedirectUri(req: Request): string {
   const configured = env.derivOAuthRedirectUri.trim();
-  const host = (req.get('host') || '').toLowerCase();
-  const isLocalReq = host.includes('localhost') || host.includes('127.0.0.1');
-  if (configured && !configured.includes('localhost') && !isLocalReq) {
+  const rawHost = (req.get('x-forwarded-host') || req.get('host') || '').toLowerCase();
+  const isLocalReq = rawHost.includes('localhost') || rawHost.includes('127.0.0.1');
+  if (
+    configured &&
+    !configured.includes('localhost') &&
+    !configured.includes('.onrender.com') &&
+    !configured.includes('.run.app') &&
+    !isLocalReq
+  ) {
     return configured;
   }
   return `${resolvePublicSiteBase(req)}/api/deriv/oauth/callback`;

@@ -2,8 +2,8 @@ import { isDatabaseConfigured, pool } from '../database/pool';
 
 const DEFAULT_PUBLIC_SETTINGS = {
   branding: {
-    appName: 'TradeDeriv',
-    tickerText: 'WELCOME TO TRADEDERIV — YOUR HUB FOR TRADING KNOWLEDGE, DERIV INDICES, AND MORE',
+    appName: 'Pipflowtrades',
+    tickerText: 'WELCOME TO PIPFLOWTRADES — YOUR HUB FOR TRADING KNOWLEDGE, DERIV INDICES, AND MORE',
     kesRate: 130
   },
   global_settings: {
@@ -17,7 +17,7 @@ const DEFAULT_PUBLIC_SETTINGS = {
     withdrawUrl: 'https://app.deriv.com/cashier/withdrawal',
     cashierNote: 'Deposit or withdraw instantly via Official Deriv Cashier or M-Pesa / KES Payment Agent.',
     riskDisclaimerText:
-      'TradeDeriv connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.',
+      'Pipflowtrades connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.',
     enabledTabs: [
       'dashboard',
       'bot_builder',
@@ -34,6 +34,29 @@ const DEFAULT_PUBLIC_SETTINGS = {
   }
 };
 
+function sanitizeBrandingValue(value: Record<string, unknown>) {
+  const rawName = typeof value.appName === 'string' ? value.appName : DEFAULT_PUBLIC_SETTINGS.branding.appName;
+  const rawTicker = typeof value.tickerText === 'string' ? value.tickerText : DEFAULT_PUBLIC_SETTINGS.branding.tickerText;
+  return {
+    ...value,
+    appName: rawName.replace(/TradeDeriv/gi, 'Pipflowtrades'),
+    tickerText: rawTicker
+      .replace(/TRADEDERIV/g, 'PIPFLOWTRADES')
+      .replace(/TradeDeriv/gi, 'Pipflowtrades')
+  };
+}
+
+function sanitizeSiteControlsValue(value: Record<string, unknown>) {
+  const rawDisclaimer =
+    typeof value.riskDisclaimerText === 'string'
+      ? value.riskDisclaimerText
+      : DEFAULT_PUBLIC_SETTINGS.site_controls.riskDisclaimerText;
+  return {
+    ...value,
+    riskDisclaimerText: rawDisclaimer.replace(/TradeDeriv/gi, 'Pipflowtrades')
+  };
+}
+
 export async function getPublicSettings() {
   if (!isDatabaseConfigured) return DEFAULT_PUBLIC_SETTINGS;
   try {
@@ -42,7 +65,17 @@ export async function getPublicSettings() {
     );
     const map: Record<string, unknown> = { ...DEFAULT_PUBLIC_SETTINGS };
     for (const row of res.rows) {
-      map[row.setting_key] = row.setting_value;
+      if (row.setting_key === 'branding' && row.setting_value && typeof row.setting_value === 'object') {
+        map[row.setting_key] = sanitizeBrandingValue(row.setting_value as Record<string, unknown>);
+      } else if (
+        row.setting_key === 'site_controls' &&
+        row.setting_value &&
+        typeof row.setting_value === 'object'
+      ) {
+        map[row.setting_key] = sanitizeSiteControlsValue(row.setting_value as Record<string, unknown>);
+      } else {
+        map[row.setting_key] = row.setting_value;
+      }
     }
     return map;
   } catch {

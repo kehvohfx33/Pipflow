@@ -39,8 +39,8 @@ export async function apiFetch<T = unknown>(
     data = {
       error:
         res.status === 502 || res.status === 503 || res.status === 504
-          ? `Server returned HTTP ${res.status} (Bad Gateway). The backend service is still starting up, missing environment variables, or crashed on Render.`
-          : `Unexpected HTML response (HTTP ${res.status}). Check VITE_API_URL and Render server logs.`
+          ? `Server returned HTTP ${res.status} (Service Unavailable). The trading gateway is starting up or temporarily unreachable.`
+          : `Unexpected server response (HTTP ${res.status}). Please retry in a moment.`
     };
   }
 

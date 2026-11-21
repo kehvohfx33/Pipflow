@@ -90,6 +90,14 @@ const ResetPasswordRoute: React.FC = () => {
   );
 };
 
+const SEO_PATH_TO_TAB: Record<string, string> = {
+  '/charts': 'charts',
+  '/trading-view': 'trading_view',
+  '/bots': 'freebots',
+  '/analysis': 'analysistool',
+  '/learning': 'learning'
+};
+
 const MainWorkspace: React.FC = () => {
   const {
     token,
@@ -111,8 +119,13 @@ const MainWorkspace: React.FC = () => {
   const [booting, setBooting] = useState(true);
   const [oauthExchanging, setOauthExchanging] = useState(false);
   const [oauthError, setOauthError] = useState('');
-  const [publicMode, setPublicMode] = useState(false);
-  const [activeTab, setActiveTabState] = useState(() => localStorage.getItem('pipflow_active_tab') || 'dashboard');
+  const initialCleanPath =
+    typeof window !== 'undefined' ? window.location.pathname.replace(/\/+$/, '').toLowerCase() || '/' : '/';
+  const matchedSeoTab = SEO_PATH_TO_TAB[initialCleanPath];
+  const [publicMode, setPublicMode] = useState(() => Boolean(matchedSeoTab));
+  const [activeTab, setActiveTabState] = useState(
+    () => matchedSeoTab || localStorage.getItem('pipflow_active_tab') || 'dashboard'
+  );
   const [activeSymbol, setActiveSymbolState] = useState(() => localStorage.getItem('pipflow_active_symbol') || 'R_25');
   const [watchSymbols, setWatchSymbols] = useState<string[]>([]);
   const [botRunning, setBotRunning] = useState(false);

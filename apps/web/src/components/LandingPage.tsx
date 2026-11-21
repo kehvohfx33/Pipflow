@@ -77,7 +77,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onOpenPublicCharts, in
   };
 
   return (
-    <div className="min-h-screen bg-[#060d18] text-white">
+    <div className="min-h-screen w-full overflow-x-hidden bg-[#060d18] text-white">
       {/* Top Bar */}
       <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-[#060d18]/90 backdrop-blur px-4 py-3">
         <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
@@ -330,8 +330,15 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onOpenPublicCharts, in
           </div>
         </div>
 
-        <footer className="pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-center sm:justify-between gap-2 text-xs text-slate-500">
-          <span>Pipflowtrades — Deriv API Trading &amp; Automation Workspace</span>
+        <footer className="pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-center sm:justify-between gap-3 text-xs text-slate-500">
+          <span>Pipflowtrades (pipflowtrade.site) — Deriv API Trading &amp; Automation Workspace</span>
+          <nav aria-label="Public Sections" className="flex flex-wrap items-center justify-center gap-4 text-[11px] text-slate-400">
+            <a href="/charts" className="hover:text-sky-400 transition">Live Charts</a>
+            <a href="/trading-view" className="hover:text-sky-400 transition">MT5 Terminal</a>
+            <a href="/bots" className="hover:text-sky-400 transition">Trading Bots</a>
+            <a href="/analysis" className="hover:text-sky-400 transition">Market Analysis</a>
+            <a href="/learning" className="hover:text-sky-400 transition">Learning Hub</a>
+          </nav>
         </footer>
       </section>
 

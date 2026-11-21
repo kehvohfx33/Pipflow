@@ -350,8 +350,8 @@ export async function placeBulkOrders(req: Request, res: Response) {
   const placed: unknown[] = [];
   const errors: string[] = [];
 
-  const tasks = Array.from({ length: orderCount }).map(async () => {
-    if (targetAccount) {
+  if (targetAccount) {
+    for (let i = 0; i < orderCount; i++) {
       try {
         const exec = await executeDerivTrade({
           userId: req.user!.userId,
@@ -394,41 +394,45 @@ export async function placeBulkOrders(req: Request, res: Response) {
         );
         placed.push(q.rows[0]);
       } catch (err) {
-        errors.push((err as Error).message);
-      }
-      return;
-    }
-
-    const resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
-    const isShortTermContract =
-      resolvedContract.startsWith('DIGIT') || resolvedContract === 'CALL' || resolvedContract === 'PUT';
-    const contractMeta = isShortTermContract
-      ? {
-          barrier: barrier !== undefined && barrier !== '' ? String(barrier) : null,
-          durationTicks: Math.max(1, Number(duration ?? 1)),
-          ticksElapsed: 0
+        const msg = (err as Error).message;
+        errors.push(msg);
+        if (msg.toLowerCase().includes('rate limit') || msg.toLowerCase().includes('insufficient')) {
+          break;
         }
-      : null;
+      }
+    }
+  } else {
+    const tasks = Array.from({ length: orderCount }).map(async () => {
+      const resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
+      const isShortTermContract =
+        resolvedContract.startsWith('DIGIT') || resolvedContract === 'CALL' || resolvedContract === 'PUT';
+      const contractMeta = isShortTermContract
+        ? {
+            barrier: barrier !== undefined && barrier !== '' ? String(barrier) : null,
+            durationTicks: Math.max(1, Number(duration ?? 1)),
+            ticksElapsed: 0
+          }
+        : null;
 
-    const q = await pool.query(
-      `INSERT INTO virtual_orders (user_id, execution_mode, contract_type, source, symbol, side, stake, entry_price, stop_loss, take_profit, contract_meta)
-       VALUES ($1, 'virtual', $2, 'manual', $3, $4, $5, $6, $7, $8, $9::jsonb) RETURNING *`,
-      [
-        req.user!.userId,
-        resolvedContract,
-        symbol,
-        side,
-        Number(stake),
-        resolvedSpot,
-        stopLoss ?? null,
-        takeProfit ?? null,
-        contractMeta ? JSON.stringify(contractMeta) : null
-      ]
-    );
-    placed.push(q.rows[0]);
-  });
-
-  await Promise.all(tasks);
+      const q = await pool.query(
+        `INSERT INTO virtual_orders (user_id, execution_mode, contract_type, source, symbol, side, stake, entry_price, stop_loss, take_profit, contract_meta)
+         VALUES ($1, 'virtual', $2, 'manual', $3, $4, $5, $6, $7, $8, $9::jsonb) RETURNING *`,
+        [
+          req.user!.userId,
+          resolvedContract,
+          symbol,
+          side,
+          Number(stake),
+          resolvedSpot,
+          stopLoss ?? null,
+          takeProfit ?? null,
+          contractMeta ? JSON.stringify(contractMeta) : null
+        ]
+      );
+      placed.push(q.rows[0]);
+    });
+    await Promise.all(tasks);
+  }
 
   if (placed.length === 0 && errors.length > 0) {
     return res.status(400).json({ error: errors[0], errors });

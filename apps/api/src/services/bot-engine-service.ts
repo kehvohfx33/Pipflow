@@ -447,7 +447,7 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
     applyBotOrderSettlement(info.userId, info.source, info.symbol, info.pnl);
   });
 
-  // Poll live open Deriv contracts (including 1-tick / N-tick Digit & Rise/Fall trades) every 2.5s
+  // Poll live open Deriv contracts (including 1-tick / N-tick Digit & Rise/Fall trades) every 5s
   let derivPollBusy = false;
   setInterval(async () => {
     if (derivPollBusy || !isDatabaseConfigured) return;
@@ -464,7 +464,7 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
     } finally {
       derivPollBusy = false;
     }
-  }, 2500);
+  }, 5000);
 
   const client = derivConnectionManager.getMarketClient();
   client.socket.on('tick', async (msg: { tick?: { symbol: string; quote: number; epoch: number; pip_size?: number } }) => {

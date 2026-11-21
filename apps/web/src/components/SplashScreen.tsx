@@ -14,7 +14,7 @@ export const SplashScreen: React.FC = () => {
         <div className="flex items-center gap-3.5 justify-center">
           <img
             src="/assets/aistudio/IMG-20261115-WA0009_aca2a037.jpg"
-            alt="Pipflow.site Logo"
+            alt="Pipflowtrades Logo"
             className="h-12 w-12 rounded-full object-cover border border-emerald-500/60 shadow-lg bg-black"
           />
           <div className="text-left">

@@ -122,7 +122,7 @@ export async function adminLogin(req: Request, res: Response) {
 
   if (!user || user.role_name !== 'admin') {
     await logSecurityEvent(user?.id ?? null, 'ADMIN_LOGIN_DENIED', 'warning', { email: cleanEmail }, req.ip);
-    return res.status(403).json({ error: 'Administrator account not found in database for this email' });
+    return res.status(401).json({ error: 'Invalid administrator email or password' });
   }
   if (!user.is_active) {
     return res.status(403).json({ error: 'Administrator account is suspended' });
@@ -243,8 +243,17 @@ export async function getAdminOverview(req: Request, res: Response) {
     announcements: announcements.rows,
     commissionConfig: {
       appId: rawComm.appId || (env.derivAppId !== '1089' ? env.derivAppId : ''),
-      appName: rawComm.appName || 'D74FX / Pipflowtrades',
-      domain: rawComm.domain || 'https://pipflow.site',
+      appName:
+        rawComm.appName && !rawComm.appName.toLowerCase().includes('tradederiv')
+          ? rawComm.appName
+          : 'Pipflowtrades',
+      domain:
+        rawComm.domain &&
+        !rawComm.domain.toLowerCase().includes('.onrender.com') &&
+        !rawComm.domain.toLowerCase().includes('tradederiv') &&
+        rawComm.domain.trim() !== 'https://pipflow.site'
+          ? rawComm.domain
+          : 'https://pipflowtrade.site',
       targetMarkupPct: Number(rawComm.targetMarkupPct ?? 2.0),
       affiliateUrl: rawComm.affiliateUrl || '',
       sidcCode: rawComm.sidcCode || '',
@@ -1104,8 +1113,15 @@ export async function getDerivCommissions(req: Request, res: Response) {
     dateTo,
     config: {
       appId: configuredAppId && configuredAppId !== '1089' ? configuredAppId : '',
-      appName: cfg.appName || 'TradeDeriv',
-      domain: cfg.domain || 'https://tradederiv-eiiy.onrender.com',
+      appName:
+        cfg.appName && !cfg.appName.toLowerCase().includes('tradederiv') ? cfg.appName : 'Pipflowtrades',
+      domain:
+        cfg.domain &&
+        !cfg.domain.toLowerCase().includes('.onrender.com') &&
+        !cfg.domain.toLowerCase().includes('tradederiv') &&
+        cfg.domain.trim() !== 'https://pipflow.site'
+          ? cfg.domain
+          : 'https://pipflowtrade.site',
       targetMarkupPct: targetPct,
       affiliateUrl: cfg.affiliateUrl || '',
       sidcCode: cfg.sidcCode || '',
@@ -1177,8 +1193,8 @@ export async function updateDerivCommissionConfig(req: Request, res: Response) {
   const nextValue: Record<string, unknown> = {
     ...prev,
     appId: appId !== undefined ? appId.trim() : prev.appId || '',
-    appName: appName !== undefined ? appName.trim() : prev.appName || 'D74FX / Pipflowtrades',
-    domain: domain !== undefined ? domain.trim() : prev.domain || 'https://pipflow.site',
+    appName: appName !== undefined ? appName.trim() : prev.appName || 'Pipflowtrades',
+    domain: domain !== undefined ? domain.trim() : prev.domain || 'https://pipflowtrade.site',
     targetMarkupPct:
       targetMarkupPct !== undefined && !Number.isNaN(Number(targetMarkupPct))
         ? Math.min(3, Math.max(0, Number(targetMarkupPct)))

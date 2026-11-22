@@ -45,6 +45,7 @@ import { CurrencyFlag } from '../components/CurrencyFlag';
 import { PipflowLogo } from '../components/PipflowLogo';
 import { useAuth } from '../contexts/AuthContext';
 import { apiFetch } from '../services/api';
+import { safeGetItem, safeSetItem } from '../utils/safeStorage';
 
 export interface NavTabItem {
   id: string;
@@ -175,7 +176,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [gmtNow, setGmtNow] = useState(() => new Date().toISOString().replace('T', ' ').slice(0, 19) + ' GMT');
   const [tabs, setTabs] = useState<NavTabItem[]>(() => {
     try {
-      const saved = localStorage.getItem('pipflow_nav_tabs');
+      const saved = safeGetItem('pipflow_nav_tabs');
       if (!saved) return DEFAULT_NAV_TABS;
       const parsed = JSON.parse(saved) as NavTabItem[];
       if (!Array.isArray(parsed) || parsed.length === 0) return DEFAULT_NAV_TABS;
@@ -238,7 +239,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   };
 
   const saveArrangement = () => {
-    localStorage.setItem('pipflow_nav_tabs', JSON.stringify(tabs));
+    safeSetItem('pipflow_nav_tabs', JSON.stringify(tabs));
     setArrangeOpen(false);
   };
 

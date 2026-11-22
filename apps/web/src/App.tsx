@@ -32,6 +32,46 @@ import { BotXmlTemplate } from './data/botXmlTemplates';
 import { MT5TradingView } from './trading/chart-engine/MT5TradingView';
 import { AdminDashboard } from './admin/AdminDashboard';
 import { apiFetch } from './services/api';
+import { safeGetItem, safeSessionGet, safeSessionSet, safeSetItem } from './utils/safeStorage';
+
+interface RootErrorBoundaryState {
+  hasError: boolean;
+  errorMessage: string;
+}
+
+class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, RootErrorBoundaryState> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, errorMessage: '' };
+  }
+
+  static getDerivedStateFromError(error: Error): RootErrorBoundaryState {
+    return { hasError: true, errorMessage: error?.message || 'Unexpected rendering error' };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#060d18] text-white flex items-center justify-center p-4">
+          <div className="max-w-md w-full rounded-2xl border border-slate-800 bg-[#0b1526] p-6 text-center space-y-4 shadow-2xl">
+            <h1 className="text-lg font-extrabold text-rose-400">Workspace Recovery</h1>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              {this.state.errorMessage}
+            </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-xs font-bold text-white"
+            >
+              Reload Pipflowtrades
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const VerifyEmailRoute: React.FC = () => {
   const [params] = useSearchParams();
@@ -150,9 +190,9 @@ const MainWorkspace: React.FC = () => {
   const matchedSeoTab = SEO_PATH_TO_TAB[initialCleanPath];
   const [publicMode, setPublicMode] = useState(() => Boolean(matchedSeoTab));
   const [activeTab, setActiveTabState] = useState(
-    () => matchedSeoTab || localStorage.getItem('pipflow_active_tab') || 'dashboard'
+    () => matchedSeoTab || safeGetItem('pipflow_active_tab') || 'dashboard'
   );
-  const [activeSymbol, setActiveSymbolState] = useState(() => localStorage.getItem('pipflow_active_symbol') || 'R_25');
+  const [activeSymbol, setActiveSymbolState] = useState(() => safeGetItem('pipflow_active_symbol') || 'R_25');
   const [watchSymbols, setWatchSymbols] = useState<string[]>([]);
   const [botRunning, setBotRunning] = useState(false);
   const [confirmRealFooterOpen, setConfirmRealFooterOpen] = useState(false);
@@ -167,12 +207,12 @@ const MainWorkspace: React.FC = () => {
 
   const setActiveTab = (tab: string) => {
     setActiveTabState(tab);
-    localStorage.setItem('pipflow_active_tab', tab);
+    safeSetItem('pipflow_active_tab', tab);
   };
 
   const setActiveSymbol = (sym: string) => {
     setActiveSymbolState(sym);
-    localStorage.setItem('pipflow_active_symbol', sym);
+    safeSetItem('pipflow_active_symbol', sym);
   };
 
   const {
@@ -565,11 +605,7 @@ const ConsoleSlugEntryGate: React.FC = () => {
     apiFetch<{ authorizedEntry?: boolean }>(`/auth/console-entry?slug=${encodeURIComponent(slug)}`)
       .then((res) => {
         if (res?.authorizedEntry) {
-          try {
-            sessionStorage.setItem('pf_secret_console', '1');
-          } catch {
-            // ignore
-          }
+          safeSessionSet('pf_secret_console', '1');
           navigate('/_console', { replace: true });
         } else {
           navigate('/', { replace: true });
@@ -602,12 +638,7 @@ const InitialOpsPathnameRedirect: React.FC = () => {
 
 const HiddenAdminGate: React.FC = () => {
   const { user, authenticated, authLoading } = useAuth();
-  let unlocked = false;
-  try {
-    unlocked = sessionStorage.getItem('pf_secret_console') === '1';
-  } catch {
-    unlocked = false;
-  }
+  const unlocked = safeSessionGet('pf_secret_console') === '1';
 
   const hashQuery = window.location.hash.includes('?') ? window.location.hash.split('?')[1] : '';
   const hashParams = new URLSearchParams(hashQuery);
@@ -633,17 +664,19 @@ const HiddenAdminGate: React.FC = () => {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <HashRouter>
-        <InitialOpsPathnameRedirect />
-        <Routes>
-          <Route path="/ops/:slug" element={<ConsoleSlugEntryGate />} />
-          <Route path="/_console" element={<HiddenAdminGate />} />
-          <Route path="/verify-email" element={<VerifyEmailRoute />} />
-          <Route path="/reset-password" element={<ResetPasswordRoute />} />
-          <Route path="*" element={<MainWorkspace />} />
-        </Routes>
-      </HashRouter>
-    </AuthProvider>
+    <RootErrorBoundary>
+      <AuthProvider>
+        <HashRouter>
+          <InitialOpsPathnameRedirect />
+          <Routes>
+            <Route path="/ops/:slug" element={<ConsoleSlugEntryGate />} />
+            <Route path="/_console" element={<HiddenAdminGate />} />
+            <Route path="/verify-email" element={<VerifyEmailRoute />} />
+            <Route path="/reset-password" element={<ResetPasswordRoute />} />
+            <Route path="*" element={<MainWorkspace />} />
+          </Routes>
+        </HashRouter>
+      </AuthProvider>
+    </RootErrorBoundary>
   );
 }

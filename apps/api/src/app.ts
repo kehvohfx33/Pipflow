@@ -95,6 +95,8 @@ export function createApiApp() {
       contentSecurityPolicy: false,
       frameguard: false,
       crossOriginEmbedderPolicy: false,
+      crossOriginResourcePolicy: false,
+      crossOriginOpenerPolicy: false,
       referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
       hsts: env.nodeEnv === 'production' ? { maxAge: 31536000, includeSubDomains: true } : false
     })

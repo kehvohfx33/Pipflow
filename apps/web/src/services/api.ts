@@ -1,3 +1,5 @@
+import { safeGetItem } from '../utils/safeStorage';
+
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
 export class ApiError extends Error {
@@ -28,7 +30,7 @@ export async function apiFetch<T = unknown>(
   options: RequestInit = {},
   includeBotGate = false
 ): Promise<T> {
-  const botGate = localStorage.getItem('pipflow_bot_gate');
+  const botGate = safeGetItem('pipflow_bot_gate');
   const method = String(options.method || 'GET').toUpperCase();
   const isMutation = !['GET', 'HEAD', 'OPTIONS'].includes(method);
   const headers: Record<string, string> = {

@@ -19,6 +19,7 @@ import {
 } from '../../services/derivBrowserWs';
 import { useAuth } from '../../contexts/AuthContext';
 import { LiveTick } from '../../hooks/useDerivStream';
+import { safeGetItem, safeSetItem } from '../../utils/safeStorage';
 import { TimeframesBar } from '../timeframes/TimeframesBar';
 import { IndicatorsPanel, IndicatorConfig } from '../indicators/IndicatorsPanel';
 import { DrawingToolbar, DrawingTool } from '../drawing-tools/DrawingToolbar';
@@ -86,12 +87,12 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
 
   const [symbol, setSymbol] = useState(symbolProp || 'R_25');
   const [granularity, setGranularityState] = useState(() => {
-    const saved = Number(localStorage.getItem('pipflow_chart_granularity'));
+    const saved = Number(safeGetItem('pipflow_chart_granularity'));
     return Number.isFinite(saved) && saved > 0 ? saved : 86400;
   });
   const setGranularity = (g: number) => {
     setGranularityState(g);
-    localStorage.setItem('pipflow_chart_granularity', String(g));
+    safeSetItem('pipflow_chart_granularity', String(g));
   };
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
   const [watchlist, setWatchlist] = useState<string[]>(['R_25', 'R_100', '1HZ90V']);
@@ -113,12 +114,12 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   const [lotSize, setLotSize] = useState(0.1);
   const [stake, setStake] = useState(10);
   const [orderMode, setOrderModeState] = useState<OrderTicketMode>(() => {
-    const saved = localStorage.getItem('pipflow_order_mode');
+    const saved = safeGetItem('pipflow_order_mode');
     return saved === 'OVER_UNDER' || saved === 'RISE_FALL' ? saved : 'MT5';
   });
   const setOrderMode = (m: OrderTicketMode) => {
     setOrderModeState(m);
-    localStorage.setItem('pipflow_order_mode', m);
+    safeSetItem('pipflow_order_mode', m);
   };
   const [digitPrediction, setDigitPrediction] = useState(4);
   const [durationTicks, setDurationTicks] = useState(5);

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Lock, ShieldCheck } from 'lucide-react';
 import { apiFetch } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
+import { safeSetItem } from '../utils/safeStorage';
 
 interface PasswordGateModalProps {
   title?: string;
@@ -26,7 +27,7 @@ export const PasswordGateModal: React.FC<PasswordGateModalProps> = ({
         method: 'POST',
         body: JSON.stringify({ password })
       });
-      localStorage.setItem('pipflow_bot_gate', res.gateToken);
+      safeSetItem('pipflow_bot_gate', res.gateToken);
       setBotGateUnlocked(true);
       onUnlocked();
     } catch (err) {

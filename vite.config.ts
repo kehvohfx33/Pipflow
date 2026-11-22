@@ -32,6 +32,7 @@ export default defineConfig(() => {
       alias: {
         '@': path.resolve(__dirname, '.'),
       },
+      dedupe: ['react', 'react-dom', 'mobx', 'mobx-react-lite'],
     },
     server: {
       host: '0.0.0.0',

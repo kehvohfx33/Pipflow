@@ -79,13 +79,24 @@ export function useDerivStream(
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
-      const ws = new WebSocket(getWebSocketUrl());
+      if (typeof WebSocket === 'undefined') return;
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(getWebSocketUrl());
+      } catch {
+        if (!closed) reconnectTimer = setTimeout(connect, 2500);
+        return;
+      }
       wsRef.current = ws;
 
       ws.onopen = () => {
         setConnected(true);
-        if (mergedWatchRef.current.length > 0) {
-          ws.send(JSON.stringify({ type: 'subscribe_many', symbols: mergedWatchRef.current }));
+        if (mergedWatchRef.current.length > 0 && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'subscribe_many', symbols: mergedWatchRef.current }));
+          } catch {
+            // ignore
+          }
         }
       };
 
@@ -152,8 +163,17 @@ export function useDerivStream(
   }, [authenticated]);
 
   useEffect(() => {
-    if (mergedWatchList.length > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'subscribe_many', symbols: mergedWatchList }));
+    if (
+      mergedWatchList.length > 0 &&
+      wsRef.current &&
+      typeof WebSocket !== 'undefined' &&
+      wsRef.current.readyState === WebSocket.OPEN
+    ) {
+      try {
+        wsRef.current.send(JSON.stringify({ type: 'subscribe_many', symbols: mergedWatchList }));
+      } catch {
+        // ignore
+      }
     }
   }, [watchListKey]);
 

@@ -9,6 +9,7 @@ import {
 import { LiveTick } from '../../hooks/useDerivStream';
 import { useAuth } from '../../contexts/AuthContext';
 import { VirtualOrderItem } from '../../components/trading/OrderTicket';
+import { safeGetItem, safeSetItem } from '../../utils/safeStorage';
 
 import { SmartChartWrapper } from '../../components/deriv/SmartChartWrapper';
 import { CandlestickSeries } from 'lightweight-charts';
@@ -70,12 +71,12 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   );
   const [externalMeta, setExternalMeta] = useState<Omit<ExternalFeedResp, 'candles'> | null>(null);
   const [granularity, setGranularityState] = useState(() => {
-    const saved = Number(localStorage.getItem('pipflow_chart_granularity'));
+    const saved = Number(safeGetItem('pipflow_chart_granularity'));
     return Number.isFinite(saved) && saved > 0 ? saved : 60;
   });
   const setGranularity = (g: number) => {
     setGranularityState(g);
-    localStorage.setItem('pipflow_chart_granularity', String(g));
+    safeSetItem('pipflow_chart_granularity', String(g));
   };
   const [latestPrice, setLatestPrice] = useState(0);
   const [stake, setStake] = useState(10);

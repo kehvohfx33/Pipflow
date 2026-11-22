@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { ApiError, apiFetch } from '../services/api';
+import { safeGetItem, safeRemoveItem, safeSetItem } from '../utils/safeStorage';
 
 export interface UserProfile {
   id: string;
@@ -200,14 +201,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [user, setUser] = useState<UserProfile | null>(null);
   const [derivAccounts, setDerivAccounts] = useState<DerivAccountSummary[]>([]);
   const [activeAccountId, setActiveAccountIdState] = useState<string | null>(() =>
-    localStorage.getItem('pipflow_active_account_id')
+    safeGetItem('pipflow_active_account_id')
   );
   const [botGateUnlocked, setBotGateUnlocked] = useState<boolean>(true);
   const [darkTheme, setDarkThemeState] = useState<boolean>(
-    () => localStorage.getItem('pipflow_dark') === 'true'
+    () => safeGetItem('pipflow_dark') === 'true'
   );
   const [currency, setCurrencyState] = useState<'USD' | 'KSH'>(() =>
-    localStorage.getItem('pipflow_currency') === 'KSH' ? 'KSH' : 'USD'
+    safeGetItem('pipflow_currency') === 'KSH' ? 'KSH' : 'USD'
   );
   const [orderVersion, setOrderVersion] = useState(0);
   const [fastExecution, setFastExecution] = useState<boolean>(true);
@@ -215,15 +216,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const setActiveAccountId = useCallback((id: string | null) => {
     setActiveAccountIdState(id);
     if (id) {
-      localStorage.setItem('pipflow_active_account_id', id);
+      safeSetItem('pipflow_active_account_id', id);
     } else {
-      localStorage.removeItem('pipflow_active_account_id');
+      safeRemoveItem('pipflow_active_account_id');
     }
   }, []);
 
   const setCurrency = useCallback((next: 'USD' | 'KSH') => {
     setCurrencyState(next);
-    localStorage.setItem('pipflow_currency', next);
+    safeSetItem('pipflow_currency', next);
   }, []);
 
   const bumpOrderVersion = useCallback(() => {
@@ -231,7 +232,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
   const [botConfig, setBotConfig] = useState<SharedBotConfig>(() => {
     try {
-      const saved = localStorage.getItem('pipflow_bot_config');
+      const saved = safeGetItem('pipflow_bot_config');
       return saved ? { ...DEFAULT_BOT_CONFIG, ...(JSON.parse(saved) as Partial<SharedBotConfig>) } : DEFAULT_BOT_CONFIG;
     } catch {
       return DEFAULT_BOT_CONFIG;
@@ -250,16 +251,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [siteControls, setSiteControls] = useState<SiteControlsSettings>(DEFAULT_SITE_CONTROLS);
 
   useEffect(() => {
-    try {
-      localStorage.setItem('pipflow_bot_config', JSON.stringify(botConfig));
-    } catch {
-      // Ignore storage quota errors
-    }
+    safeSetItem('pipflow_bot_config', JSON.stringify(botConfig));
   }, [botConfig]);
 
   const setDarkTheme = (val: boolean) => {
     setDarkThemeState(val);
-    localStorage.setItem('pipflow_dark', String(val));
+    safeSetItem('pipflow_dark', String(val));
     document.documentElement.classList.toggle('dark', val);
   };
 
@@ -311,13 +308,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [refreshBranding]);
 
   const clearLocalSession = useCallback(() => {
-    localStorage.removeItem('pipflow_token');
-    localStorage.removeItem('pipflow_user');
-    localStorage.removeItem('pipflow_active_account_id');
-    localStorage.removeItem('pipflow_active_tab');
-    localStorage.removeItem('pipflow_active_symbol');
-    localStorage.removeItem('pipflow_chart_granularity');
-    localStorage.removeItem('pipflow_order_mode');
+    safeRemoveItem('pipflow_token');
+    safeRemoveItem('pipflow_user');
+    safeRemoveItem('pipflow_active_account_id');
+    safeRemoveItem('pipflow_active_tab');
+    safeRemoveItem('pipflow_active_symbol');
+    safeRemoveItem('pipflow_chart_granularity');
+    safeRemoveItem('pipflow_order_mode');
     setUser(null);
     setDerivAccounts([]);
     setActiveAccountIdState(null);
@@ -370,8 +367,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     let cancelled = false;
     (async () => {
       // Remove any legacy insecure token storage from prior client builds
-      localStorage.removeItem('pipflow_token');
-      localStorage.removeItem('pipflow_user');
+      safeRemoveItem('pipflow_token');
+      safeRemoveItem('pipflow_user');
       try {
         const res = await apiFetch<{ user?: UserProfile }>('/auth/me');
         if (cancelled) return;
@@ -403,7 +400,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (Array.isArray(freshAccounts)) {
         setDerivAccounts(freshAccounts);
         if (activeAccountId && !freshAccounts.some((a) => a.id === activeAccountId)) {
-          localStorage.removeItem('pipflow_active_account_id');
+          safeRemoveItem('pipflow_active_account_id');
           setActiveAccountIdState(null);
         }
       } else {

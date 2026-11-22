@@ -1,4 +1,4 @@
-import { isDatabaseConfigured, pool } from '../database/pool';
+import { isStorageReady, pool } from '../database/pool';
 
 export async function createNotification(
   userId: string | null,
@@ -6,7 +6,7 @@ export async function createNotification(
   title: string,
   message: string
 ) {
-  if (!isDatabaseConfigured) return null;
+  if (!isStorageReady) return null;
   const res = await pool.query(
     `INSERT INTO notifications (user_id, category, title, message)
      VALUES ($1, $2, $3, $4) RETURNING *`,
@@ -22,7 +22,7 @@ export async function logSecurityEvent(
   details: Record<string, unknown>,
   ipAddress?: string
 ) {
-  if (!isDatabaseConfigured) return;
+  if (!isStorageReady) return;
   await pool.query(
     `INSERT INTO security_logs (user_id, event_type, severity, details, ip_address)
      VALUES ($1, $2, $3, $4::jsonb, $5)`,

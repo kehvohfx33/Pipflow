@@ -1,4 +1,4 @@
-import { isDatabaseConfigured, pool } from '../database/pool';
+import { isStorageReady, pool } from '../database/pool';
 import { derivConnectionManager } from '../integrations/deriv/connection-manager';
 import { fetchTickHistory } from '../integrations/deriv/candles';
 import {
@@ -249,7 +249,7 @@ function resolveBotSignal(session: ActiveBotSession, quote: number): {
 }
 
 async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: number, isInitialBurst = false) {
-  if (!session.isRunning || !isDatabaseConfigured) return;
+  if (!session.isRunning || !isStorageReady) return;
   if (botTradeLocks.has(session.userId)) return;
 
   // Enforce Number of Wins target & Stop Loss USD hard stop
@@ -450,7 +450,7 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
   // Poll live open Deriv contracts (including 1-tick / N-tick Digit & Rise/Fall trades) every 5s
   let derivPollBusy = false;
   setInterval(async () => {
-    if (derivPollBusy || !isDatabaseConfigured) return;
+    if (derivPollBusy || !isStorageReady) return;
     derivPollBusy = true;
     try {
       const q = await pool.query(
@@ -468,7 +468,7 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
 
   const client = derivConnectionManager.getMarketClient();
   client.socket.on('tick', async (msg: { tick?: { symbol: string; quote: number; epoch: number; pip_size?: number } }) => {
-    if (!msg.tick || !isDatabaseConfigured) return;
+    if (!msg.tick || !isStorageReady) return;
     const { symbol, quote } = msg.tick;
 
     try {

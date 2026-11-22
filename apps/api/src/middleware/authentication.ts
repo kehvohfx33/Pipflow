@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
-import { isDatabaseConfigured, pool } from '../database/pool';
+import { isStorageReady, pool } from '../database/pool';
 
 export interface AuthUser {
   userId: string;
@@ -27,7 +27,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const token = header.slice(7);
     const payload = jwt.verify(token, env.jwtSecret) as AuthUser;
 
-    if (isDatabaseConfigured) {
+    if (isStorageReady) {
       const q = await pool.query(
         `SELECT u.email, u.is_active, COALESCE(u.token_version, 1) AS token_version, r.name as role_name
          FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,

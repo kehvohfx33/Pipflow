@@ -4,13 +4,10 @@ import { env } from '../config/env';
 import { isDatabaseConfigured, pool } from '../database/pool';
 import { ensureDatabaseSchema } from '../database/init';
 
-export async function requireDb(_req: Request, res: Response, next: NextFunction) {
-  if (!isDatabaseConfigured) {
-    return res.status(503).json({
-      error: 'Service storage is temporarily unavailable.'
-    });
+export async function requireDb(_req: Request, _res: Response, next: NextFunction) {
+  if (isDatabaseConfigured) {
+    await ensureDatabaseSchema();
   }
-  await ensureDatabaseSchema();
   next();
 }
 
@@ -18,10 +15,7 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
   if (!req.user || req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Administrator privileges required' });
   }
-  if (!isDatabaseConfigured) {
-    return res.status(503).json({ error: 'Database not configured' });
-  }
-  // Verify role directly against database
+  // Verify role directly against storage (PostgreSQL or in-memory fallback)
   const q = await pool.query(
     `SELECT r.name as role_name, u.is_active FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
     [req.user.userId]

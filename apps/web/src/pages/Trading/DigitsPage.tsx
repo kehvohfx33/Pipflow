@@ -21,7 +21,7 @@ export const DigitsPage: React.FC<DigitsPageProps> = ({
   onSymbolChange,
   livePricesMap
 }) => {
-  const { token, activeDerivAccount, refreshDerivAccounts, refreshProfile, orderVersion, bumpOrderVersion } = useAuth();
+  const { authenticated, activeDerivAccount, refreshDerivAccounts, refreshProfile, orderVersion, bumpOrderVersion } = useAuth();
   const synthSymbols = useDerivSymbolsCatalog(true);
 
   const effectiveSymbol = synthSymbols.some((s) => s.symbol === symbol) ? symbol : 'R_100';
@@ -58,7 +58,7 @@ export const DigitsPage: React.FC<DigitsPageProps> = ({
   const needsBarrier = mode !== 'even_odd';
 
   const loadOrders = () => {
-    if (!token) return;
+    if (!authenticated) return;
     apiFetch<{ orders?: VirtualOrderItem[]; liveContracts?: Record<string, { currentSpot: number; profit: number; bidPrice?: number }> }>('/orders')
       .then((res) => {
         setOrders(Array.isArray(res?.orders) ? res.orders : []);
@@ -69,7 +69,7 @@ export const DigitsPage: React.FC<DigitsPageProps> = ({
 
   useEffect(() => {
     loadOrders();
-  }, [token, orderVersion]);
+  }, [authenticated, orderVersion]);
 
   useEffect(() => {
     let cancelled = false;
@@ -98,7 +98,7 @@ export const DigitsPage: React.FC<DigitsPageProps> = ({
     let cancelled = false;
     setQuoteErr('');
     const t = setTimeout(() => {
-      apiFetch<{ payout: number; askPrice: number }>('/deriv/proposal', {
+      apiFetch<{ proposal?: { payout: number; askPrice: number }; payout?: number; askPrice?: number }>('/deriv/proposal', {
         method: 'POST',
         body: JSON.stringify({
           symbol: effectiveSymbol,
@@ -110,7 +110,9 @@ export const DigitsPage: React.FC<DigitsPageProps> = ({
         })
       })
         .then((res) => {
-          if (!cancelled) setQuote(res);
+          if (cancelled) return;
+          const p = res.proposal ?? (res as { payout: number; askPrice: number });
+          if (p && typeof p.payout === 'number') setQuote(p);
         })
         .catch((err) => {
           if (!cancelled) setQuoteErr((err as Error).message);
@@ -127,7 +129,7 @@ export const DigitsPage: React.FC<DigitsPageProps> = ({
   const recentDigits = tickPrices.slice(-20).map((p) => Number(p.toFixed(pipSize).slice(-1)));
 
   const handleBuy = async () => {
-    if (!token) {
+    if (!authenticated) {
       setNotice('Please sign in to place Digits contracts.');
       return;
     }

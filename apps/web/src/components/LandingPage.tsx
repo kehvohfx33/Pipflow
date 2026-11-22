@@ -59,14 +59,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onOpenPublicCharts, in
       } else {
         const path = modalMode === 'register' ? '/auth/register' : '/auth/login';
         const res = await apiFetch<{
-          token: string;
           user: UserProfile;
           accounts?: DerivAccountSummary[];
         }>(path, {
           method: 'POST',
           body: JSON.stringify({ email, password, fullName })
         });
-        setSession(res.token, res.user, res.accounts);
+        setSession(res.user, res.accounts);
         setModalMode('none');
       }
     } catch (err) {

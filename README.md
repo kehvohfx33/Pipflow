@@ -1,18 +1,18 @@
-# PIPFLOW — Official Deriv API Trading Terminal & Market Analyser
+# Pipflowtrade.site (Pipflowtrades) — Official Deriv API Trading Terminal, Bot Builder & Market Analyser
 
-PIPFLOW is an independent trading analysis, MT5-inspired candlestick charting, and read-only Deriv account management platform built with React, TypeScript, Tailwind CSS, Node.js, Express, WebSockets, Neon PostgreSQL, and Brevo.
+**Pipflowtrade.site** unifies four Deriv trading workspaces (Bot Builder, Accumulators, Digits, and Rise/Fall) alongside MT5 multi-asset charting (`lightweight-charts`) on one branded React + Express + PostgreSQL + WebSocket platform backed by `@deriv-com/smartcharts-champion`.
 
 ## Repository Structure
 
-- `apps/web`: React + Vite + TypeScript + Tailwind CSS frontend (`pipflow.site` UI/UX)
+- `apps/web`: Unified React + Vite + TypeScript + Tailwind CSS frontend (`https://pipflowtrade.site`)
 - `apps/api`: Node.js + Express + WebSockets + Official Deriv WS API backend
-- `database/`: Neon PostgreSQL schema (`schema.sql`), migrations (`migrations/`), and seed data (`seeds/`)
-- `docs/`: Architecture, Database, API, and Render Deployment documentation
-- `render.yaml`: Render Blueprint for deploying `pipflow-api` and `pipflow-web`
+- `apps/deriv-bot`, `apps/deriv-accumulators`, `apps/deriv-digits`, `apps/deriv-rise-fall`: Extracted source modules from the original Deriv archives (originals preserved untouched in root)
+- `database/`: PostgreSQL schema (`schema.sql`), incremental migrations (`migrations/001–003`), and seeds (`seeds/`)
+- `docs/`: `ARCHIVE_MAPPING.md`, `ARCHITECTURE.md`, `DATABASE.md`, `API.md`, and `DEPLOYMENT.md`
+- `render.yaml`: Render Blueprint for deploying `pipflowtrades` (`https://pipflowtrade.site`)
 
 ## Quick Start
 
-1. Copy `.env.example` to `.env` and populate `DATABASE_URL`, `TOKEN_ENCRYPTION_KEY`, `DERIV_APP_ID`, `BREVO_API_KEY`, and `JWT_SECRET`.
-2. Run `database/schema.sql` and `database/seeds/seed.sql` on your Neon PostgreSQL database.
-3. Install dependencies and start the development server (`npm install && npm run dev`).
-4. Refer to `docs/DEPLOYMENT.md` for GitHub + Render production deployment.
+1. Copy `.env.example` to `.env` and populate `DATABASE_URL`, `TOKEN_ENCRYPTION_KEY`, `DERIV_APP_ID`, `DERIV_CLIENT_SECRET`, `BREVO_API_KEY`, `JWT_SECRET`, and `ADMIN_PRIVATE_SLUG`.
+2. Install dependencies and start the development server (`npm install && npm run dev`).
+3. Refer to `docs/ARCHIVE_MAPPING.md` for archive provenance and `docs/DEPLOYMENT.md` for Render production deployment.

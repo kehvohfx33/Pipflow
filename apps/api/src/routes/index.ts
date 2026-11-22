@@ -3,13 +3,14 @@ import { checkDatabaseHealth } from '../database/pool';
 import { derivConnectionManager } from '../integrations/deriv/connection-manager';
 import { getPublicSettings } from '../services/settings-service';
 import { requireAuth } from '../middleware/authentication';
-import { requireAdmin, requireDb } from '../middleware/authorization';
+import { requireAdmin, requireDb, requireOwner } from '../middleware/authorization';
 import { adminAuthRateLimiter, authRateLimiter } from '../middleware/rate-limit';
 import * as authCtrl from '../controllers/authController';
 import * as derivCtrl from '../controllers/derivController';
 import * as marketCtrl from '../controllers/marketController';
 import * as tradingCtrl from '../controllers/tradingController';
 import * as adminCtrl from '../controllers/adminController';
+import * as ownerCtrl from '../controllers/ownerController';
 
 const asyncHandler = (fn: (req: Request, res: Response, next: NextFunction) => unknown): RequestHandler => {
   return (req, res, next) => {
@@ -40,22 +41,26 @@ router.get(
   })
 );
 
-// Authentication & Password Gate
+// Authentication, Session Revocation & Private Entry Validation
 router.post('/auth/register', authRateLimiter, requireDb, asyncHandler(authCtrl.register));
 router.post('/auth/login', authRateLimiter, requireDb, asyncHandler(authCtrl.login));
+router.post('/auth/logout', requireDb, asyncHandler(authCtrl.logout));
+router.post('/auth/revoke-sessions', requireDb, asyncHandler(requireAuth), asyncHandler(authCtrl.revokeAllSessions));
 router.get('/auth/me', requireDb, asyncHandler(requireAuth), asyncHandler(authCtrl.getMe));
+router.get('/auth/console-entry', authRateLimiter, asyncHandler(authCtrl.checkConsoleEntry));
 router.get('/auth/verify-email', requireDb, asyncHandler(authCtrl.verifyEmail));
 router.post('/auth/forgot-password', authRateLimiter, requireDb, asyncHandler(authCtrl.forgotPassword));
 router.post('/auth/reset-password', authRateLimiter, requireDb, asyncHandler(authCtrl.resetPassword));
 router.post('/bot-gate/unlock', authRateLimiter, requireDb, asyncHandler(requireAuth), asyncHandler(authCtrl.unlockBotAnalyserGate));
 
-// Official Deriv OAuth2 Sign-Up / Login & Read-Only Account Management
+// Official Deriv OAuth2 Sign-Up / Login & Account Management
 router.get('/deriv/oauth-url/public', asyncHandler(derivCtrl.getPublicDerivOAuthUrl));
 router.get('/deriv/oauth-url', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.getDerivOAuthUrl));
 router.get(['/deriv/oauth/callback', '/deriv/oauth/callback/'], requireDb, asyncHandler(derivCtrl.handleDerivOAuthCallback));
 router.post('/deriv/oauth/exchange', requireDb, asyncHandler(derivCtrl.exchangeDerivOAuthTokens));
 router.post('/deriv/connect', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.connectDerivToken));
 router.get('/deriv/accounts', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.listConnectedAccounts));
+router.get('/deriv/adjustments', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.getUserBalanceAdjustments));
 router.post('/deriv/accounts/:id/sync', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.syncConnectedAccount));
 router.post('/deriv/accounts/:id/disconnect', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.disconnectAccount));
 router.post('/deriv/accounts/:id/revoke', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.revokeAccountAuthorization));
@@ -101,40 +106,13 @@ router.delete('/watchlists/:symbol', requireDb, asyncHandler(requireAuth), async
 router.get('/notifications', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.listNotifications));
 router.patch('/notifications/:id/read', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.markNotificationRead));
 
-// Server-Side Database-Backed Administrator Authentication & Modules
+// Console Bootstrap & Sign-In (OWNER / ADMIN)
 router.get('/admin/bootstrap-status', requireDb, asyncHandler(adminCtrl.getAdminBootstrapStatus));
 router.post('/admin/bootstrap', adminAuthRateLimiter, requireDb, asyncHandler(adminCtrl.bootstrapAdmin));
 router.post('/admin/login', adminAuthRateLimiter, requireDb, asyncHandler(adminCtrl.adminLogin));
 
+// Operations Admin + Owner Routes
 router.get('/admin/overview', asyncHandler(requireAuth), requireDb, asyncHandler(requireAdmin), asyncHandler(adminCtrl.getAdminOverview));
-router.put(
-  '/admin/settings/admin-credentials',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateAdminCredentials)
-);
-router.patch(
-  '/admin/users/:id/role',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateUserRole)
-);
-router.patch(
-  '/admin/users/:id/virtual-balance',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateUserVirtualBalance)
-);
-router.patch(
-  '/admin/connected-accounts/:id/balance',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateConnectedAccountBalance)
-);
 router.post(
   '/admin/connected-accounts/:id/sync',
   asyncHandler(requireAuth),
@@ -156,13 +134,6 @@ router.post(
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.adminRevokeConnectedAccount)
 );
-router.post(
-  '/admin/connected-accounts/connect',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.adminConnectDerivToken)
-);
 router.patch(
   '/admin/users/:id/status',
   asyncHandler(requireAuth),
@@ -170,33 +141,12 @@ router.patch(
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.toggleUserStatus)
 );
-router.put(
-  '/admin/settings/bot-password',
+router.post(
+  '/admin/users/:id/revoke-sessions',
   asyncHandler(requireAuth),
   requireDb,
   asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateBotGatePassword)
-);
-router.put(
-  '/admin/settings/branding',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateBrandingSettings)
-);
-router.put(
-  '/admin/settings/global',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateGlobalSettings)
-);
-router.put(
-  '/admin/settings/site-controls',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.updateSiteControls)
+  asyncHandler(adminCtrl.revokeUserSessions)
 );
 router.post(
   '/admin/announcements',
@@ -225,20 +175,6 @@ router.patch(
   requireDb,
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.updateUser)
-);
-router.delete(
-  '/admin/users/:id',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.deleteUser)
-);
-router.delete(
-  '/admin/connected-accounts/:id',
-  asyncHandler(requireAuth),
-  requireDb,
-  asyncHandler(requireAdmin),
-  asyncHandler(adminCtrl.deleteConnectedAccount)
 );
 router.post(
   '/admin/strategies',
@@ -282,24 +218,126 @@ router.delete(
   asyncHandler(requireAdmin),
   asyncHandler(adminCtrl.deleteAdminOrder)
 );
+
+// Platform OWNER-Exclusive Routes (Platform Settings, Credentials, Roles, Commissions, Deletions & Financial Adjustments)
+router.put(
+  '/admin/settings/admin-credentials',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.updateAdminCredentials)
+);
+router.patch(
+  '/admin/users/:id/role',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.updateUserRole)
+);
+router.delete(
+  '/admin/users/:id',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.deleteUser)
+);
+router.delete(
+  '/admin/connected-accounts/:id',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.deleteConnectedAccount)
+);
+router.post(
+  '/admin/connected-accounts/connect',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.adminConnectDerivToken)
+);
+router.put(
+  '/admin/settings/bot-password',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.updateBotGatePassword)
+);
+router.put(
+  '/admin/settings/branding',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.updateBrandingSettings)
+);
+router.put(
+  '/admin/settings/global',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.updateGlobalSettings)
+);
+router.put(
+  '/admin/settings/site-controls',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(adminCtrl.updateSiteControls)
+);
 router.get(
   '/admin/commissions',
   asyncHandler(requireAuth),
   requireDb,
-  asyncHandler(requireAdmin),
+  asyncHandler(requireOwner),
   asyncHandler(adminCtrl.getDerivCommissions)
 );
 router.get(
   '/admin/commissions/oauth-url',
   asyncHandler(requireAuth),
   requireDb,
-  asyncHandler(requireAdmin),
+  asyncHandler(requireOwner),
   asyncHandler(adminCtrl.getAdminCommissionOAuthUrl)
 );
 router.put(
   '/admin/commissions/config',
   asyncHandler(requireAuth),
   requireDb,
-  asyncHandler(requireAdmin),
+  asyncHandler(requireOwner),
   asyncHandler(adminCtrl.updateDerivCommissionConfig)
+);
+
+// Owner-Exclusive 8-Step Synchronized Balance Management & Immutable Ledger
+router.get(
+  '/owner/balance-adjustments',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(ownerCtrl.listOwnerBalanceAdjustments)
+);
+router.post(
+  '/owner/accounts/:id/sync-for-adjustment',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(ownerCtrl.syncAccountForAdjustment)
+);
+router.post(
+  '/owner/accounts/:id/adjustments',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(ownerCtrl.createPlatformAdjustment)
+);
+router.post(
+  '/owner/accounts/:id/exact-mode',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(ownerCtrl.toggleRealExactMode)
+);
+router.post(
+  '/owner/users/:id/virtual-adjustments',
+  asyncHandler(requireAuth),
+  requireDb,
+  asyncHandler(requireOwner),
+  asyncHandler(ownerCtrl.adjustVirtualWorkspaceBalance)
 );

@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS connected_accounts (
   account_type VARCHAR(16) NOT NULL CHECK (account_type IN ('demo', 'real')),
   currency VARCHAR(16) NOT NULL DEFAULT 'USD',
   last_known_balance NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  platform_adjustment_balance NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  exact_broker_balance_only BOOLEAN NOT NULL DEFAULT TRUE,
   balance_locked_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
   landing_company VARCHAR(64),
   connection_status VARCHAR(32) NOT NULL DEFAULT 'connected'
@@ -50,7 +52,29 @@ CREATE TABLE IF NOT EXISTS connected_accounts (
 );
 CREATE INDEX IF NOT EXISTS idx_connected_accounts_user ON connected_accounts(user_id, is_primary DESC);
 
--- 4. account_authorizations (AES-256-GCM encrypted Deriv token; never exposed to frontend)
+-- 4. balance_adjustments (immutable append-only audit ledger for Owner platform-side adjustments)
+CREATE TABLE IF NOT EXISTS balance_adjustments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idempotency_key VARCHAR(128) UNIQUE NOT NULL,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  connected_account_id UUID REFERENCES connected_accounts(id) ON DELETE SET NULL,
+  account_scope VARCHAR(16) NOT NULL CHECK (account_scope IN ('virtual', 'demo', 'real')),
+  owner_user_id UUID NOT NULL REFERENCES users(id),
+  broker_balance_at_sync NUMERIC(18, 4) NOT NULL,
+  currency VARCHAR(16) NOT NULL DEFAULT 'USD',
+  sync_timestamp TIMESTAMPTZ NOT NULL,
+  adjustment_delta NUMERIC(18, 4) NOT NULL,
+  previous_adjustment_total NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  new_adjustment_total NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  resulting_displayed_balance NUMERIC(18, 4) NOT NULL,
+  reason VARCHAR(160) NOT NULL,
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_balance_adjustments_user_created ON balance_adjustments(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_balance_adjustments_account_created ON balance_adjustments(connected_account_id, created_at DESC);
+
+-- 5. account_authorizations (AES-256-GCM encrypted Deriv token; never exposed to frontend)
 CREATE TABLE IF NOT EXISTS account_authorizations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   connected_account_id UUID NOT NULL REFERENCES connected_accounts(id) ON DELETE CASCADE,
@@ -67,7 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_account_auth_active
   ON account_authorizations(connected_account_id, user_id, created_at DESC)
   WHERE revoked_at IS NULL;
 
--- 5. market_instruments
+-- 6. market_instruments
 CREATE TABLE IF NOT EXISTS market_instruments (
   symbol VARCHAR(64) PRIMARY KEY,
   display_name VARCHAR(150) NOT NULL,
@@ -79,7 +103,7 @@ CREATE TABLE IF NOT EXISTS market_instruments (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 6. market_data_cache
+-- 7. market_data_cache
 CREATE TABLE IF NOT EXISTS market_data_cache (
   id BIGSERIAL PRIMARY KEY,
   symbol VARCHAR(64) NOT NULL REFERENCES market_instruments(symbol) ON DELETE CASCADE,
@@ -95,7 +119,7 @@ CREATE TABLE IF NOT EXISTS market_data_cache (
 CREATE INDEX IF NOT EXISTS idx_market_data_cache_lookup
   ON market_data_cache(symbol, granularity, epoch DESC);
 
--- 7. watchlists
+-- 8. watchlists
 CREATE TABLE IF NOT EXISTS watchlists (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -105,7 +129,7 @@ CREATE TABLE IF NOT EXISTS watchlists (
   UNIQUE (user_id, symbol)
 );
 
--- 8. notifications
+-- 9. notifications
 CREATE TABLE IF NOT EXISTS notifications (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -117,7 +141,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC);
 
--- 9. email_logs
+-- 10. email_logs
 CREATE TABLE IF NOT EXISTS email_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -131,7 +155,7 @@ CREATE TABLE IF NOT EXISTS email_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_email_logs_user_sent ON email_logs(user_id, sent_at DESC);
 
--- 10. application_settings
+-- 11. application_settings
 CREATE TABLE IF NOT EXISTS application_settings (
   setting_key VARCHAR(100) PRIMARY KEY,
   setting_value JSONB NOT NULL,
@@ -140,7 +164,7 @@ CREATE TABLE IF NOT EXISTS application_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 11. administrator_audit_logs
+-- 12. administrator_audit_logs
 CREATE TABLE IF NOT EXISTS administrator_audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   admin_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -153,7 +177,7 @@ CREATE TABLE IF NOT EXISTS administrator_audit_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON administrator_audit_logs(created_at DESC);
 
--- 12. virtual_orders
+-- 13. virtual_orders
 CREATE TABLE IF NOT EXISTS virtual_orders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -180,7 +204,7 @@ CREATE TABLE IF NOT EXISTS virtual_orders (
 CREATE INDEX IF NOT EXISTS idx_virtual_orders_user_status ON virtual_orders(user_id, status, opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_virtual_orders_contract ON virtual_orders(deriv_contract_id) WHERE deriv_contract_id IS NOT NULL;
 
--- 13. bot_strategies
+-- 14. bot_strategies
 CREATE TABLE IF NOT EXISTS bot_strategies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   slug VARCHAR(100) UNIQUE NOT NULL,
@@ -193,7 +217,7 @@ CREATE TABLE IF NOT EXISTS bot_strategies (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 14. security_logs
+-- 15. security_logs
 CREATE TABLE IF NOT EXISTS security_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -204,3 +228,15 @@ CREATE TABLE IF NOT EXISTS security_logs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_security_logs_user_created ON security_logs(user_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION prevent_balance_adjustments_mutation_fn()
+RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'balance_adjustments ledger is immutable and cannot be modified or deleted';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS prevent_balance_adjustments_mutation ON balance_adjustments;
+CREATE TRIGGER prevent_balance_adjustments_mutation
+BEFORE UPDATE OR DELETE ON balance_adjustments
+FOR EACH ROW EXECUTE FUNCTION prevent_balance_adjustments_mutation_fn();

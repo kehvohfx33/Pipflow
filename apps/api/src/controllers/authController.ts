@@ -6,6 +6,7 @@ import { pool } from '../database/pool';
 import { env } from '../config/env';
 import { sendBrevoEmail } from '../emails/brevo-service';
 import { logSecurityEvent } from '../services/notification-service';
+import { clearAuthCookies, ensureCsrfCookie, setAuthCookies } from '../utils/cookies';
 import { getUserAccountsList, syncUserDerivAccountsFromStoredTokens } from './derivController';
 
 export async function register(req: Request, res: Response) {
@@ -30,15 +31,21 @@ export async function register(req: Request, res: Response) {
   }
   const initialBalance = Number(globalCfg.defaultVirtualBalance ?? 10000);
 
+  await pool.query(
+    `INSERT INTO roles (id, name, description) VALUES (4, 'user', 'Standard registered Pipflowtrade user') ON CONFLICT (name) DO NOTHING`
+  );
+  const roleRes = await pool.query(`SELECT id FROM roles WHERE name = 'user' LIMIT 1`);
+  const userRoleId = Number(roleRes.rows[0]?.id ?? 4);
+
   const hash = await bcrypt.hash(password, 12);
   const verifyToken = crypto.randomBytes(24).toString('hex');
 
   try {
     const result = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role_id, virtual_workspace_balance, email_verification_token)
-       VALUES ($1, $2, $3, 1, $4, $5)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, COALESCE(token_version, 1) AS token_version`,
-      [email.trim().toLowerCase(), hash, fullName?.trim() || 'Trader', initialBalance, verifyToken]
+      [email.trim().toLowerCase(), hash, fullName?.trim() || 'Trader', userRoleId, initialBalance, verifyToken]
     );
     const user = result.rows[0];
 
@@ -47,18 +54,31 @@ export async function register(req: Request, res: Response) {
       to: user.email,
       toName: user.full_name,
       templateType: 'welcome_verification',
-      subject: 'Welcome to Pipflowtrades — Verify Your Email',
-      htmlContent: `<p>Welcome to Pipflowtrades, ${user.full_name}.</p><p>Verify your email address: <a href="${env.frontendUrl}/#/verify-email?token=${verifyToken}">Verify Account</a></p>`
+      subject: 'Welcome to Pipflowtrade — Verify Your Email',
+      htmlContent: `<p>Welcome to Pipflowtrade, ${user.full_name}.</p><p>Verify your email address: <a href="${env.frontendUrl}/#/verify-email?token=${verifyToken}">Verify Account</a></p>`
     });
 
-    await logSecurityEvent(user.id, 'USER_REGISTERED', 'info', { email: user.email }, req.ip);
+    await logSecurityEvent(user.id, 'USER_REGISTERED', 'info', { email: user.email, role: 'user' }, req.ip);
 
     const token = jwt.sign(
-      { userId: user.id, email: user.email, role: 'trader', tv: Number(user.token_version ?? 1) },
+      { userId: user.id, email: user.email, role: 'user', tv: Number(user.token_version ?? 1) },
       env.jwtSecret,
       { expiresIn: '7d' }
     );
-    res.status(201).json({ token, user: { ...user, role: 'trader' } });
+    setAuthCookies(req, res, token);
+    res.status(201).json({
+      authenticated: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        full_name: user.full_name,
+        role: 'user',
+        is_email_verified: Boolean(user.is_email_verified),
+        virtual_workspace_balance: Number(user.virtual_workspace_balance),
+        preferred_currency: user.preferred_currency,
+        local_currency: user.local_currency
+      }
+    });
   } catch {
     res.status(409).json({ error: 'Email already registered' });
   }
@@ -85,11 +105,10 @@ export async function login(req: Request, res: Response) {
 
   await pool.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [user.id]);
 
-  // On fresh login after sign-out, refresh real Deriv accounts, names, and balances into DB
   let accounts: Array<Record<string, unknown>> = [];
   try {
     const syncResult = await Promise.race([
-      syncUserDerivAccountsFromStoredTokens(user.id, { clearAdminLock: true }),
+      syncUserDerivAccountsFromStoredTokens(user.id),
       new Promise<{ synced: false; accounts: Array<Record<string, unknown>> }>((resolve) =>
         setTimeout(() => resolve({ synced: false, accounts: [] }), 6500)
       )
@@ -116,9 +135,10 @@ export async function login(req: Request, res: Response) {
     env.jwtSecret,
     { expiresIn: '7d' }
   );
+  setAuthCookies(req, res, token);
 
   res.json({
-    token,
+    authenticated: true,
     user: {
       id: user.id,
       email: user.email,
@@ -133,6 +153,36 @@ export async function login(req: Request, res: Response) {
   });
 }
 
+export async function logout(req: Request, res: Response) {
+  if (req.user?.userId) {
+    await logSecurityEvent(req.user.userId, 'USER_LOGOUT', 'info', {}, req.ip).catch(() => {});
+  }
+  clearAuthCookies(req, res);
+  res.json({ loggedOut: true });
+}
+
+export async function revokeAllSessions(req: Request, res: Response) {
+  const updated = await pool.query(
+    `UPDATE users
+     SET token_version = COALESCE(token_version, 1) + 1, updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, email, COALESCE(token_version, 1) AS token_version`,
+    [req.user!.userId]
+  );
+  if (!updated.rows[0]) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  await logSecurityEvent(
+    req.user!.userId,
+    'ALL_SESSIONS_REVOKED',
+    'info',
+    { tokenVersion: Number(updated.rows[0].token_version) },
+    req.ip
+  );
+  clearAuthCookies(req, res);
+  res.json({ revoked: true });
+}
+
 export async function getMe(req: Request, res: Response) {
   const q = await pool.query(
     `SELECT u.id, u.email, u.full_name, u.is_email_verified, u.virtual_workspace_balance, u.preferred_currency, u.local_currency, r.name as role
@@ -140,12 +190,27 @@ export async function getMe(req: Request, res: Response) {
     [req.user!.userId]
   );
   if (!q.rows[0]) return res.status(404).json({ error: 'User not found' });
+  ensureCsrfCookie(req, res);
   res.json({
     user: {
       ...q.rows[0],
       virtual_workspace_balance: Number(q.rows[0].virtual_workspace_balance)
     }
   });
+}
+
+export function checkConsoleEntry(req: Request, res: Response) {
+  const submitted = String(req.query.slug ?? '').trim();
+  const expected = env.adminPrivateSlug.trim();
+  if (!submitted || !expected) {
+    return res.status(404).json({ authorizedEntry: false });
+  }
+  const bufSub = Buffer.from(submitted, 'utf8');
+  const bufExp = Buffer.from(expected, 'utf8');
+  if (bufSub.length !== bufExp.length || !crypto.timingSafeEqual(bufSub, bufExp)) {
+    return res.status(404).json({ authorizedEntry: false });
+  }
+  res.json({ authorizedEntry: true });
 }
 
 export async function verifyEmail(req: Request, res: Response) {
@@ -177,8 +242,8 @@ export async function forgotPassword(req: Request, res: Response) {
       to: q.rows[0].email,
       toName: q.rows[0].full_name,
       templateType: 'password_recovery',
-      subject: 'Pipflowtrades Password Recovery',
-      htmlContent: `<p>Reset your Pipflowtrades password:</p><p><a href="${env.frontendUrl}/#/reset-password?token=${resetToken}">Reset Password</a></p>`
+      subject: 'Pipflowtrade Password Recovery',
+      htmlContent: `<p>Reset your Pipflowtrade password:</p><p><a href="${env.frontendUrl}/#/reset-password?token=${resetToken}">Reset Password</a></p>`
     });
     await logSecurityEvent(q.rows[0].id, 'PASSWORD_RESET_REQUESTED', 'info', {}, req.ip);
   }
@@ -208,8 +273,8 @@ export async function resetPassword(req: Request, res: Response) {
     userId: q.rows[0].id,
     to: q.rows[0].email,
     templateType: 'security_alert',
-    subject: 'Pipflowtrades Security Alert: Password Changed',
-    htmlContent: `<p>Your Pipflowtrades account password was recently changed. If this wasn't you, contact support immediately.</p>`
+    subject: 'Pipflowtrade Security Alert: Password Changed',
+    htmlContent: `<p>Your Pipflowtrade account password was recently changed. If this wasn't you, contact support immediately.</p>`
   });
   res.json({ reset: true });
 }

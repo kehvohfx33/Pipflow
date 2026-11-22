@@ -7,16 +7,16 @@ import { VirtualOrderItem } from '../../components/trading/OrderTicket';
 import { RiskCalculatorPage } from '../Dashboard/RiskCalculatorPage';
 
 export const AnalyticsPage: React.FC = () => {
-  const { token, darkTheme, orderVersion } = useAuth();
+  const { authenticated, darkTheme, orderVersion } = useAuth();
   const [orders, setOrders] = useState<VirtualOrderItem[]>([]);
   const chartRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!token) return;
+    if (!authenticated) return;
     apiFetch<{ orders?: VirtualOrderItem[] }>('/orders')
       .then((res) => setOrders(Array.isArray(res?.orders) ? res.orders : []))
       .catch(() => {});
-  }, [token, orderVersion]);
+  }, [authenticated, orderVersion]);
 
   const metrics = useMemo(() => {
     const settled = orders.filter((o) => o.status !== 'OPEN');

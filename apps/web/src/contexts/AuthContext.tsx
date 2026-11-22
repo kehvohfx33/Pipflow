@@ -5,7 +5,7 @@ export interface UserProfile {
   id: string;
   email: string;
   full_name: string;
-  role: 'trader' | 'admin';
+  role: 'owner' | 'admin' | 'user' | 'trader';
   is_email_verified: boolean;
   virtual_workspace_balance: number;
   preferred_currency: string;
@@ -18,11 +18,19 @@ export interface DerivAccountSummary {
   account_type: 'demo' | 'real';
   currency: string;
   last_known_balance: number;
+  platform_adjustment_balance?: number;
+  exact_broker_balance_only?: boolean;
+  displayed_balance?: number;
   landing_company: string | null;
   connection_status: 'connected' | 'disconnected' | 'revoked' | 'error';
   is_primary: boolean;
   last_synced_at: string | null;
   granted_scopes?: string[];
+}
+
+export function getEffectiveAccountBalance(account: DerivAccountSummary | null | undefined): number {
+  if (!account) return 0;
+  return Number(account.displayed_balance ?? account.last_known_balance ?? 0);
 }
 
 export interface BrandingSettings {
@@ -156,7 +164,8 @@ const DEFAULT_SITE_CONTROLS: SiteControlsSettings = {
 };
 
 interface AuthContextValue {
-  token: string | null;
+  authenticated: boolean;
+  authLoading: boolean;
   user: UserProfile | null;
   derivAccounts: DerivAccountSummary[];
   activeDerivAccount: DerivAccountSummary | null;
@@ -176,25 +185,19 @@ interface AuthContextValue {
   setCurrency: (c: 'USD' | 'KSH') => void;
   orderVersion: number;
   bumpOrderVersion: () => void;
-  setSession: (token: string, user: UserProfile, freshAccounts?: DerivAccountSummary[]) => void;
+  setSession: (user: UserProfile, freshAccounts?: DerivAccountSummary[]) => void;
   refreshProfile: () => Promise<void>;
   refreshDerivAccounts: (sync?: boolean) => Promise<void>;
   refreshBranding: () => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
+  revokeAllSessions: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem('pipflow_token'));
-  const [user, setUser] = useState<UserProfile | null>(() => {
-    const raw = localStorage.getItem('pipflow_user');
-    try {
-      return raw ? (JSON.parse(raw) as UserProfile) : null;
-    } catch {
-      return null;
-    }
-  });
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [user, setUser] = useState<UserProfile | null>(null);
   const [derivAccounts, setDerivAccounts] = useState<DerivAccountSummary[]>([]);
   const [activeAccountId, setActiveAccountIdState] = useState<string | null>(() =>
     localStorage.getItem('pipflow_active_account_id')
@@ -307,7 +310,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     refreshBranding();
   }, [refreshBranding]);
 
-  const logout = useCallback(() => {
+  const clearLocalSession = useCallback(() => {
     localStorage.removeItem('pipflow_token');
     localStorage.removeItem('pipflow_user');
     localStorage.removeItem('pipflow_active_account_id');
@@ -315,31 +318,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.removeItem('pipflow_active_symbol');
     localStorage.removeItem('pipflow_chart_granularity');
     localStorage.removeItem('pipflow_order_mode');
-    setToken(null);
     setUser(null);
     setDerivAccounts([]);
     setActiveAccountIdState(null);
   }, []);
 
-  const refreshProfile = useCallback(async () => {
-    const activeToken = localStorage.getItem('pipflow_token') || token;
-    if (!activeToken) return;
+  const logout = useCallback(async () => {
     try {
-      const res = await apiFetch<{ user?: UserProfile }>('/auth/me');
-      if (res?.user) {
-        setUser(res.user);
-        localStorage.setItem('pipflow_user', JSON.stringify(res.user));
-      }
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        logout();
-      }
+      await apiFetch('/auth/logout', { method: 'POST' });
+    } catch {
+      // Ignore network/401 errors on logout
     }
-  }, [token, logout]);
+    clearLocalSession();
+  }, [clearLocalSession]);
+
+  const revokeAllSessions = useCallback(async () => {
+    await apiFetch('/auth/revoke-sessions', { method: 'POST' });
+    clearLocalSession();
+  }, [clearLocalSession]);
 
   const refreshDerivAccounts = useCallback(async (sync = false) => {
-    const activeToken = localStorage.getItem('pipflow_token') || token;
-    if (!activeToken) return;
     try {
       const res = await apiFetch<{ accounts?: DerivAccountSummary[] }>(
         `/deriv/accounts${sync ? '?sync=1' : ''}`
@@ -348,34 +346,72 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setDerivAccounts(res.accounts);
       }
     } catch {
-      // Ignore if DB not configured
+      // Ignore if unauthenticated or DB unavailable
     }
-  }, [token]);
+  }, []);
 
-  useEffect(() => {
-    if (token) {
-      refreshProfile();
-      refreshDerivAccounts(false);
-    }
-  }, [token, refreshProfile, refreshDerivAccounts]);
-
-  const setSession = (
-    newToken: string,
-    newUser: UserProfile,
-    freshAccounts?: DerivAccountSummary[]
-  ) => {
-    localStorage.setItem('pipflow_token', newToken);
-    localStorage.setItem('pipflow_user', JSON.stringify(newUser));
-    setToken(newToken);
-    setUser(newUser);
-    if (Array.isArray(freshAccounts)) {
-      setDerivAccounts(freshAccounts);
-      if (activeAccountId && !freshAccounts.some((a) => a.id === activeAccountId)) {
-        localStorage.removeItem('pipflow_active_account_id');
-        setActiveAccountIdState(null);
+  const refreshProfile = useCallback(async () => {
+    try {
+      const res = await apiFetch<{ user?: UserProfile }>('/auth/me');
+      if (res?.user) {
+        setUser(res.user);
+      } else {
+        clearLocalSession();
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        clearLocalSession();
       }
     }
-  };
+  }, [clearLocalSession]);
+
+  // Hydrate authenticated user from HttpOnly pf_session cookie on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      // Remove any legacy insecure token storage from prior client builds
+      localStorage.removeItem('pipflow_token');
+      localStorage.removeItem('pipflow_user');
+      try {
+        const res = await apiFetch<{ user?: UserProfile }>('/auth/me');
+        if (cancelled) return;
+        if (res?.user) {
+          setUser(res.user);
+          await refreshDerivAccounts(false);
+        } else {
+          clearLocalSession();
+        }
+      } catch {
+        if (!cancelled) {
+          clearLocalSession();
+        }
+      } finally {
+        if (!cancelled) {
+          setAuthLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [clearLocalSession, refreshDerivAccounts]);
+
+  const setSession = useCallback(
+    (newUser: UserProfile, freshAccounts?: DerivAccountSummary[]) => {
+      setUser(newUser);
+      setAuthLoading(false);
+      if (Array.isArray(freshAccounts)) {
+        setDerivAccounts(freshAccounts);
+        if (activeAccountId && !freshAccounts.some((a) => a.id === activeAccountId)) {
+          localStorage.removeItem('pipflow_active_account_id');
+          setActiveAccountIdState(null);
+        }
+      } else {
+        void refreshDerivAccounts(false);
+      }
+    },
+    [activeAccountId, refreshDerivAccounts]
+  );
 
   const safeDerivAccounts = Array.isArray(derivAccounts) ? derivAccounts : [];
 
@@ -389,7 +425,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   return (
     <AuthContext.Provider
       value={{
-        token,
+        authenticated: Boolean(user),
+        authLoading,
         user,
         derivAccounts: safeDerivAccounts,
         activeDerivAccount,
@@ -413,7 +450,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         refreshProfile,
         refreshDerivAccounts,
         refreshBranding,
-        logout
+        logout,
+        revokeAllSessions
       }}
     >
       {children}

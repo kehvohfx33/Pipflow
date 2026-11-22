@@ -148,7 +148,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const navigate = useNavigate();
   const {
     user,
-    token,
+    authenticated,
     derivAccounts,
     activeDerivAccount,
     setActiveAccountId,
@@ -201,7 +201,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   }, []);
 
   const displayUsdBalance = activeDerivAccount
-    ? Number(activeDerivAccount.last_known_balance)
+    ? Number(activeDerivAccount.displayed_balance ?? activeDerivAccount.last_known_balance)
     : Number(user?.virtual_workspace_balance ?? 10000);
 
   const isRealAccount = activeDerivAccount?.account_type === 'real';
@@ -243,7 +243,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   };
 
   const handleResetVirtualBalance = async () => {
-    if (!token) return;
+    if (!authenticated) return;
     await apiFetch('/orders/reset-balance', { method: 'POST' });
     await refreshProfile();
   };
@@ -658,12 +658,26 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
                   <span>Learning Hub</span>
                 </button>
 
-                {token ? (
+                {(user?.role === 'owner' || user?.role === 'admin') && (
                   <button
                     type="button"
                     onClick={() => {
                       setMenuOpen(false);
-                      logout();
+                      navigate('/_console');
+                    }}
+                    className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-blue-50 dark:hover:bg-blue-950/30 text-blue-600 dark:text-sky-400 font-semibold text-left"
+                  >
+                    <Settings className="w-4 h-4" />
+                    <span>{user?.role === 'owner' ? 'Owner Console' : 'Operations Console'}</span>
+                  </button>
+                )}
+
+                {authenticated ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void logout();
                     }}
                     className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-rose-50 dark:hover:bg-rose-950/30 text-rose-600 font-semibold text-left"
                   >
@@ -751,7 +765,9 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
                 derivAccounts
                   .filter((a) => a.account_type === accountTab)
                   .map((acc) => {
-                    const accLowReal = acc.account_type === 'real' && Number(acc.last_known_balance) < 2;
+                    const effectiveBal = Number(acc.displayed_balance ?? acc.last_known_balance);
+                    const accLowReal = acc.account_type === 'real' && effectiveBal < 2;
+                    const hasAdj = Math.abs(Number(acc.platform_adjustment_balance ?? 0)) > 0.0001;
                     return (
                       <button
                         key={acc.id}
@@ -763,17 +779,29 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
                         className="w-full flex items-center justify-between p-3 rounded-xl bg-slate-100 dark:bg-slate-800 hover:ring-2 hover:ring-blue-500 text-left transition"
                       >
                         <div>
-                          <div className="font-bold text-sm">
-                            {acc.account_type === 'real' ? 'Real Trading Account' : 'Demo Practice Account'}
+                          <div className="font-bold text-sm flex items-center gap-1.5">
+                            <span>{acc.account_type === 'real' ? 'Real Trading Account' : 'Demo Practice Account'}</span>
+                            {acc.account_type === 'real' && acc.exact_broker_balance_only !== false && (
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300 text-[9px] font-bold">
+                                Exact Broker
+                              </span>
+                            )}
+                            {hasAdj && !(acc.account_type === 'real' && acc.exact_broker_balance_only !== false) && (
+                              <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 text-[9px] font-bold">
+                                +Platform Adj.
+                              </span>
+                            )}
                           </div>
-                          <div className="text-xs text-slate-500">{acc.currency} Wallet</div>
+                          <div className="text-xs text-slate-500">
+                            {acc.currency} Wallet · {acc.deriv_login_id}
+                          </div>
                         </div>
                         <div
                           className={`font-bold text-sm font-mono ${
                             accLowReal ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'
                           }`}
                         >
-                          {Number(acc.last_known_balance).toLocaleString('en-US', {
+                          {effectiveBal.toLocaleString('en-US', {
                             minimumFractionDigits: 2
                           })}{' '}
                           {acc.currency}
@@ -783,7 +811,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
                   })
               )}
 
-              {accountTab === 'demo' && token && (
+              {accountTab === 'demo' && authenticated && (
                 <button
                   type="button"
                   onClick={handleResetVirtualBalance}

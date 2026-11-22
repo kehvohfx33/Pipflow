@@ -42,7 +42,7 @@ const CORE_WATCH_SYMBOLS = [
 ];
 
 export function useDerivStream(
-  token: string | null,
+  authenticated: boolean,
   activeSymbol?: string,
   watchSymbols: string[] = []
 ) {
@@ -71,11 +71,15 @@ export function useDerivStream(
   mergedWatchRef.current = mergedWatchList;
 
   useEffect(() => {
+    if (!authenticated) {
+      setConnected(false);
+      return;
+    }
     let closed = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
-      const ws = new WebSocket(getWebSocketUrl(token));
+      const ws = new WebSocket(getWebSocketUrl());
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -145,7 +149,7 @@ export function useDerivStream(
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsRef.current?.close();
     };
-  }, [token]);
+  }, [authenticated]);
 
   useEffect(() => {
     if (mergedWatchList.length > 0 && wsRef.current?.readyState === WebSocket.OPEN) {

@@ -10,11 +10,14 @@ import { env, validateEnvironmentConfig } from './config/env';
 import { router } from './routes';
 import { handleDerivOAuthCallback } from './controllers/derivController';
 import { requireDb } from './middleware/authorization';
+import { requireCsrf } from './middleware/authentication';
 import { ensureDatabaseSchema } from './database/init';
+import { pool, isStorageReady } from './database/pool';
 import { derivConnectionManager } from './integrations/deriv/connection-manager';
 import { ensureLiveTickSubscription, getLatestTicksForSymbols } from './services/market-data-service';
 import { attachTickEvaluator } from './services/bot-engine-service';
 import { registerWsClient, unregisterWsClient, broadcastToUser } from './services/realtime-hub';
+import { parseCookies, SESSION_COOKIE_NAME } from './utils/cookies';
 import { logInfo, logError } from './utils/logger';
 
 const SITEMAP_XML = `<?xml version="1.0" encoding="UTF-8"?>
@@ -69,7 +72,14 @@ function isAllowedCorsOrigin(origin?: string): boolean {
     if (host === 'pipflowtrade.site' || host === 'www.pipflowtrade.site') return true;
     const configuredHost = new URL(env.publicSiteUrl).hostname.toLowerCase();
     if (host === configuredHost) return true;
-    if (host === 'localhost' || host === '127.0.0.1' || host.endsWith('.aistudio.dev')) return true;
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.aistudio.dev') ||
+      host.endsWith('.run.app')
+    ) {
+      return true;
+    }
   } catch {
     return false;
   }
@@ -133,10 +143,15 @@ export function createApiApp() {
     res.status(204).end();
   });
 
-  app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
-    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
-    next();
-  }, router);
+  app.use(
+    '/api',
+    (_req: Request, res: Response, next: NextFunction) => {
+      res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+      next();
+    },
+    requireCsrf,
+    router
+  );
 
   app.get(['/callback', '/callback/'], requireDb, (req: Request, res: Response, next: NextFunction) => {
     Promise.resolve(handleDerivOAuthCallback(req, res)).catch(next);
@@ -169,19 +184,12 @@ export function attachWebSocketRelay(server: http.Server) {
 
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url ?? '', `http://${req.headers.host || 'localhost'}`);
-    const token = url.searchParams.get('token');
-    let userId: string | null = null;
-
-    if (token) {
-      try {
-        const payload = jwt.verify(token, env.jwtSecret) as { userId: string };
-        userId = payload.userId;
-      } catch {
-        // Unauthenticated clients still receive public live market ticks and global branding updates
-      }
-    }
-
-    registerWsClient(ws, userId);
+    const cookies = parseCookies(req.headers.cookie);
+    const cookieToken = cookies[SESSION_COOKIE_NAME];
+    const queryToken = url.searchParams.get('token');
+    const rawToken = (cookieToken && cookieToken.trim()) || (queryToken && queryToken.trim()) || null;
+    let verifiedUserId: string | null = null;
+    let registered = false;
 
     const flushCachedTicks = (symbols: string[]) => {
       const cached = getLatestTicksForSymbols(symbols);
@@ -211,8 +219,38 @@ export function attachWebSocketRelay(server: http.Server) {
     });
 
     ws.on('close', () => {
-      unregisterWsClient(ws, userId);
+      if (registered) {
+        unregisterWsClient(ws, verifiedUserId);
+      }
     });
+
+    void (async () => {
+      if (rawToken) {
+        try {
+          const payload = jwt.verify(rawToken, env.jwtSecret) as { userId?: string; tv?: number };
+          if (payload.userId) {
+            if (isStorageReady) {
+              const q = await pool.query(
+                `SELECT is_active, COALESCE(token_version, 1) AS token_version FROM users WHERE id = $1`,
+                [payload.userId]
+              );
+              const row = q.rows[0];
+              if (row && row.is_active && Number(payload.tv ?? 1) === Number(row.token_version)) {
+                verifiedUserId = payload.userId;
+              }
+            } else {
+              verifiedUserId = payload.userId;
+            }
+          }
+        } catch {
+          verifiedUserId = null;
+        }
+      }
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        registerWsClient(ws, verifiedUserId);
+        registered = true;
+      }
+    })();
   });
 
   const marketClient = derivConnectionManager.getMarketClient();

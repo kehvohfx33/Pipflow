@@ -7,6 +7,7 @@ import { ChartBarrier, SmartChartWrapper } from '../../components/deriv/SmartCha
 import { SymbolSelector, useDerivSymbolsCatalog } from '../../components/deriv/SymbolSelector';
 import { ContractPositionsList } from '../../components/deriv/PositionsCards';
 import { VirtualOrderItem } from '../../components/trading/OrderTicket';
+import { calculateContractMarkersFromOrders } from '../../utils/chartMarkers';
 
 interface AccumulatorsPageProps {
   symbol: string;
@@ -23,7 +24,7 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
   liveTick,
   livePricesMap
 }) => {
-  const { token, activeDerivAccount, refreshDerivAccounts, refreshProfile, orderVersion, bumpOrderVersion } = useAuth();
+  const { authenticated, activeDerivAccount, refreshDerivAccounts, refreshProfile, orderVersion, bumpOrderVersion } = useAuth();
   const synthSymbols = useDerivSymbolsCatalog(true);
   const effectiveSymbol = synthSymbols.some((s) => s.symbol === symbol) ? symbol : '1HZ100V';
 
@@ -35,13 +36,11 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
     payout: number;
     askPrice: number;
     spot: number;
-    contractParams?: {
-      high_barrier?: string;
-      low_barrier?: string;
-      tick_size_percentage?: number;
-      maximum_ticks?: number;
-      maximum_payout?: number;
-    };
+    highBarrier?: number | null;
+    lowBarrier?: number | null;
+    maxTicks?: number | null;
+    maxPayout?: number | null;
+    tickSizePercentage?: number | null;
   } | null>(null);
   const [quoteErr, setQuoteErr] = useState('');
   const [placing, setPlacing] = useState(false);
@@ -51,7 +50,7 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
   const [liveContracts, setLiveContracts] = useState<Record<string, { currentSpot: number; profit: number; bidPrice?: number }>>({});
 
   const loadOrders = () => {
-    if (!token) return;
+    if (!authenticated) return;
     apiFetch<{ orders?: VirtualOrderItem[]; liveContracts?: Record<string, { currentSpot: number; profit: number; bidPrice?: number }> }>('/orders')
       .then((res) => {
         setOrders(Array.isArray(res?.orders) ? res.orders : []);
@@ -62,24 +61,24 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
 
   useEffect(() => {
     loadOrders();
-  }, [token, orderVersion]);
+  }, [authenticated, orderVersion]);
 
   useEffect(() => {
     let cancelled = false;
     setQuoteErr('');
     const t = setTimeout(() => {
-      apiFetch<typeof quote>('/deriv/proposal', {
+      apiFetch<{ proposal?: NonNullable<typeof quote> }>('/deriv/proposal', {
         method: 'POST',
         body: JSON.stringify({
           symbol: effectiveSymbol,
           contractType: 'ACCU',
           stake,
           growthRate,
-          ...(useTakeProfit && takeProfitUsd > 0 ? { takeProfit: takeProfitUsd } : {})
+          ...(useTakeProfit && takeProfitUsd > 0 ? { takeProfitUsd } : {})
         })
       })
         .then((res) => {
-          if (!cancelled) setQuote(res);
+          if (!cancelled && res.proposal) setQuote(res.proposal);
         })
         .catch((err) => {
           if (!cancelled) setQuoteErr((err as Error).message);
@@ -92,25 +91,37 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
   }, [effectiveSymbol, growthRate, stake, useTakeProfit, takeProfitUsd]);
 
   const barriers = useMemo((): ChartBarrier[] => {
-    const high = quote?.contractParams?.high_barrier;
-    const low = quote?.contractParams?.low_barrier;
-    if (!high || !low) return [];
+    const high = quote?.highBarrier;
+    const low = quote?.lowBarrier;
+    if (high == null || low == null) return [];
     return [
       {
         shade: 'BETWEEN',
         color: '#26a69a',
         shadeColor: 'rgba(38, 166, 154, 0.14)',
-        high,
-        low,
+        high: String(high),
+        low: String(low),
         relative: false
       }
     ];
   }, [quote]);
 
+  const contractMarkers = useMemo(
+    () =>
+      calculateContractMarkersFromOrders({
+        orders: orders.filter((o) => String(o.contract_type || '').toUpperCase() === 'ACCU'),
+        activeSymbol: effectiveSymbol,
+        liveContracts,
+        livePricesMap,
+        currency: activeDerivAccount?.currency || 'USD'
+      }),
+    [orders, effectiveSymbol, liveContracts, livePricesMap, activeDerivAccount?.currency]
+  );
+
   const openAccu = orders.find((o) => o.status === 'OPEN' && String(o.contract_type || '').toUpperCase() === 'ACCU');
 
   const handleBuy = async () => {
-    if (!token) {
+    if (!authenticated) {
       setNotice('Please sign in to open an Accumulator contract.');
       return;
     }
@@ -194,6 +205,7 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
             onSymbolChange={onSymbolChange}
             defaultGranularity={0}
             barriers={barriers}
+            contractsArray={contractMarkers}
             fallbackSpot={liveTick?.quote}
           />
         </div>
@@ -267,8 +279,8 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
             <div className="flex justify-between">
               <span className="text-slate-500">Maximum Payout</span>
               <span className="font-mono font-bold text-emerald-600">
-                {quote?.contractParams?.maximum_payout
-                  ? `${Number(quote.contractParams.maximum_payout).toFixed(2)} USD`
+                {quote?.maxPayout
+                  ? `${Number(quote.maxPayout).toFixed(2)} USD`
                   : quote
                     ? `${quote.payout.toFixed(2)} USD`
                     : '—'}
@@ -276,13 +288,13 @@ export const AccumulatorsPage: React.FC<AccumulatorsPageProps> = ({
             </div>
             <div className="flex justify-between">
               <span className="text-slate-500">Max Ticks</span>
-              <span className="font-mono font-bold">{quote?.contractParams?.maximum_ticks ?? '—'}</span>
+              <span className="font-mono font-bold">{quote?.maxTicks ?? '—'}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-slate-500">Barrier Range</span>
               <span className="font-mono font-bold">
-                {quote?.contractParams?.low_barrier && quote?.contractParams?.high_barrier
-                  ? `${quote.contractParams.low_barrier} – ${quote.contractParams.high_barrier}`
+                {quote?.lowBarrier != null && quote?.highBarrier != null
+                  ? `${quote.lowBarrier} – ${quote.highBarrier}`
                   : 'Syncing...'}
               </span>
             </div>

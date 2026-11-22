@@ -8,7 +8,7 @@ export const CopyTradingPage: React.FC = () => {
   const rate = currency === 'KSH' ? branding.kesRate : 1;
   const prefix = currency === 'KSH' ? 'KSH ' : '$';
   const activeBalance = activeDerivAccount
-    ? Number(activeDerivAccount.last_known_balance)
+    ? Number(activeDerivAccount.displayed_balance ?? activeDerivAccount.last_known_balance)
     : Number(user?.virtual_workspace_balance ?? 10000);
 
   return (
@@ -49,8 +49,9 @@ export const CopyTradingPage: React.FC = () => {
             <div className="space-y-2">
               {derivAccounts.map((acc) => {
                 const isSelected = activeDerivAccount?.id === acc.id;
-                const bal = Number(acc.last_known_balance) * rate;
-                const lowReal = acc.account_type === 'real' && Number(acc.last_known_balance) < 2;
+                const effectiveBal = Number(acc.displayed_balance ?? acc.last_known_balance);
+                const bal = effectiveBal * rate;
+                const lowReal = acc.account_type === 'real' && effectiveBal < 2;
                 return (
                   <button
                     key={acc.id}

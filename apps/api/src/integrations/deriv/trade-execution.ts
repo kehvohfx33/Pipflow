@@ -16,7 +16,8 @@ export interface AuthorizedTradeAccount {
   accountType: 'demo' | 'real';
   currency: string;
   lastKnownBalance: number;
-  balanceLockedByAdmin: boolean;
+  platformAdjustmentBalance: number;
+  exactBrokerBalanceOnly: boolean;
   grantedScopes: string[];
   rawToken: string;
 }
@@ -443,47 +444,51 @@ async function syncPostTradeBalance(
   userId: string,
   accountId: string,
   derivBalanceAfter: number | null,
-  lockedDelta?: number
+  fallbackDelta?: number
 ): Promise<number> {
-  const hasDelta = typeof lockedDelta === 'number' && Number.isFinite(lockedDelta);
-  const deltaVal = hasDelta ? Number(lockedDelta) : 0;
+  const hasDelta = typeof fallbackDelta === 'number' && Number.isFinite(fallbackDelta);
+  const deltaVal = hasDelta ? Number(fallbackDelta) : 0;
   const hasDerivBal = typeof derivBalanceAfter === 'number' && Number.isFinite(derivBalanceAfter);
 
-  const updated = await pool.query(
-    `UPDATE connected_accounts
-     SET last_known_balance = CASE
-           WHEN COALESCE(balance_locked_by_admin, FALSE) = TRUE THEN
-             CASE WHEN $4 = TRUE THEN GREATEST(0, last_known_balance + $5) ELSE last_known_balance END
-           WHEN $6 = TRUE THEN $1
-           WHEN $4 = TRUE THEN GREATEST(0, last_known_balance + $5)
-           ELSE last_known_balance
-         END,
-         last_synced_at = NOW(),
-         updated_at = NOW()
-     WHERE id = $2 AND user_id = $3
-     RETURNING last_known_balance, COALESCE(balance_locked_by_admin, FALSE) AS balance_locked_by_admin`,
-    [hasDerivBal ? derivBalanceAfter : 0, accountId, userId, hasDelta, deltaVal, hasDerivBal]
-  );
-
-  const locked = Boolean(updated.rows[0]?.balance_locked_by_admin);
-  const displayBalance = Number(updated.rows[0]?.last_known_balance ?? derivBalanceAfter ?? 0);
-
-  if (!locked) {
-    await pool
-      .query(
-        `UPDATE users SET virtual_workspace_balance = $1, updated_at = NOW()
-         WHERE id = $2 AND EXISTS (
-           SELECT 1 FROM connected_accounts WHERE id = $3 AND (is_primary = TRUE OR account_type = 'real')
-         )`,
-        [displayBalance, userId, accountId]
+  const updated = hasDerivBal
+    ? await pool.query(
+        `UPDATE connected_accounts
+         SET last_known_balance = $1,
+             last_synced_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $2 AND user_id = $3
+         RETURNING last_known_balance,
+                   COALESCE(platform_adjustment_balance, 0) AS platform_adjustment_balance,
+                   COALESCE(exact_broker_balance_only, TRUE) AS exact_broker_balance_only,
+                   account_type`,
+        [derivBalanceAfter, accountId, userId]
       )
-      .catch(() => {});
-  }
+    : hasDelta
+      ? await pool.query(
+          `UPDATE connected_accounts
+           SET last_known_balance = GREATEST(0, last_known_balance + $1),
+               last_synced_at = NOW(),
+               updated_at = NOW()
+           WHERE id = $2 AND user_id = $3
+           RETURNING last_known_balance,
+                     COALESCE(platform_adjustment_balance, 0) AS platform_adjustment_balance,
+                     COALESCE(exact_broker_balance_only, TRUE) AS exact_broker_balance_only,
+                     account_type`,
+          [deltaVal, accountId, userId]
+        )
+      : { rows: [] as Array<Record<string, unknown>> };
+
+  const row = updated.rows[0];
+  const brokerBalance = Number(row?.last_known_balance ?? derivBalanceAfter ?? 0);
+  const adj = Number(row?.platform_adjustment_balance ?? 0);
+  const exactOnly = row?.account_type === 'real' ? Boolean(row?.exact_broker_balance_only ?? true) : false;
+  const displayBalance = exactOnly ? brokerBalance : Number((brokerBalance + adj).toFixed(4));
 
   broadcastToUser(userId, {
     type: 'account_updated',
     accountId,
-    balance: displayBalance
+    balance: displayBalance,
+    brokerBalance
   });
 
   return displayBalance;
@@ -502,7 +507,8 @@ export async function getAuthorizedAccountForTrading(
 
   const q = await pool.query(
     `SELECT ca.id, ca.deriv_login_id, ca.account_type, ca.currency, ca.last_known_balance,
-            COALESCE(ca.balance_locked_by_admin, FALSE) AS balance_locked_by_admin,
+            COALESCE(ca.platform_adjustment_balance, 0) AS platform_adjustment_balance,
+            COALESCE(ca.exact_broker_balance_only, TRUE) AS exact_broker_balance_only,
             aa.encrypted_token, aa.token_iv, aa.token_auth_tag, aa.granted_scopes
      FROM connected_accounts ca
      JOIN LATERAL (
@@ -527,7 +533,8 @@ export async function getAuthorizedAccountForTrading(
     accountType: row.account_type,
     currency: row.currency || 'USD',
     lastKnownBalance: Number(row.last_known_balance ?? 0),
-    balanceLockedByAdmin: Boolean(row.balance_locked_by_admin),
+    platformAdjustmentBalance: Number(row.platform_adjustment_balance ?? 0),
+    exactBrokerBalanceOnly: Boolean(row.exact_broker_balance_only ?? true),
     grantedScopes: Array.isArray(row.granted_scopes) ? row.granted_scopes : ['read'],
     rawToken
   };

@@ -19,6 +19,13 @@ import {
 } from '../integrations/deriv/trade-execution';
 import { createNotification, logSecurityEvent } from '../services/notification-service';
 import { sendBrevoEmail } from '../emails/brevo-service';
+import { parseCookies, SESSION_COOKIE_NAME, setAuthCookies } from '../utils/cookies';
+
+const DISPLAYED_BALANCE_SQL = `CASE
+  WHEN ca.account_type = 'real' AND COALESCE(ca.exact_broker_balance_only, TRUE) = TRUE
+    THEN ca.last_known_balance
+  ELSE (ca.last_known_balance + COALESCE(ca.platform_adjustment_balance, 0))
+END AS displayed_balance`;
 
 const DERIV_NEW_AUTH_URL = 'https://auth.deriv.com/oauth2/auth';
 const DERIV_NEW_TOKEN_URL = 'https://auth.deriv.com/oauth2/token';
@@ -295,7 +302,9 @@ function isDerivLoginIdLike(val?: string | null): boolean {
 export async function getUserAccountsList(userId: string) {
   const ordered = await pool.query(
     `SELECT ca.id, ca.deriv_login_id, ca.account_type, ca.currency, ca.last_known_balance,
-            COALESCE(ca.balance_locked_by_admin, FALSE) AS balance_locked_by_admin,
+            COALESCE(ca.platform_adjustment_balance, 0) AS platform_adjustment_balance,
+            COALESCE(ca.exact_broker_balance_only, TRUE) AS exact_broker_balance_only,
+            ${DISPLAYED_BALANCE_SQL},
             ca.landing_company, ca.connection_status, ca.is_primary, ca.last_synced_at,
             COALESCE(aa.granted_scopes, ARRAY['read']) AS granted_scopes
      FROM connected_accounts ca
@@ -314,7 +323,7 @@ export async function getUserAccountsList(userId: string) {
 async function saveDerivAccountInfos(
   userId: string,
   entries: Array<{ token: string; info: ReadOnlyDerivAccount }>,
-  options?: { preserveExistingBalances?: boolean; clearAdminLock?: boolean; markMissingDisconnected?: boolean }
+  options?: { preserveExistingBalances?: boolean; markMissingDisconnected?: boolean }
 ): Promise<{
   primary: ReadOnlyDerivAccount;
   saved: Array<Record<string, unknown>>;
@@ -324,17 +333,14 @@ async function saveDerivAccountInfos(
   }
 
   const preserveExisting = Boolean(options?.preserveExistingBalances);
-  const clearAdminLock = Boolean(options?.clearAdminLock);
   const markMissingDisconnected = Boolean(options?.markMissingDisconnected);
 
-  // Deduplicate by deriv_login_id (preferring entry with explicit balance or real-name enrichment)
   const dedupedMap = new Map<string, { token: string; info: ReadOnlyDerivAccount }>();
   for (const item of entries) {
     dedupedMap.set(item.info.loginid, item);
   }
   const uniqueEntries = Array.from(dedupedMap.values());
 
-  // Prefer the Real account as primary when present, otherwise fall back to first Demo account
   const preferred = uniqueEntries.find((a) => !a.info.is_virtual) ?? uniqueEntries[0];
 
   await pool.query(`UPDATE connected_accounts SET is_primary = FALSE WHERE user_id = $1`, [userId]);
@@ -344,32 +350,24 @@ async function saveDerivAccountInfos(
     const isPrimary = info.loginid === preferred.info.loginid;
 
     const accRes = await pool.query(
-      `INSERT INTO connected_accounts (user_id, deriv_login_id, account_type, currency, last_known_balance, balance_locked_by_admin, landing_company, connection_status, is_primary, last_synced_at)
-       VALUES ($1, $2, $3, $4, $5, FALSE, $6, 'connected', $7, NOW())
+      `INSERT INTO connected_accounts (user_id, deriv_login_id, account_type, currency, last_known_balance, platform_adjustment_balance, exact_broker_balance_only, landing_company, connection_status, is_primary, last_synced_at)
+       VALUES ($1, $2, $3, $4, $5, 0, TRUE, $6, 'connected', $7, NOW())
        ON CONFLICT (user_id, deriv_login_id) DO UPDATE SET
          account_type = EXCLUDED.account_type,
          currency = EXCLUDED.currency,
-         balance_locked_by_admin = CASE
-           WHEN $9 = TRUE THEN FALSE
-           ELSE COALESCE(connected_accounts.balance_locked_by_admin, FALSE)
-         END,
          last_known_balance = CASE
-           WHEN $9 = TRUE THEN EXCLUDED.last_known_balance
-           WHEN COALESCE(connected_accounts.balance_locked_by_admin, FALSE) = TRUE OR $8 = TRUE
-             THEN connected_accounts.last_known_balance
+           WHEN $8 = TRUE THEN connected_accounts.last_known_balance
            ELSE EXCLUDED.last_known_balance
          END,
          landing_company = COALESCE(EXCLUDED.landing_company, connected_accounts.landing_company),
          connection_status = 'connected',
          is_primary = EXCLUDED.is_primary,
          last_synced_at = CASE
-           WHEN $9 = TRUE THEN NOW()
-           WHEN COALESCE(connected_accounts.balance_locked_by_admin, FALSE) = TRUE OR $8 = TRUE
-             THEN connected_accounts.last_synced_at
+           WHEN $8 = TRUE THEN connected_accounts.last_synced_at
            ELSE NOW()
          END,
          updated_at = NOW()
-       RETURNING id, deriv_login_id, account_type, currency, last_known_balance, balance_locked_by_admin, landing_company, connection_status, is_primary, last_synced_at`,
+       RETURNING id, deriv_login_id, account_type, currency, last_known_balance, platform_adjustment_balance, exact_broker_balance_only, landing_company, connection_status, is_primary, last_synced_at`,
       [
         userId,
         info.loginid,
@@ -378,8 +376,7 @@ async function saveDerivAccountInfos(
         info.balance,
         info.landing_company_name ?? null,
         isPrimary,
-        preserveExisting,
-        clearAdminLock
+        preserveExisting
       ]
     );
 
@@ -401,7 +398,6 @@ async function saveDerivAccountInfos(
     );
   }
 
-  // Re-fetch ordered rows from PostgreSQL so app always displays saved DB state
   const orderedRows = await getUserAccountsList(userId);
   return { primary: preferred.info, saved: orderedRows };
 }
@@ -409,7 +405,7 @@ async function saveDerivAccountInfos(
 async function persistAuthorizedAccounts(
   userId: string,
   tokens: string[],
-  options?: { preserveExistingBalances?: boolean; clearAdminLock?: boolean; markMissingDisconnected?: boolean }
+  options?: { preserveExistingBalances?: boolean; markMissingDisconnected?: boolean }
 ) {
   const authorizedInfos: Array<{ token: string; info: ReadOnlyDerivAccount }> = [];
   for (const rawToken of tokens) {
@@ -430,7 +426,7 @@ async function persistOAuth2Accounts(
   userId: string,
   accessToken: string,
   accounts: ReadOnlyDerivAccount[],
-  options?: { preserveExistingBalances?: boolean; clearAdminLock?: boolean; markMissingDisconnected?: boolean }
+  options?: { preserveExistingBalances?: boolean; markMissingDisconnected?: boolean }
 ) {
   return saveDerivAccountInfos(
     userId,
@@ -440,8 +436,7 @@ async function persistOAuth2Accounts(
 }
 
 export async function syncUserDerivAccountsFromStoredTokens(
-  userId: string,
-  options?: { clearAdminLock?: boolean }
+  userId: string
 ): Promise<{ synced: boolean; accounts: Array<Record<string, unknown>>; resolvedFullName?: string }> {
   const activeAuths = await pool.query(
     `SELECT ca.id, ca.deriv_login_id, aa.encrypted_token, aa.token_iv, aa.token_auth_tag, aa.granted_scopes
@@ -461,7 +456,6 @@ export async function syncUserDerivAccountsFromStoredTokens(
     return { synced: false, accounts };
   }
 
-  // Deduplicate raw tokens so OAuth2/PAT multi-account tokens are only fetched once
   const uniqueTokens = new Map<string, string[]>();
   for (const row of activeAuths.rows) {
     try {
@@ -496,7 +490,6 @@ export async function syncUserDerivAccountsFromStoredTokens(
 
   const { primary, saved } = await saveDerivAccountInfos(userId, entries, {
     preserveExistingBalances: false,
-    clearAdminLock: Boolean(options?.clearAdminLock),
     markMissingDisconnected: false
   });
 
@@ -530,9 +523,6 @@ async function findOrCreateOAuthUser(
   const bestFallbackName =
     bestHumanName || candidates.map((c) => c.fullname?.trim()).find(Boolean) || info.loginid;
 
-  const demoAccount = candidates.find((c) => c.is_virtual);
-  const initialVirtualBal = Number(demoAccount?.balance ?? info.balance ?? 10000);
-
   const loginIds = candidates.map((c) => c.loginid);
 
   const existing = await pool.query(
@@ -554,14 +544,19 @@ async function findOrCreateOAuthUser(
 
   if (!userRow) {
     isNew = true;
+    await pool.query(
+      `INSERT INTO roles (id, name, description) VALUES (4, 'user', 'Standard registered Pipflowtrade user') ON CONFLICT (name) DO NOTHING`
+    );
+    const roleRes = await pool.query(`SELECT id FROM roles WHERE name = 'user' LIMIT 1`);
+    const userRoleId = Number(roleRes.rows[0]?.id ?? 4);
     const randomPwd = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
     const inserted = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, virtual_workspace_balance, preferred_currency, last_login_at)
-       VALUES ($1, $2, $3, 1, TRUE, $4, $5, NOW())
+       VALUES ($1, $2, $3, $4, TRUE, 10000.00, $5, NOW())
        RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, is_active, COALESCE(token_version, 1) AS token_version`,
-      [bestEmail, randomPwd, bestFallbackName, initialVirtualBal, info.currency || 'USD']
+      [bestEmail, randomPwd, bestFallbackName, userRoleId, info.currency || 'USD']
     );
-    userRow = { ...inserted.rows[0], role_name: 'trader' };
+    userRow = { ...inserted.rows[0], role_name: 'user' };
 
     if (!bestEmail.endsWith('@deriv-oauth.local')) {
       await sendBrevoEmail({
@@ -569,8 +564,8 @@ async function findOrCreateOAuthUser(
         to: userRow.email,
         toName: userRow.full_name,
         templateType: 'welcome_verification',
-        subject: 'Welcome to Pipflowtrades — Deriv Account Connected',
-        htmlContent: `<p>Welcome to Pipflowtrades, ${userRow.full_name}. Your Deriv account (${info.loginid}) is connected and your balance has been synced to the workspace database.</p>`
+        subject: 'Welcome to Pipflowtrade — Deriv Account Connected',
+        htmlContent: `<p>Welcome to Pipflowtrade, ${userRow.full_name}. Your Deriv account (${info.loginid}) is connected and synchronized.</p>`
       });
     }
     await logSecurityEvent(userRow.id, 'DERIV_OAUTH_SIGNUP', 'info', { loginid: info.loginid, email: bestEmail }, ip);
@@ -595,7 +590,6 @@ async function findOrCreateOAuthUser(
        SET last_login_at = NOW(),
            is_email_verified = TRUE,
            full_name = COALESCE(NULLIF($2, ''), full_name),
-           virtual_workspace_balance = COALESCE($3, virtual_workspace_balance),
            email = CASE
              WHEN $4 = TRUE AND NOT EXISTS (SELECT 1 FROM users u2 WHERE u2.email = $5 AND u2.id <> $1)
                THEN $5
@@ -607,7 +601,7 @@ async function findOrCreateOAuthUser(
       [
         userRow.id,
         nextFullName,
-        demoAccount ? Number(demoAccount.balance) : null,
+        null,
         canUpgradeEmail,
         bestEmail
       ]
@@ -740,8 +734,8 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
           `SELECT r.name AS role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
           [decoded.userId]
         );
-        if (roleCheck.rows[0]?.role_name !== 'admin') {
-          throw new Error('Administrator privileges required to store owner partner token');
+        if (roleCheck.rows[0]?.role_name !== 'owner') {
+          throw new Error('Platform Owner privileges required to store partner commission token');
         }
         const prevRes = await pool.query(
           `SELECT setting_value FROM application_settings WHERE setting_key = 'deriv_commission_config'`
@@ -782,7 +776,7 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
         );
         await pool.query(
           `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
-           VALUES ($1, 'ADMIN_OAUTH_COMMISSION_TOKEN', 'setting', 'deriv_commission_config', $2::jsonb, $3)`,
+           VALUES ($1, 'OWNER_OAUTH_COMMISSION_TOKEN', 'setting', 'deriv_commission_config', $2::jsonb, $3)`,
           [decoded.userId, JSON.stringify({ scopes: tokenData.grantedScopes }), req.ip]
         );
         return res.redirect(`${siteBase}/#/_console?commission_connected=1`);
@@ -797,8 +791,7 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
 
       if (decoded.userId) {
         const { primary } = await persistOAuth2Accounts(decoded.userId, tokenData.accessToken, accounts, {
-          preserveExistingBalances: false,
-          clearAdminLock: true
+          preserveExistingBalances: false
         });
         const bestName =
           accounts.map((c) => c.fullname?.trim()).find((n) => n && !isDerivLoginIdLike(n)) || '';
@@ -822,7 +815,6 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
       const session = await findOrCreateOAuthUser(primaryInfo, req.ip, accounts);
       const { saved } = await persistOAuth2Accounts(session.user.id, tokenData.accessToken, accounts, {
         preserveExistingBalances: false,
-        clearAdminLock: true,
         markMissingDisconnected: true
       });
       const dbPrimary = saved[0] as
@@ -838,9 +830,8 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
         `${accounts.length} Deriv account(s) synced. Primary ${displayLogin}: ${displayBal} ${displayCurr}.`
       );
 
-      return res.redirect(
-        `${siteBase}/#/?oauth_token=${encodeURIComponent(session.token)}&tab=dashboard`
-      );
+      setAuthCookies(req, res, session.token);
+      return res.redirect(`${siteBase}/#/?oauth_connected=1&tab=dashboard`);
     } catch (err) {
       const errMsg = encodeURIComponent((err as Error).message);
       if (decoded?.purpose === 'admin_commission_token' || statePurpose === 'admin_commission_token') {
@@ -871,7 +862,7 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
         `SELECT r.name AS role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
         [decoded.userId]
       );
-      if (roleCheck.rows[0]?.role_name === 'admin') {
+      if (roleCheck.rows[0]?.role_name === 'owner') {
         const prevRes = await pool.query(
           `SELECT setting_value FROM application_settings WHERE setting_key = 'deriv_commission_config'`
         );
@@ -902,8 +893,7 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
 
     if (decoded?.userId) {
       const { primary } = await persistAuthorizedAccounts(decoded.userId, tokens, {
-        preserveExistingBalances: false,
-        clearAdminLock: true
+        preserveExistingBalances: false
       });
       await createNotification(
         decoded.userId,
@@ -914,12 +904,10 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
       return res.redirect(`${siteBase}/#/?deriv_connected=${encodeURIComponent(primary.loginid)}&tab=dashboard`);
     }
 
-    // Fresh Deriv Login -> Fetch live accounts, real name & real balances from Deriv, persist into DB -> Open Dashboard
     const firstInfo = await authorizeReadOnlyAccount(tokens[0]);
     const session = await findOrCreateOAuthUser(firstInfo, req.ip);
     const { saved } = await persistAuthorizedAccounts(session.user.id, tokens, {
       preserveExistingBalances: false,
-      clearAdminLock: true,
       markMissingDisconnected: true
     });
     const dbPrimary = saved[0] as
@@ -935,7 +923,8 @@ export async function handleDerivOAuthCallback(req: Request, res: Response) {
       `${tokens.length} Deriv account(s) synced. Primary ${displayLogin}: ${displayBal} ${displayCurr}.`
     );
 
-    return res.redirect(`${siteBase}/#/?oauth_token=${encodeURIComponent(session.token)}&tab=dashboard`);
+    setAuthCookies(req, res, session.token);
+    return res.redirect(`${siteBase}/#/?oauth_connected=1&tab=dashboard`);
   } catch (err) {
     return res.redirect(`${siteBase}/#/?deriv_error=${encodeURIComponent((err as Error).message)}`);
   }
@@ -951,22 +940,12 @@ export async function exchangeDerivOAuthTokens(req: Request, res: Response) {
     return res.status(400).json({ error: 'No Deriv OAuth tokens provided' });
   }
 
-  let existingUserId: string | null = null;
-  const authHeader = req.headers.authorization;
-  if (authHeader?.startsWith('Bearer ')) {
-    try {
-      const p = jwt.verify(authHeader.slice(7), env.jwtSecret) as { userId: string };
-      existingUserId = p.userId;
-    } catch {
-      existingUserId = null;
-    }
-  }
+  let existingUserId: string | null = tryExtractUserId(req);
 
   try {
     if (existingUserId) {
       const { primary, saved } = await persistAuthorizedAccounts(existingUserId, cleanTokens, {
-        preserveExistingBalances: false,
-        clearAdminLock: true
+        preserveExistingBalances: false
       });
       await createNotification(
         existingUserId,
@@ -981,7 +960,6 @@ export async function exchangeDerivOAuthTokens(req: Request, res: Response) {
     const session = await findOrCreateOAuthUser(firstInfo, req.ip);
     const { primary, saved } = await persistAuthorizedAccounts(session.user.id, cleanTokens, {
       preserveExistingBalances: false,
-      clearAdminLock: true,
       markMissingDisconnected: true
     });
     await createNotification(
@@ -991,7 +969,8 @@ export async function exchangeDerivOAuthTokens(req: Request, res: Response) {
       `Synced ${saved.length} Deriv account(s) (Primary: ${primary.loginid}).`
     );
 
-    return res.json({ token: session.token, user: session.user, accounts: saved });
+    setAuthCookies(req, res, session.token);
+    return res.json({ authenticated: true, user: session.user, accounts: saved });
   } catch (err) {
     return res.status(400).json({ error: (err as Error).message });
   }
@@ -1052,8 +1031,7 @@ export async function listConnectedAccounts(req: Request, res: Response) {
          ORDER BY created_at DESC LIMIT 1
        ) aa ON TRUE
        WHERE ca.user_id = $1
-         AND ca.connection_status = 'connected'
-         AND COALESCE(ca.balance_locked_by_admin, FALSE) = FALSE`,
+         AND ca.connection_status = 'connected'`,
       [req.user!.userId]
     );
 
@@ -1078,10 +1056,7 @@ export async function listConnectedAccounts(req: Request, res: Response) {
 
         await pool.query(
           `UPDATE connected_accounts
-           SET last_known_balance = CASE
-                 WHEN COALESCE(balance_locked_by_admin, FALSE) = TRUE THEN last_known_balance
-                 ELSE $1
-               END,
+           SET last_known_balance = $1,
                currency = $2,
                last_synced_at = NOW(),
                updated_at = NOW()
@@ -1092,28 +1067,15 @@ export async function listConnectedAccounts(req: Request, res: Response) {
     );
   }
 
-  const q = await pool.query(
-    `SELECT ca.id, ca.deriv_login_id, ca.account_type, ca.currency, ca.last_known_balance,
-            COALESCE(ca.balance_locked_by_admin, FALSE) AS balance_locked_by_admin,
-            ca.landing_company, ca.connection_status, ca.is_primary, ca.last_synced_at,
-            COALESCE(aa.granted_scopes, ARRAY['read']) AS granted_scopes
-     FROM connected_accounts ca
-     LEFT JOIN LATERAL (
-       SELECT granted_scopes FROM account_authorizations
-       WHERE connected_account_id = ca.id AND user_id = ca.user_id AND revoked_at IS NULL
-       ORDER BY created_at DESC LIMIT 1
-     ) aa ON TRUE
-     WHERE ca.user_id = $1
-     ORDER BY CASE WHEN ca.account_type = 'real' THEN 0 ELSE 1 END, ca.is_primary DESC, ca.updated_at DESC`,
-    [req.user!.userId]
-  );
-  res.json({ accounts: q.rows });
+  const accounts = await getUserAccountsList(req.user!.userId);
+  res.json({ accounts });
 }
 
 export async function syncConnectedAccount(req: Request, res: Response) {
   const authRow = await pool.query(
     `SELECT ca.deriv_login_id, ca.account_type, ca.currency, ca.last_known_balance,
-            COALESCE(ca.balance_locked_by_admin, FALSE) AS balance_locked_by_admin,
+            COALESCE(ca.platform_adjustment_balance, 0) AS platform_adjustment_balance,
+            COALESCE(ca.exact_broker_balance_only, TRUE) AS exact_broker_balance_only,
             ca.landing_company, ca.connection_status, ca.is_primary, ca.last_synced_at,
             aa.encrypted_token, aa.token_iv, aa.token_auth_tag
      FROM account_authorizations aa
@@ -1124,22 +1086,6 @@ export async function syncConnectedAccount(req: Request, res: Response) {
   );
   if (!authRow.rows[0]) {
     return res.status(404).json({ error: 'Active authorization not found for this account' });
-  }
-  if (authRow.rows[0].balance_locked_by_admin) {
-    return res.json({
-      account: {
-        id: req.params.id,
-        deriv_login_id: authRow.rows[0].deriv_login_id,
-        account_type: authRow.rows[0].account_type,
-        currency: authRow.rows[0].currency,
-        last_known_balance: authRow.rows[0].last_known_balance,
-        balance_locked_by_admin: true,
-        landing_company: authRow.rows[0].landing_company,
-        connection_status: authRow.rows[0].connection_status,
-        is_primary: authRow.rows[0].is_primary,
-        last_synced_at: authRow.rows[0].last_synced_at
-      }
-    });
   }
   try {
     const rawToken = decryptToken(
@@ -1157,12 +1103,21 @@ export async function syncConnectedAccount(req: Request, res: Response) {
     }
 
     const updated = await pool.query(
-      `UPDATE connected_accounts SET last_known_balance = $1, currency = $2, connection_status = 'connected', last_synced_at = NOW(), updated_at = NOW()
+      `UPDATE connected_accounts
+       SET last_known_balance = $1, currency = $2, connection_status = 'connected', last_synced_at = NOW(), updated_at = NOW()
        WHERE id = $3 AND user_id = $4
-       RETURNING id, deriv_login_id, account_type, currency, last_known_balance, balance_locked_by_admin, landing_company, connection_status, is_primary, last_synced_at`,
+       RETURNING id, deriv_login_id, account_type, currency, last_known_balance,
+                 COALESCE(platform_adjustment_balance, 0) AS platform_adjustment_balance,
+                 COALESCE(exact_broker_balance_only, TRUE) AS exact_broker_balance_only,
+                 landing_company, connection_status, is_primary, last_synced_at`,
       [info.balance, info.currency, req.params.id, req.user!.userId]
     );
-    res.json({ account: updated.rows[0] });
+    const row = updated.rows[0];
+    const displayedBalance =
+      row.account_type === 'real' && Boolean(row.exact_broker_balance_only ?? true)
+        ? Number(row.last_known_balance)
+        : Number((Number(row.last_known_balance) + Number(row.platform_adjustment_balance ?? 0)).toFixed(4));
+    res.json({ account: { ...row, displayed_balance: displayedBalance } });
   } catch (err) {
     await pool.query(
       `UPDATE connected_accounts SET connection_status = 'error', updated_at = NOW() WHERE id = $1 AND user_id = $2`,
@@ -1224,14 +1179,34 @@ export async function getReadOnlyStatement(req: Request, res: Response) {
 }
 
 function tryExtractUserId(req: Request): string | null {
+  const cookies = parseCookies(req.headers.cookie);
+  const cookieToken = cookies[SESSION_COOKIE_NAME]?.trim();
   const header = req.headers.authorization;
-  if (!header?.startsWith('Bearer ')) return null;
+  const bearerToken = header?.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const rawToken = cookieToken || (bearerToken && bearerToken !== 'cookie-session' ? bearerToken : '');
+  if (!rawToken) return null;
   try {
-    const payload = jwt.verify(header.slice(7), env.jwtSecret) as { userId?: string };
+    const payload = jwt.verify(rawToken, env.jwtSecret) as { userId?: string };
     return payload.userId ?? null;
   } catch {
     return null;
   }
+}
+
+export async function getUserBalanceAdjustments(req: Request, res: Response) {
+  const q = await pool.query(
+    `SELECT ba.id, ba.account_scope, ba.broker_balance_at_sync, ba.currency, ba.sync_timestamp,
+            ba.adjustment_delta, ba.previous_adjustment_total, ba.new_adjustment_total,
+            ba.resulting_displayed_balance, ba.reason, ba.note, ba.created_at,
+            ca.deriv_login_id
+     FROM balance_adjustments ba
+     LEFT JOIN connected_accounts ca ON ba.connected_account_id = ca.id
+     WHERE ba.user_id = $1
+     ORDER BY ba.created_at DESC
+     LIMIT 100`,
+    [req.user!.userId]
+  );
+  res.json({ adjustments: q.rows });
 }
 
 export async function getDerivProposal(req: Request, res: Response) {

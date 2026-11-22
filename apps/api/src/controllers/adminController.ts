@@ -17,11 +17,25 @@ import { sendBrevoEmail } from '../emails/brevo-service';
 import { broadcastToAll, broadcastToUser } from '../services/realtime-hub';
 import { fetchDerivAppMarkupReport } from '../integrations/deriv/commission';
 import { closeDerivContract } from '../integrations/deriv/trade-execution';
+import { setAuthCookies } from '../utils/cookies';
 import { buildDerivOAuthUrl, refreshCommissionOAuth2Token, resolveOAuthRedirectUri, usesNewDerivOAuth2 } from './derivController';
+
+const ROLE_ID_MAP: Record<string, number> = {
+  trader: 1,
+  admin: 2,
+  owner: 3,
+  user: 4
+};
+
+const DISPLAYED_BALANCE_SQL = `CASE
+  WHEN ca.account_type = 'real' AND COALESCE(ca.exact_broker_balance_only, TRUE) = TRUE
+    THEN ca.last_known_balance
+  ELSE (ca.last_known_balance + COALESCE(ca.platform_adjustment_balance, 0))
+END AS displayed_balance`;
 
 export async function getAdminBootstrapStatus(_req: Request, res: Response) {
   const q = await pool.query(
-    `SELECT COUNT(*)::int AS cnt FROM users u JOIN roles r ON u.role_id = r.id WHERE r.name = 'admin'`
+    `SELECT COUNT(*)::int AS cnt FROM users u JOIN roles r ON u.role_id = r.id WHERE r.name = 'owner'`
   );
   const count = q.rows[0]?.cnt ?? 0;
   res.json({ initialized: count > 0 });
@@ -35,33 +49,33 @@ export async function bootstrapAdmin(req: Request, res: Response) {
   };
   const cleanEmail = email?.trim().toLowerCase();
   if (!cleanEmail || !password || password.length < 8) {
-    return res.status(400).json({ error: 'Valid administrator email and password (min 8 chars) required' });
+    return res.status(400).json({ error: 'Valid platform owner email and password (min 8 chars) required' });
   }
 
   await pool.query(
-    `INSERT INTO roles (id, name, description) VALUES (2, 'admin', 'Platform administrator') ON CONFLICT (name) DO NOTHING`
+    `INSERT INTO roles (id, name, description) VALUES (3, 'owner', 'Platform owner with exclusive settings and financial adjustment privileges') ON CONFLICT (name) DO NOTHING`
   );
-  const roleRes = await pool.query(`SELECT id FROM roles WHERE name = 'admin' LIMIT 1`);
-  const adminRoleId = Number(roleRes.rows[0]?.id ?? 2);
+  const roleRes = await pool.query(`SELECT id FROM roles WHERE name = 'owner' LIMIT 1`);
+  const ownerRoleId = Number(roleRes.rows[0]?.id ?? 3);
 
   const countRes = await pool.query(
-    `SELECT COUNT(*)::int AS cnt FROM users u JOIN roles r ON u.role_id = r.id WHERE r.name = 'admin'`
+    `SELECT COUNT(*)::int AS cnt FROM users u JOIN roles r ON u.role_id = r.id WHERE r.name = 'owner'`
   );
   if ((countRes.rows[0]?.cnt ?? 0) > 0) {
     return res.status(409).json({
-      error: 'Administrator is already configured in the database. Sign in with your database admin email and password.'
+      error: 'Platform Owner is already configured in the database. Sign in with your owner credentials.'
     });
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
   const existing = await pool.query(`SELECT id FROM users WHERE email = $1`, [cleanEmail]);
-  let adminUser;
+  let ownerUser;
 
   if (existing.rows[0]) {
     const updated = await pool.query(
       `UPDATE users
        SET password_hash = $1,
-           full_name = COALESCE(NULLIF($2, ''), full_name, 'Platform Administrator'),
+           full_name = COALESCE(NULLIF($2, ''), full_name, 'Platform Owner'),
            role_id = $3,
            is_email_verified = TRUE,
            is_active = TRUE,
@@ -70,39 +84,45 @@ export async function bootstrapAdmin(req: Request, res: Response) {
            updated_at = NOW()
        WHERE id = $4
        RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, COALESCE(token_version, 1) AS token_version`,
-      [passwordHash, fullName?.trim() || '', adminRoleId, existing.rows[0].id]
+      [passwordHash, fullName?.trim() || '', ownerRoleId, existing.rows[0].id]
     );
-    adminUser = updated.rows[0];
+    ownerUser = updated.rows[0];
   } else {
     const inserted = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, is_active, last_login_at)
        VALUES ($1, $2, $3, $4, TRUE, TRUE, NOW())
        RETURNING id, email, full_name, is_email_verified, virtual_workspace_balance, preferred_currency, local_currency, COALESCE(token_version, 1) AS token_version`,
-      [cleanEmail, passwordHash, fullName?.trim() || 'Platform Administrator', adminRoleId]
+      [cleanEmail, passwordHash, fullName?.trim() || 'Platform Owner', ownerRoleId]
     );
-    adminUser = inserted.rows[0];
+    ownerUser = inserted.rows[0];
   }
 
-  await upsertSetting('admin_credentials', { email: cleanEmail, passwordHash }, true, adminUser.id);
+  await upsertSetting('admin_credentials', { email: cleanEmail, passwordHash }, true, ownerUser.id);
   await pool.query(
     `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
-     VALUES ($1, 'ADMIN_BOOTSTRAPPED', 'user', $1, $2::jsonb, $3)`,
-    [adminUser.id, JSON.stringify({ email: cleanEmail }), req.ip]
+     VALUES ($1, 'OWNER_BOOTSTRAPPED', 'user', $1, $2::jsonb, $3)`,
+    [ownerUser.id, JSON.stringify({ email: cleanEmail }), req.ip]
   );
-  await logSecurityEvent(adminUser.id, 'ADMIN_BOOTSTRAPPED', 'info', { email: cleanEmail }, req.ip);
+  await logSecurityEvent(ownerUser.id, 'OWNER_BOOTSTRAPPED', 'info', { email: cleanEmail }, req.ip);
 
   const token = jwt.sign(
-    { userId: adminUser.id, email: adminUser.email, role: 'admin', tv: Number(adminUser.token_version ?? 1) },
+    { userId: ownerUser.id, email: ownerUser.email, role: 'owner', tv: Number(ownerUser.token_version ?? 1) },
     env.jwtSecret,
     { expiresIn: '7d' }
   );
+  setAuthCookies(req, res, token);
 
   res.status(201).json({
-    token,
+    authenticated: true,
     user: {
-      ...adminUser,
-      role: 'admin',
-      virtual_workspace_balance: Number(adminUser.virtual_workspace_balance)
+      id: ownerUser.id,
+      email: ownerUser.email,
+      full_name: ownerUser.full_name,
+      role: 'owner',
+      is_email_verified: Boolean(ownerUser.is_email_verified),
+      virtual_workspace_balance: Number(ownerUser.virtual_workspace_balance),
+      preferred_currency: ownerUser.preferred_currency,
+      local_currency: ownerUser.local_currency
     }
   });
 }
@@ -111,7 +131,7 @@ export async function adminLogin(req: Request, res: Response) {
   const { email, password } = req.body as { email?: string; password?: string };
   const cleanEmail = email?.trim().toLowerCase();
   if (!cleanEmail || !password) {
-    return res.status(400).json({ error: 'Administrator email and password required' });
+    return res.status(400).json({ error: 'Console email and password required' });
   }
 
   const q = await pool.query(
@@ -120,46 +140,48 @@ export async function adminLogin(req: Request, res: Response) {
   );
   const user = q.rows[0];
 
-  if (!user || user.role_name !== 'admin') {
+  if (!user || (user.role_name !== 'owner' && user.role_name !== 'admin')) {
     await logSecurityEvent(user?.id ?? null, 'ADMIN_LOGIN_DENIED', 'warning', { email: cleanEmail }, req.ip);
-    return res.status(401).json({ error: 'Invalid administrator email or password' });
+    return res.status(401).json({ error: 'Invalid console email or password' });
   }
   if (!user.is_active) {
-    return res.status(403).json({ error: 'Administrator account is suspended' });
+    return res.status(403).json({ error: 'Console account is suspended' });
   }
 
-  const settingRes = await pool.query(
-    `SELECT setting_value FROM application_settings WHERE setting_key = 'admin_credentials'`
-  );
-  const storedCred = settingRes.rows[0]?.setting_value as { email?: string; passwordHash?: string } | undefined;
-
   const matchesUserHash = await bcrypt.compare(password, user.password_hash);
-  const matchesAdminSetting =
-    storedCred?.email === cleanEmail && storedCred?.passwordHash
-      ? await bcrypt.compare(password, storedCred.passwordHash)
-      : false;
+  let matchesOwnerSetting = false;
+  if (user.role_name === 'owner') {
+    const settingRes = await pool.query(
+      `SELECT setting_value FROM application_settings WHERE setting_key = 'admin_credentials'`
+    );
+    const storedCred = settingRes.rows[0]?.setting_value as { email?: string; passwordHash?: string } | undefined;
+    if (storedCred?.email === cleanEmail && storedCred?.passwordHash) {
+      matchesOwnerSetting = await bcrypt.compare(password, storedCred.passwordHash);
+    }
+  }
 
-  if (!matchesUserHash && !matchesAdminSetting) {
+  if (!matchesUserHash && !matchesOwnerSetting) {
     await logSecurityEvent(user.id, 'ADMIN_LOGIN_FAILED', 'warning', { email: cleanEmail }, req.ip);
-    return res.status(401).json({ error: 'Invalid administrator email or password' });
+    return res.status(401).json({ error: 'Invalid console email or password' });
   }
 
   await pool.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [user.id]);
-  await logSecurityEvent(user.id, 'ADMIN_LOGIN_SUCCESS', 'info', { email: cleanEmail }, req.ip);
+  await logSecurityEvent(user.id, 'CONSOLE_LOGIN_SUCCESS', 'info', { email: cleanEmail, role: user.role_name }, req.ip);
 
   const token = jwt.sign(
-    { userId: user.id, email: user.email, role: 'admin', tv: Number(user.token_version ?? 1) },
+    { userId: user.id, email: user.email, role: user.role_name, tv: Number(user.token_version ?? 1) },
     env.jwtSecret,
     { expiresIn: '7d' }
   );
+  setAuthCookies(req, res, token);
 
   res.json({
-    token,
+    authenticated: true,
     user: {
       id: user.id,
       email: user.email,
       full_name: user.full_name,
-      role: 'admin',
+      role: user.role_name,
       is_email_verified: user.is_email_verified,
       virtual_workspace_balance: Number(user.virtual_workspace_balance),
       preferred_currency: user.preferred_currency,
@@ -169,6 +191,8 @@ export async function adminLogin(req: Request, res: Response) {
 }
 
 export async function getAdminOverview(req: Request, res: Response) {
+  const isOwner = req.user!.role === 'owner';
+
   const [
     adminAcc,
     users,
@@ -189,7 +213,10 @@ export async function getAdminOverview(req: Request, res: Response) {
     ),
     pool.query(
       `SELECT ca.id, ca.user_id, u.email as user_email, ca.deriv_login_id, ca.account_type, ca.currency,
-              ca.last_known_balance, COALESCE(ca.balance_locked_by_admin, FALSE) AS balance_locked_by_admin,
+              ca.last_known_balance,
+              COALESCE(ca.platform_adjustment_balance, 0) AS platform_adjustment_balance,
+              COALESCE(ca.exact_broker_balance_only, TRUE) AS exact_broker_balance_only,
+              ${DISPLAYED_BALANCE_SQL},
               ca.landing_company, ca.connection_status, ca.is_primary, ca.last_synced_at,
               COALESCE(aa.granted_scopes, ARRAY['read']) AS granted_scopes
        FROM connected_accounts ca
@@ -215,7 +242,9 @@ export async function getAdminOverview(req: Request, res: Response) {
     pool.query(
       `SELECT * FROM notifications WHERE category = 'announcement' ORDER BY created_at DESC LIMIT 40`
     ),
-    pool.query(`SELECT setting_value FROM application_settings WHERE setting_key = 'deriv_commission_config'`)
+    isOwner
+      ? pool.query(`SELECT setting_value FROM application_settings WHERE setting_key = 'deriv_commission_config'`)
+      : Promise.resolve({ rows: [] })
   ]);
 
   const rawComm = (commissionSecret.rows[0]?.setting_value || {}) as {
@@ -229,12 +258,21 @@ export async function getAdminOverview(req: Request, res: Response) {
     encryptedToken?: string;
   };
 
+  const adminRow = adminAcc.rows[0];
   res.json({
-    adminAccount: adminAcc.rows[0] ?? null,
+    adminAccount: adminRow
+      ? {
+          id: adminRow.id,
+          email: adminRow.email,
+          full_name: adminRow.full_name,
+          last_login_at: adminRow.last_login_at,
+          role: req.user!.role
+        }
+      : null,
     users: users.rows,
     connectedAccounts: accounts.rows,
     derivDiagnostics: derivConnectionManager.getDiagnostics(),
-    configStatus: validateEnvironmentConfig(),
+    configStatus: isOwner ? validateEnvironmentConfig() : null,
     auditLogs: auditLogs.rows,
     securityLogs: securityLogs.rows,
     emailLogs: emailLogs.rows,
@@ -242,25 +280,27 @@ export async function getAdminOverview(req: Request, res: Response) {
     strategies: strategies.rows,
     recentOrders: recentOrders.rows,
     announcements: announcements.rows,
-    commissionConfig: {
-      appId: rawComm.appId || (env.derivAppId !== '1089' ? env.derivAppId : ''),
-      appName:
-        rawComm.appName && !rawComm.appName.toLowerCase().includes('tradederiv')
-          ? rawComm.appName
-          : 'Pipflowtrades',
-      domain:
-        rawComm.domain &&
-        !rawComm.domain.toLowerCase().includes('.onrender.com') &&
-        !rawComm.domain.toLowerCase().includes('tradederiv') &&
-        rawComm.domain.trim() !== 'https://pipflow.site'
-          ? rawComm.domain
-          : 'https://pipflowtrade.site',
-      targetMarkupPct: Number(rawComm.targetMarkupPct ?? 2.0),
-      affiliateUrl: rawComm.affiliateUrl || '',
-      sidcCode: rawComm.sidcCode || '',
-      payoutAccount: rawComm.payoutAccount || '',
-      hasAdminToken: Boolean(rawComm.encryptedToken || process.env.DERIV_ADMIN_TOKEN)
-    }
+    commissionConfig: isOwner
+      ? {
+          appId: rawComm.appId || (env.derivAppId !== '1089' ? env.derivAppId : ''),
+          appName:
+            rawComm.appName && !rawComm.appName.toLowerCase().includes('tradederiv')
+              ? rawComm.appName
+              : 'Pipflowtrades',
+          domain:
+            rawComm.domain &&
+            !rawComm.domain.toLowerCase().includes('.onrender.com') &&
+            !rawComm.domain.toLowerCase().includes('tradederiv') &&
+            rawComm.domain.trim() !== 'https://pipflow.site'
+              ? rawComm.domain
+              : 'https://pipflowtrade.site',
+          targetMarkupPct: Number(rawComm.targetMarkupPct ?? 2.0),
+          affiliateUrl: rawComm.affiliateUrl || '',
+          sidcCode: rawComm.sidcCode || '',
+          payoutAccount: rawComm.payoutAccount || '',
+          hasAdminToken: Boolean(rawComm.encryptedToken || process.env.DERIV_ADMIN_TOKEN)
+        }
+      : null
   });
 }
 
@@ -269,10 +309,10 @@ export async function updateAdminCredentials(req: Request, res: Response) {
   const cleanEmail = newEmail?.trim().toLowerCase();
 
   if (!cleanEmail && !newPassword) {
-    return res.status(400).json({ error: 'Provide a new admin email and/or password to update' });
+    return res.status(400).json({ error: 'Provide a new owner email and/or password to update' });
   }
   if (newPassword && newPassword.length < 8) {
-    return res.status(400).json({ error: 'Admin password must be at least 8 characters' });
+    return res.status(400).json({ error: 'Owner password must be at least 8 characters' });
   }
 
   const currentRes = await pool.query(
@@ -306,18 +346,24 @@ export async function updateAdminCredentials(req: Request, res: Response) {
     await logSecurityEvent(req.user!.userId, 'ADMIN_CREDENTIALS_UPDATED', 'info', { email: targetEmail }, req.ip);
 
     const token = jwt.sign(
-      { userId: updated.rows[0].id, email: updated.rows[0].email, role: 'admin', tv: Number(updated.rows[0].token_version ?? 1) },
+      { userId: updated.rows[0].id, email: updated.rows[0].email, role: req.user!.role, tv: Number(updated.rows[0].token_version ?? 1) },
       env.jwtSecret,
       { expiresIn: '7d' }
     );
+    setAuthCookies(req, res, token);
 
+    const updatedOwner = updated.rows[0];
     res.json({
       updated: true,
-      token,
       user: {
-        ...updated.rows[0],
-        role: 'admin',
-        virtual_workspace_balance: Number(updated.rows[0].virtual_workspace_balance)
+        id: updatedOwner.id,
+        email: updatedOwner.email,
+        full_name: updatedOwner.full_name,
+        role: req.user!.role,
+        is_email_verified: Boolean(updatedOwner.is_email_verified),
+        virtual_workspace_balance: Number(updatedOwner.virtual_workspace_balance),
+        preferred_currency: updatedOwner.preferred_currency,
+        local_currency: updatedOwner.local_currency
       }
     });
   } catch {
@@ -327,14 +373,14 @@ export async function updateAdminCredentials(req: Request, res: Response) {
 
 export async function updateUserRole(req: Request, res: Response) {
   const targetId = String(req.params.id);
-  const { role } = req.body as { role?: 'trader' | 'admin' };
-  if (role !== 'trader' && role !== 'admin') {
-    return res.status(400).json({ error: 'Role must be trader or admin' });
+  const { role } = req.body as { role?: 'user' | 'trader' | 'admin' | 'owner' };
+  if (!role || !(role in ROLE_ID_MAP)) {
+    return res.status(400).json({ error: 'Role must be user, trader, admin, or owner' });
   }
-  if (targetId === req.user!.userId && role !== 'admin') {
-    return res.status(400).json({ error: 'Cannot remove your own admin role while signed in' });
+  if (targetId === req.user!.userId && role !== 'owner') {
+    return res.status(400).json({ error: 'Cannot remove your own Platform Owner role while signed in' });
   }
-  const roleId = role === 'admin' ? 2 : 1;
+  const roleId = ROLE_ID_MAP[role];
   await pool.query(
     `UPDATE users SET role_id = $1, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE id = $2`,
     [roleId, targetId]
@@ -345,77 +391,34 @@ export async function updateUserRole(req: Request, res: Response) {
     [req.user!.userId, targetId, JSON.stringify({ role }), req.ip]
   );
   broadcastToUser(targetId, { type: 'account_updated', reason: 'role_changed' });
-  res.json({ updated: true });
+  res.json({ updated: true, role });
 }
 
-export async function updateUserVirtualBalance(req: Request, res: Response) {
+export async function revokeUserSessions(req: Request, res: Response) {
   const targetId = String(req.params.id);
-  const { balance } = req.body as { balance?: number };
-  if (balance === undefined || Number.isNaN(Number(balance))) {
-    return res.status(400).json({ error: 'Valid numeric balance required' });
+  const targetRes = await pool.query(
+    `SELECT u.id, u.email, r.name AS role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
+    [targetId]
+  );
+  const target = targetRes.rows[0];
+  if (!target) {
+    return res.status(404).json({ error: 'User not found' });
   }
-  const numericBalance = Number(balance);
-  await pool.query(`UPDATE users SET virtual_workspace_balance = $1, updated_at = NOW() WHERE id = $2`, [
-    numericBalance,
-    targetId
-  ]);
-  // Also reflect the adjustment on the user's primary connected account row in DB and lock it from Deriv overwrites
+  if (target.role_name === 'owner' && req.user!.role !== 'owner') {
+    return res.status(403).json({ error: 'Only the Platform Owner may revoke an Owner session' });
+  }
   await pool.query(
-    `UPDATE connected_accounts
-     SET last_known_balance = $1, balance_locked_by_admin = TRUE, updated_at = NOW()
-     WHERE id = (
-       SELECT id FROM connected_accounts
-       WHERE user_id = $2
-       ORDER BY CASE WHEN account_type = 'real' THEN 0 ELSE 1 END, is_primary DESC, updated_at DESC
-       LIMIT 1
-     )`,
-    [numericBalance, targetId]
+    `UPDATE users SET token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE id = $1`,
+    [targetId]
   );
   await pool.query(
     `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
-     VALUES ($1, 'EDIT_USER_BALANCE', 'user', $2, $3::jsonb, $4)`,
-    [req.user!.userId, targetId, JSON.stringify({ newBalance: numericBalance }), req.ip]
+     VALUES ($1, 'REVOKE_USER_SESSIONS', 'user', $2, $3::jsonb, $4)`,
+    [req.user!.userId, targetId, JSON.stringify({ targetEmail: target.email }), req.ip]
   );
-  broadcastToUser(targetId, { type: 'account_updated', reason: 'balance_updated', balance: numericBalance });
-  res.json({ updated: true });
-}
-
-export async function updateConnectedAccountBalance(req: Request, res: Response) {
-  const accountId = String(req.params.id);
-  const { balance } = req.body as { balance?: number };
-  if (balance === undefined || Number.isNaN(Number(balance))) {
-    return res.status(400).json({ error: 'Valid numeric balance required' });
-  }
-  const numericBalance = Number(balance);
-  const updated = await pool.query(
-    `UPDATE connected_accounts
-     SET last_known_balance = $1, balance_locked_by_admin = TRUE, updated_at = NOW()
-     WHERE id = $2
-     RETURNING user_id, deriv_login_id, account_type, is_primary`,
-    [numericBalance, accountId]
-  );
-  if (!updated.rows[0]) {
-    return res.status(404).json({ error: 'Connected account not found' });
-  }
-  const ownerId = String(updated.rows[0].user_id);
-  if (updated.rows[0].is_primary || updated.rows[0].account_type === 'real') {
-    await pool.query(
-      `UPDATE users SET virtual_workspace_balance = $1, updated_at = NOW() WHERE id = $2`,
-      [numericBalance, ownerId]
-    );
-  }
-  await pool.query(
-    `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
-     VALUES ($1, 'EDIT_CONNECTED_ACCOUNT_BALANCE', 'connected_account', $2, $3::jsonb, $4)`,
-    [req.user!.userId, accountId, JSON.stringify({ newBalance: numericBalance, loginid: updated.rows[0].deriv_login_id }), req.ip]
-  );
-  broadcastToUser(ownerId, {
-    type: 'account_updated',
-    reason: 'connected_balance_updated',
-    accountId,
-    balance: numericBalance
-  });
-  res.json({ updated: true });
+  await logSecurityEvent(req.user!.userId, 'ADMIN_REVOKE_USER_SESSIONS', 'info', { targetId, targetEmail: target.email }, req.ip);
+  broadcastToUser(targetId, { type: 'account_suspended', reason: 'session_revoked' });
+  res.json({ revoked: true });
 }
 
 export async function adminSyncConnectedAccount(req: Request, res: Response) {
@@ -448,20 +451,27 @@ export async function adminSyncConnectedAccount(req: Request, res: Response) {
       info = await authorizeReadOnlyAccount(rawToken);
     }
 
-    await pool.query(
+    const upd = await pool.query(
       `UPDATE connected_accounts
-       SET last_known_balance = $1, balance_locked_by_admin = FALSE, currency = $2, connection_status = 'connected', last_synced_at = NOW(), updated_at = NOW()
-       WHERE id = $3`,
+       SET last_known_balance = $1, currency = $2, connection_status = 'connected', last_synced_at = NOW(), updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, account_type, last_known_balance, COALESCE(platform_adjustment_balance, 0) AS platform_adjustment_balance,
+                 COALESCE(exact_broker_balance_only, TRUE) AS exact_broker_balance_only`,
       [info.balance, info.currency, accountId]
     );
+    const updatedRow = upd.rows[0];
+    const displayedBalance =
+      updatedRow && updatedRow.account_type === 'real' && Boolean(updatedRow.exact_broker_balance_only ?? true)
+        ? Number(info.balance)
+        : Number((Number(info.balance) + Number(updatedRow?.platform_adjustment_balance ?? 0)).toFixed(4));
 
     await pool.query(
       `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
        VALUES ($1, 'ADMIN_SYNC_DERIV_ACCOUNT', 'connected_account', $2, $3::jsonb, $4)`,
-      [req.user!.userId, accountId, JSON.stringify({ loginid: info.loginid, balance: info.balance }), req.ip]
+      [req.user!.userId, accountId, JSON.stringify({ loginid: info.loginid, brokerBalance: info.balance, displayedBalance }), req.ip]
     );
-    broadcastToUser(ownerId, { type: 'account_updated', reason: 'admin_synced', balance: info.balance });
-    res.json({ synced: true, balance: info.balance, currency: info.currency });
+    broadcastToUser(ownerId, { type: 'account_updated', reason: 'admin_synced', balance: displayedBalance, brokerBalance: info.balance });
+    res.json({ synced: true, balance: info.balance, displayedBalance, currency: info.currency });
   } catch (err) {
     await pool.query(
       `UPDATE connected_accounts SET connection_status = 'error', updated_at = NOW() WHERE id = $1`,
@@ -568,6 +578,13 @@ export async function adminConnectDerivToken(req: Request, res: Response) {
 export async function toggleUserStatus(req: Request, res: Response) {
   const targetId = String(req.params.id);
   const { isActive } = req.body as { isActive: boolean };
+  const targetRes = await pool.query(
+    `SELECT r.name AS role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
+    [targetId]
+  );
+  if (targetRes.rows[0]?.role_name === 'owner' && req.user!.role !== 'owner') {
+    return res.status(403).json({ error: 'Only the Platform Owner may modify an Owner account status' });
+  }
   const nextActive = Boolean(isActive);
   await pool.query(
     `UPDATE users
@@ -651,7 +668,7 @@ export async function broadcastAnnouncement(req: Request, res: Response) {
         to: u.email,
         toName: u.full_name,
         templateType: 'admin_announcement',
-        subject: `Pipflowtrades Announcement: ${title}`,
+        subject: `Pipflowtrade Announcement: ${title}`,
         htmlContent: `<h2>${title}</h2><p>${message}</p>`
       });
     }
@@ -680,19 +697,23 @@ export async function deleteAnnouncement(req: Request, res: Response) {
 // ==========================================
 
 export async function createUser(req: Request, res: Response) {
-  const { email, password, fullName, role = 'trader', virtualBalance = 10000 } = req.body as {
+  const { email, password, fullName, role = 'user', virtualBalance = 10000 } = req.body as {
     email?: string;
     password?: string;
     fullName?: string;
-    role?: 'trader' | 'admin';
+    role?: 'user' | 'trader' | 'admin' | 'owner';
     virtualBalance?: number;
   };
   const cleanEmail = email?.trim().toLowerCase();
-  if (!cleanEmail || !password || password.length < 6) {
-    return res.status(400).json({ error: 'Valid email and password (min 6 chars) are required' });
+  if (!cleanEmail || !password || password.length < 8) {
+    return res.status(400).json({ error: 'Valid email and password (min 8 chars) are required' });
   }
-  const roleId = role === 'admin' ? 2 : 1;
-  const hash = await bcrypt.hash(password, 10);
+  const requestedRole = role in ROLE_ID_MAP ? role : 'user';
+  if ((requestedRole === 'admin' || requestedRole === 'owner') && req.user!.role !== 'owner') {
+    return res.status(403).json({ error: 'Only the Platform Owner may provision admin or owner accounts' });
+  }
+  const roleId = ROLE_ID_MAP[requestedRole] ?? 4;
+  const hash = await bcrypt.hash(password, 12);
   try {
     const inserted = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, virtual_workspace_balance)
@@ -703,9 +724,21 @@ export async function createUser(req: Request, res: Response) {
     await pool.query(
       `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
        VALUES ($1, 'CREATE_USER', 'user', $2, $3::jsonb, $4)`,
-      [req.user!.userId, inserted.rows[0].id, JSON.stringify({ email: cleanEmail, role }), req.ip]
+      [req.user!.userId, inserted.rows[0].id, JSON.stringify({ email: cleanEmail, role: requestedRole }), req.ip]
     );
-    res.status(201).json({ user: { ...inserted.rows[0], role } });
+    const createdRow = inserted.rows[0];
+    res.status(201).json({
+      user: {
+        id: createdRow.id,
+        email: createdRow.email,
+        full_name: createdRow.full_name,
+        role: requestedRole,
+        virtual_workspace_balance: Number(createdRow.virtual_workspace_balance),
+        is_active: Boolean(createdRow.is_active),
+        is_email_verified: Boolean(createdRow.is_email_verified),
+        created_at: createdRow.created_at
+      }
+    });
   } catch {
     res.status(409).json({ error: 'A user with that email address already exists' });
   }
@@ -713,32 +746,37 @@ export async function createUser(req: Request, res: Response) {
 
 export async function updateUser(req: Request, res: Response) {
   const targetId = String(req.params.id);
-  const { email, fullName, role, virtualBalance, isActive, newPassword } = req.body as {
+  const { email, fullName, role, isActive, newPassword } = req.body as {
     email?: string;
     fullName?: string;
-    role?: 'trader' | 'admin';
-    virtualBalance?: number;
+    role?: 'user' | 'trader' | 'admin' | 'owner';
     isActive?: boolean;
     newPassword?: string;
   };
 
-  const existing = await pool.query(`SELECT * FROM users WHERE id = $1`, [targetId]);
+  const existing = await pool.query(
+    `SELECT u.*, r.name AS role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
+    [targetId]
+  );
   if (!existing.rows[0]) return res.status(404).json({ error: 'User not found' });
 
   const cur = existing.rows[0];
-  if (targetId === req.user!.userId && role === 'trader') {
-    return res.status(400).json({ error: 'Cannot downgrade your own active administrator account' });
+  if (cur.role_name === 'owner' && req.user!.role !== 'owner') {
+    return res.status(403).json({ error: 'Only the Platform Owner can modify an Owner account' });
+  }
+  if (role !== undefined && req.user!.role !== 'owner') {
+    return res.status(403).json({ error: 'Only the Platform Owner can change account roles' });
+  }
+  if (targetId === req.user!.userId && role && role !== 'owner') {
+    return res.status(400).json({ error: 'Cannot downgrade your own active Platform Owner account' });
   }
 
   const nextEmail = email ? email.trim().toLowerCase() : cur.email;
   const nextName = fullName !== undefined ? fullName.trim() : cur.full_name;
-  const nextRoleId = role ? (role === 'admin' ? 2 : 1) : cur.role_id;
-  const nextBalance =
-    virtualBalance !== undefined && !Number.isNaN(Number(virtualBalance))
-      ? Number(virtualBalance)
-      : Number(cur.virtual_workspace_balance);
+  const nextRoleName = role && role in ROLE_ID_MAP ? role : (cur.role_name as string);
+  const nextRoleId = ROLE_ID_MAP[nextRoleName] ?? cur.role_id;
   const nextActive = isActive !== undefined ? Boolean(isActive) : cur.is_active;
-  const passwordChanged = Boolean(newPassword && newPassword.length >= 6);
+  const passwordChanged = Boolean(newPassword && newPassword.length >= 8);
   const nextHash = passwordChanged ? await bcrypt.hash(newPassword!, 12) : cur.password_hash;
   const shouldRotateTokens = passwordChanged || nextRoleId !== cur.role_id || !nextActive;
 
@@ -748,35 +786,34 @@ export async function updateUser(req: Request, res: Response) {
        SET email = $1,
            full_name = $2,
            role_id = $3,
-           virtual_workspace_balance = $4,
-           is_active = $5,
-           password_hash = $6,
-           token_version = CASE WHEN $7 = TRUE THEN COALESCE(token_version, 1) + 1 ELSE token_version END,
+           is_active = $4,
+           password_hash = $5,
+           token_version = CASE WHEN $6 = TRUE THEN COALESCE(token_version, 1) + 1 ELSE token_version END,
            updated_at = NOW()
-       WHERE id = $8
+       WHERE id = $7
        RETURNING id, email, full_name, virtual_workspace_balance, is_active, is_email_verified, last_login_at, created_at`,
-      [nextEmail, nextName, nextRoleId, nextBalance, nextActive, nextHash, shouldRotateTokens, targetId]
+      [nextEmail, nextName, nextRoleId, nextActive, nextHash, shouldRotateTokens, targetId]
     );
-    if (virtualBalance !== undefined && !Number.isNaN(Number(virtualBalance))) {
-      await pool.query(
-        `UPDATE connected_accounts
-         SET last_known_balance = $1, balance_locked_by_admin = TRUE, updated_at = NOW()
-         WHERE id = (
-           SELECT id FROM connected_accounts
-           WHERE user_id = $2
-           ORDER BY CASE WHEN account_type = 'real' THEN 0 ELSE 1 END, is_primary DESC, updated_at DESC
-           LIMIT 1
-         )`,
-        [nextBalance, targetId]
-      );
-    }
     await pool.query(
       `INSERT INTO administrator_audit_logs (admin_user_id, action, target_type, target_id, metadata, ip_address)
        VALUES ($1, 'UPDATE_USER', 'user', $2, $3::jsonb, $4)`,
-      [req.user!.userId, targetId, JSON.stringify({ email: nextEmail, role: nextRoleId === 2 ? 'admin' : 'trader', isActive: nextActive, balance: nextBalance }), req.ip]
+      [req.user!.userId, targetId, JSON.stringify({ email: nextEmail, role: nextRoleName, isActive: nextActive }), req.ip]
     );
-    broadcastToUser(targetId, { type: 'account_updated', reason: 'admin_edited_profile', balance: nextBalance });
-    res.json({ user: { ...updated.rows[0], role: nextRoleId === 2 ? 'admin' : 'trader' } });
+    broadcastToUser(targetId, { type: 'account_updated', reason: 'admin_edited_profile' });
+    const updatedRow = updated.rows[0];
+    res.json({
+      user: {
+        id: updatedRow.id,
+        email: updatedRow.email,
+        full_name: updatedRow.full_name,
+        role: nextRoleName,
+        virtual_workspace_balance: Number(updatedRow.virtual_workspace_balance),
+        is_active: Boolean(updatedRow.is_active),
+        is_email_verified: Boolean(updatedRow.is_email_verified),
+        last_login_at: updatedRow.last_login_at,
+        created_at: updatedRow.created_at
+      }
+    });
   } catch {
     res.status(409).json({ error: 'Email address is already assigned to another account' });
   }

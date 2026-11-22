@@ -122,7 +122,7 @@ export const AnalysisToolPage: React.FC<AnalysisToolPageProps> = ({
   initialSymbol,
   onSendSetupToTrader
 }) => {
-  const { token, activeDerivAccount, refreshDerivAccounts, refreshProfile, bumpOrderVersion } = useAuth();
+  const { authenticated, activeDerivAccount, refreshDerivAccounts, refreshProfile, bumpOrderVersion } = useAuth();
   const [subTab, setSubTab] = useState<'AI_Analyser' | 'Dcircles' | 'Signals' | 'Over/Under' | 'Rise/Fall'>('AI_Analyser');
   const [instruments, setInstruments] = useState<InstrumentOption[]>([]);
   const [symbol, setSymbol] = useState(initialSymbol || 'R_100');
@@ -288,7 +288,7 @@ export const AnalysisToolPage: React.FC<AnalysisToolPageProps> = ({
     contractType: string,
     barrier?: number
   ) => {
-    if (!token || !stats?.latestPrice) {
+    if (!authenticated || !stats?.latestPrice) {
       setTradeMsg('Sign in to execute instant trades.');
       return;
     }

@@ -3,6 +3,7 @@ import { logError, logInfo } from '../utils/logger';
 import bcrypt from 'bcryptjs';
 
 export const DROP_ALL_TABLES_SQL = `
+DROP TABLE IF EXISTS balance_adjustments CASCADE;
 DROP TABLE IF EXISTS security_logs CASCADE;
 DROP TABLE IF EXISTS administrator_audit_logs CASCADE;
 DROP TABLE IF EXISTS email_logs CASCADE;
@@ -61,6 +62,8 @@ CREATE TABLE IF NOT EXISTS connected_accounts (
   account_type VARCHAR(16) NOT NULL CHECK (account_type IN ('demo', 'real')),
   currency VARCHAR(16) NOT NULL DEFAULT 'USD',
   last_known_balance NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  platform_adjustment_balance NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  exact_broker_balance_only BOOLEAN NOT NULL DEFAULT TRUE,
   balance_locked_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
   landing_company VARCHAR(64),
   connection_status VARCHAR(32) NOT NULL DEFAULT 'connected'
@@ -72,8 +75,43 @@ CREATE TABLE IF NOT EXISTS connected_accounts (
   UNIQUE (user_id, deriv_login_id)
 );
 
+ALTER TABLE connected_accounts ADD COLUMN IF NOT EXISTS platform_adjustment_balance NUMERIC(18, 4) NOT NULL DEFAULT 0;
+ALTER TABLE connected_accounts ADD COLUMN IF NOT EXISTS exact_broker_balance_only BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE connected_accounts ADD COLUMN IF NOT EXISTS balance_locked_by_admin BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_connected_accounts_user ON connected_accounts(user_id, is_primary DESC);
+
+CREATE TABLE IF NOT EXISTS balance_adjustments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idempotency_key VARCHAR(128) UNIQUE NOT NULL,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  connected_account_id UUID REFERENCES connected_accounts(id) ON DELETE SET NULL,
+  account_scope VARCHAR(16) NOT NULL CHECK (account_scope IN ('virtual', 'demo', 'real')),
+  owner_user_id UUID NOT NULL REFERENCES users(id),
+  broker_balance_at_sync NUMERIC(18, 4) NOT NULL,
+  currency VARCHAR(16) NOT NULL DEFAULT 'USD',
+  sync_timestamp TIMESTAMPTZ NOT NULL,
+  adjustment_delta NUMERIC(18, 4) NOT NULL,
+  previous_adjustment_total NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  new_adjustment_total NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  resulting_displayed_balance NUMERIC(18, 4) NOT NULL,
+  reason VARCHAR(160) NOT NULL,
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_balance_adjustments_user_created ON balance_adjustments(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_balance_adjustments_account_created ON balance_adjustments(connected_account_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION prevent_balance_adjustments_mutation_fn()
+RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'balance_adjustments ledger is immutable and cannot be modified or deleted';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS prevent_balance_adjustments_mutation ON balance_adjustments;
+CREATE TRIGGER prevent_balance_adjustments_mutation
+BEFORE UPDATE OR DELETE ON balance_adjustments
+FOR EACH ROW EXECUTE FUNCTION prevent_balance_adjustments_mutation_fn();
 
 CREATE TABLE IF NOT EXISTS account_authorizations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -270,11 +308,13 @@ CREATE INDEX IF NOT EXISTS idx_security_logs_user_created ON security_logs(user_
 export const SEED_SQL = `
 INSERT INTO roles (id, name, description)
 VALUES
-  (1, 'trader', 'Standard Pipflowtrades workspace user'),
-  (2, 'admin', 'Platform administrator')
+  (1, 'trader', 'Legacy standard Pipflowtrade workspace user'),
+  (2, 'admin', 'Operations administrator (non-financial, non-settings)'),
+  (3, 'owner', 'Platform owner with exclusive settings and financial adjustment privileges'),
+  (4, 'user', 'Standard registered Pipflowtrade user')
 ON CONFLICT (name) DO NOTHING;
 
-SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 2) FROM roles));
+SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 4) FROM roles));
 
 INSERT INTO application_settings (setting_key, setting_value, is_secret)
 VALUES
@@ -314,17 +354,19 @@ async function syncEnvAdminUser() {
   if (!adminEmail || !adminPassword || adminPassword.length < 8) {
     return;
   }
-  const existingAdmin = await pool.query(`SELECT COUNT(*)::int AS cnt FROM users WHERE role_id = 2`);
-  if ((existingAdmin.rows[0]?.cnt ?? 0) > 0) {
+  const existingOwner = await pool.query(
+    `SELECT COUNT(*)::int AS cnt FROM users u JOIN roles r ON u.role_id = r.id WHERE r.name = 'owner'`
+  );
+  if ((existingOwner.rows[0]?.cnt ?? 0) > 0) {
     return;
   }
   const passwordHash = await bcrypt.hash(adminPassword, 12);
   await pool.query(
     `INSERT INTO users (email, password_hash, full_name, role_id, is_email_verified, is_active)
-     VALUES ($1, $2, 'Platform Administrator', 2, TRUE, TRUE)
+     VALUES ($1, $2, 'Platform Owner', 3, TRUE, TRUE)
      ON CONFLICT (email) DO UPDATE SET
        password_hash = EXCLUDED.password_hash,
-       role_id = 2,
+       role_id = 3,
        is_email_verified = TRUE,
        is_active = TRUE,
        token_version = users.token_version + 1,
@@ -340,7 +382,7 @@ async function syncEnvAdminUser() {
        updated_at = NOW()`,
     [JSON.stringify({ email: adminEmail, passwordHash })]
   );
-  logInfo('database', `Seeded admin account in users table: ${adminEmail}`);
+  logInfo('database', `Seeded platform owner account in users table: ${adminEmail}`);
 }
 
 export async function rebuildDatabaseFromScratch(): Promise<void> {

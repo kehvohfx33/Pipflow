@@ -10,21 +10,45 @@ export class ApiError extends Error {
   }
 }
 
+export function getCookieValue(name: string): string {
+  if (typeof document === 'undefined') return '';
+  const pairs = document.cookie ? document.cookie.split(';') : [];
+  for (const pair of pairs) {
+    const idx = pair.indexOf('=');
+    if (idx === -1) continue;
+    if (pair.slice(0, idx).trim() === name) {
+      return decodeURIComponent(pair.slice(idx + 1).trim());
+    }
+  }
+  return '';
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
   includeBotGate = false
 ): Promise<T> {
-  const token = localStorage.getItem('pipflow_token');
   const botGate = localStorage.getItem('pipflow_bot_gate');
+  const method = String(options.method || 'GET').toUpperCase();
+  const isMutation = !['GET', 'HEAD', 'OPTIONS'].includes(method);
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> | undefined)
   };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
+  if (isMutation) {
+    headers['X-Requested-With'] = 'XMLHttpRequest';
+    const csrf = getCookieValue('pf_csrf');
+    if (csrf) {
+      headers['X-CSRF-Token'] = csrf;
+    }
+  }
   if (includeBotGate && botGate) headers['x-bot-gate-token'] = botGate;
 
-  const res = await fetch(`${API_BASE}/api${path}`, { ...options, headers });
+  const res = await fetch(`${API_BASE}/api${path}`, {
+    ...options,
+    credentials: 'include',
+    headers
+  });
   const text = await res.text();
   const looksLikeHtml = text.trimStart().startsWith('<');
 
@@ -54,12 +78,11 @@ export async function apiFetch<T = unknown>(
   return data as T;
 }
 
-export function getWebSocketUrl(token: string | null): string {
+export function getWebSocketUrl(): string {
   const configured = import.meta.env.VITE_WS_URL;
   if (configured) {
-    return token ? `${configured}?token=${encodeURIComponent(token)}` : configured;
+    return configured;
   }
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const base = `${proto}//${window.location.host}/ws`;
-  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+  return `${proto}//${window.location.host}/ws`;
 }

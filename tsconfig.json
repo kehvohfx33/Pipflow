@@ -24,5 +24,11 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "exclude": ["dist"]
+  "exclude": [
+    "dist",
+    "apps/deriv-bot",
+    "apps/deriv-accumulators",
+    "apps/deriv-digits",
+    "apps/deriv-rise-fall"
+  ]
 }

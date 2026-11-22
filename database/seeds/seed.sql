@@ -1,10 +1,12 @@
 INSERT INTO roles (id, name, description)
 VALUES
-  (1, 'trader', 'Standard Pipflowtrades workspace user'),
-  (2, 'admin', 'Platform administrator')
+  (1, 'trader', 'Legacy standard Pipflowtrade workspace user'),
+  (2, 'admin', 'Operations administrator (non-financial, non-settings)'),
+  (3, 'owner', 'Platform owner with exclusive settings and financial adjustment privileges'),
+  (4, 'user', 'Standard registered Pipflowtrade user')
 ON CONFLICT (name) DO NOTHING;
 
-SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 2) FROM roles));
+SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 4) FROM roles));
 
 -- Default settings & Bot gate password hash ("Pipflow@2026" — rotate via Admin Console after first login)
 INSERT INTO application_settings (setting_key, setting_value, is_secret)

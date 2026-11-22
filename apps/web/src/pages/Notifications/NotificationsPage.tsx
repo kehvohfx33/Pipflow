@@ -13,17 +13,17 @@ interface NotificationItem {
 }
 
 export const NotificationsPage: React.FC = () => {
-  const { token } = useAuth();
+  const { authenticated } = useAuth();
   const [items, setItems] = useState<NotificationItem[]>([]);
 
   const load = () => {
-    if (!token) return;
+    if (!authenticated) return;
     apiFetch<{ notifications?: NotificationItem[] }>('/notifications')
       .then((res) => setItems(Array.isArray(res?.notifications) ? res.notifications : []))
       .catch(() => {});
   };
 
-  useEffect(load, [token]);
+  useEffect(load, [authenticated]);
 
   const markRead = async (id: string) => {
     await apiFetch(`/notifications/${id}/read`, { method: 'PATCH' });

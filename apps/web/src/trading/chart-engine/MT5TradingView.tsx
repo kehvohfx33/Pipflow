@@ -65,7 +65,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   presetSetup
 }) => {
   const {
-    token,
+    authenticated,
     user,
     darkTheme,
     activeDerivAccount,
@@ -213,7 +213,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
 
     loadInstruments();
 
-    if (token) {
+    if (authenticated) {
       apiFetch<{ watchlist?: Array<{ symbol: string }> }>('/watchlists')
         .then((res) => {
           if (Array.isArray(res?.watchlist) && res.watchlist.length > 0) {
@@ -227,10 +227,10 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [token]);
+  }, [authenticated]);
 
   const loadOrders = () => {
-    if (!token) return;
+    if (!authenticated) return;
     apiFetch<{ orders?: VirtualOrderItem[]; liveContracts?: Record<string, LiveContractSnapshot> }>('/orders')
       .then((res) => {
         setOrders(Array.isArray(res?.orders) ? res.orders : []);
@@ -240,20 +240,20 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   };
 
   useEffect(() => {
-    if (token && orderVersion > 0) {
+    if (authenticated && orderVersion > 0) {
       loadOrders();
     }
-  }, [token, orderVersion]);
+  }, [authenticated, orderVersion]);
 
   useEffect(() => {
-    if (!token) return;
+    if (!authenticated) return;
     const hasOpenDeriv = orders.some((o) => o.status === 'OPEN' && o.deriv_contract_id);
     if (!hasOpenDeriv) return;
     const id = setInterval(() => {
       loadOrders();
     }, 6000);
     return () => clearInterval(id);
-  }, [token, orders.length]);
+  }, [authenticated, orders.length]);
 
   const openWatchKey = orders
     .filter((o) => o.status === 'OPEN')
@@ -637,7 +637,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   const handleToggleWatchlist = async (sym: string) => {
     const exists = watchlist.includes(sym);
     setWatchlist((prev) => (exists ? prev.filter((x) => x !== sym) : [...prev, sym]));
-    if (!token) return;
+    if (!authenticated) return;
     if (exists) {
       await apiFetch(`/watchlists/${encodeURIComponent(sym)}`, { method: 'DELETE' }).catch(() => {});
     } else {
@@ -795,7 +795,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   const totalFloatingPnl = openOrders.reduce((s, o) => s + estimateOrderFloating(o), 0);
   const usedMargin = openOrders.reduce((s, o) => s + Number(o.stake || 0), 0);
   const accountBalance = activeDerivAccount
-    ? Number(activeDerivAccount.last_known_balance ?? 0)
+    ? Number(activeDerivAccount.displayed_balance ?? activeDerivAccount.last_known_balance ?? 0)
     : Number(user?.virtual_workspace_balance ?? 10000);
   const equity = accountBalance + totalFloatingPnl;
   const freeMargin = Math.max(0, equity - usedMargin);
@@ -1060,7 +1060,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
             placingSide={placingSide}
             openOrders={openOrders}
             onCloseOrder={handleCloseOrder}
-            authenticated={Boolean(token)}
+            authenticated={authenticated}
             error={orderError}
             accountLabel={
               activeDerivAccount
@@ -1139,7 +1139,7 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
               <button
                 key={btn.id}
                 type="button"
-                disabled={!token || openOrders.length === 0 || bulkClosing !== null}
+                disabled={!authenticated || openOrders.length === 0 || bulkClosing !== null}
                 onClick={() => handleBulkClose(btn.id)}
                 className={`px-2.5 py-1 rounded-md font-bold transition disabled:opacity-40 inline-flex items-center gap-1 ${btn.cls}`}
               >

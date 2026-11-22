@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { HashRouter, Routes, Route, useSearchParams, useNavigate, Navigate } from 'react-router-dom';
+import { HashRouter, Routes, Route, useSearchParams, useNavigate, Navigate, useParams } from 'react-router-dom';
 import { AuthProvider, DerivAccountSummary, UserProfile, useAuth } from './contexts/AuthContext';
 import { useDerivStream } from './hooks/useDerivStream';
 import { SplashScreen } from './components/SplashScreen';
@@ -127,7 +127,8 @@ const SEO_PATH_TO_TAB: Record<string, string> = {
 
 const MainWorkspace: React.FC = () => {
   const {
-    token,
+    authenticated,
+    authLoading,
     user,
     activeDerivAccount,
     globalSettings,
@@ -181,7 +182,7 @@ const MainWorkspace: React.FC = () => {
     accountVersion,
     suspendedCount,
     botStoppedCount
-  } = useDerivStream(token, activeSymbol, watchSymbols);
+  } = useDerivStream(authenticated, activeSymbol, watchSymbols);
 
   const livePricesMap = useMemo(() => {
     const map: Record<string, number> = {};
@@ -191,7 +192,7 @@ const MainWorkspace: React.FC = () => {
     return map;
   }, [ticksBySymbol]);
 
-  // Handle Official Deriv OAuth2 return back to the site dashboard (?oauth_token=... OR ?deriv_connected=... OR ?acct1=...&token1=...)
+  // Handle Official Deriv OAuth2 return back to the site dashboard (?oauth_connected=1 OR ?deriv_connected=... OR ?acct1=...&token1=...)
   useEffect(() => {
     const oauthErr = searchParams.get('deriv_error');
     if (oauthErr) {
@@ -211,16 +212,13 @@ const MainWorkspace: React.FC = () => {
       return;
     }
 
-    const returnedJwt = searchParams.get('oauth_token');
-    if (returnedJwt) {
+    const oauthConnected = searchParams.get('oauth_connected');
+    if (oauthConnected === '1') {
       setOauthExchanging(true);
-      localStorage.setItem('pipflow_token', returnedJwt);
-      apiFetch<{ user: UserProfile }>('/auth/me')
-        .then((res) => {
-          setSession(returnedJwt, res.user);
+      Promise.all([refreshProfile(), refreshDerivAccounts(false)])
+        .then(() => {
           setPublicMode(false);
           setActiveTab(targetTab);
-          return refreshDerivAccounts(false);
         })
         .catch((err) => setOauthError((err as Error).message))
         .finally(() => {
@@ -240,13 +238,13 @@ const MainWorkspace: React.FC = () => {
 
     if (directTokens.length > 0) {
       setOauthExchanging(true);
-      apiFetch<{ token?: string; user?: UserProfile; accounts?: DerivAccountSummary[] }>('/deriv/oauth/exchange', {
+      apiFetch<{ user?: UserProfile; accounts?: DerivAccountSummary[] }>('/deriv/oauth/exchange', {
         method: 'POST',
         body: JSON.stringify({ tokens: directTokens })
       })
         .then((res) => {
-          if (res.token && res.user) {
-            setSession(res.token, res.user, res.accounts);
+          if (res.user) {
+            setSession(res.user, res.accounts);
           }
           setPublicMode(false);
           setActiveTab(targetTab);
@@ -261,7 +259,7 @@ const MainWorkspace: React.FC = () => {
           setOauthExchanging(false);
         });
     }
-  }, [searchParams]);
+  }, [searchParams, refreshDerivAccounts, refreshProfile, setSearchParams, setSession]);
 
   useEffect(() => {
     const timer = setTimeout(() => setBooting(false), 750);
@@ -299,23 +297,24 @@ const MainWorkspace: React.FC = () => {
 
   useEffect(() => {
     if (suspendedCount > 0) {
-      logout();
+      void logout();
     }
   }, [suspendedCount, logout]);
 
   useEffect(() => {
-    if (token) {
+    if (authenticated) {
       apiFetch<{ running: boolean }>('/bots/status', {}, true)
         .then((res) => setBotRunning(res.running))
         .catch(() => {});
     }
-  }, [token]);
+  }, [authenticated]);
 
-  if (booting || oauthExchanging) {
+  if (booting || authLoading || oauthExchanging) {
     return <SplashScreen />;
   }
 
-  if (globalSettings.maintenanceMode && user?.role !== 'admin') {
+  const isPrivilegedRole = user?.role === 'owner' || user?.role === 'admin';
+  if (globalSettings.maintenanceMode && !isPrivilegedRole) {
     return (
       <div className="min-h-screen bg-[#060d18] text-white flex items-center justify-center p-4">
         <div className="max-w-md w-full rounded-2xl border border-slate-800 bg-[#0b1526] p-6 text-center space-y-4 shadow-2xl">
@@ -331,7 +330,7 @@ const MainWorkspace: React.FC = () => {
     );
   }
 
-  if (!token && !publicMode) {
+  if (!authenticated && !publicMode) {
     return (
       <LandingPage
         initialOAuthError={oauthError}
@@ -394,7 +393,7 @@ const MainWorkspace: React.FC = () => {
   };
 
   const handleToggleBot = async () => {
-    if (!token) {
+    if (!authenticated) {
       setPublicMode(false);
       return;
     }
@@ -554,8 +553,55 @@ const MainWorkspace: React.FC = () => {
   );
 };
 
+const ConsoleSlugEntryGate: React.FC = () => {
+  const { slug } = useParams<{ slug: string }>();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!slug) {
+      navigate('/', { replace: true });
+      return;
+    }
+    apiFetch<{ authorizedEntry?: boolean }>(`/auth/console-entry?slug=${encodeURIComponent(slug)}`)
+      .then((res) => {
+        if (res?.authorizedEntry) {
+          try {
+            sessionStorage.setItem('pf_secret_console', '1');
+          } catch {
+            // ignore
+          }
+          navigate('/_console', { replace: true });
+        } else {
+          navigate('/', { replace: true });
+        }
+      })
+      .catch(() => {
+        navigate('/', { replace: true });
+      });
+  }, [slug, navigate]);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-300 flex items-center justify-center text-xs">
+      Verifying entry...
+    </div>
+  );
+};
+
+const InitialOpsPathnameRedirect: React.FC = () => {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const p = window.location.pathname;
+    if (p.startsWith('/ops/') && p.length > 5) {
+      const slug = p.slice(5).replace(/\/+$/, '');
+      window.history.replaceState({}, document.title, `/#/ops/${encodeURIComponent(slug)}`);
+      navigate(`/ops/${encodeURIComponent(slug)}`, { replace: true });
+    }
+  }, [navigate]);
+  return null;
+};
+
 const HiddenAdminGate: React.FC = () => {
-  const { user } = useAuth();
+  const { user, authenticated, authLoading } = useAuth();
   let unlocked = false;
   try {
     unlocked = sessionStorage.getItem('pf_secret_console') === '1';
@@ -565,11 +611,20 @@ const HiddenAdminGate: React.FC = () => {
 
   const hashQuery = window.location.hash.includes('?') ? window.location.hash.split('?')[1] : '';
   const hashParams = new URLSearchParams(hashQuery);
+  const isPrivileged = authenticated && (user?.role === 'owner' || user?.role === 'admin');
   const isOAuthReturn =
-    user?.role === 'admin' &&
+    isPrivileged &&
     (hashParams.get('commission_connected') === '1' || Boolean(hashParams.get('commission_error')));
 
-  if (!unlocked && !isOAuthReturn) {
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-300 flex items-center justify-center text-xs">
+        Verifying session...
+      </div>
+    );
+  }
+
+  if (!unlocked && !isOAuthReturn && !isPrivileged) {
     return <Navigate to="/" replace />;
   }
 
@@ -580,7 +635,9 @@ export default function App() {
   return (
     <AuthProvider>
       <HashRouter>
+        <InitialOpsPathnameRedirect />
         <Routes>
+          <Route path="/ops/:slug" element={<ConsoleSlugEntryGate />} />
           <Route path="/_console" element={<HiddenAdminGate />} />
           <Route path="/verify-email" element={<VerifyEmailRoute />} />
           <Route path="/reset-password" element={<ResetPasswordRoute />} />

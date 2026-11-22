@@ -6,14 +6,14 @@ import { VirtualOrderItem } from '../../components/trading/OrderTicket';
 import { ContractPositionsList } from '../../components/deriv/PositionsCards';
 
 export const PortfolioPage: React.FC<{ livePricesMap: Record<string, number> }> = ({ livePricesMap }) => {
-  const { token, orderVersion, refreshDerivAccounts, refreshProfile, bumpOrderVersion } = useAuth();
+  const { authenticated, orderVersion, refreshDerivAccounts, refreshProfile, bumpOrderVersion } = useAuth();
   const [orders, setOrders] = useState<VirtualOrderItem[]>([]);
   const [liveContracts, setLiveContracts] = useState<Record<string, { currentSpot: number; profit: number; bidPrice?: number }>>({});
   const [sellingId, setSellingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const loadOrders = async () => {
-    if (!token) return;
+    if (!authenticated) return;
     setLoading(true);
     try {
       const res = await apiFetch<{ orders?: VirtualOrderItem[]; liveContracts?: typeof liveContracts }>('/orders');
@@ -30,7 +30,7 @@ export const PortfolioPage: React.FC<{ livePricesMap: Record<string, number> }> 
     loadOrders();
     const id = setInterval(loadOrders, 4000);
     return () => clearInterval(id);
-  }, [token, orderVersion]);
+  }, [authenticated, orderVersion]);
 
   const openPositions = orders.filter((o) => o.status === 'OPEN');
 

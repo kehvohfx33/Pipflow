@@ -51,7 +51,7 @@ export const RealAccountConfirmModal: React.FC<RealAccountConfirmModalProps> = (
           <div className="flex justify-between">
             <span className="text-slate-500">Available Balance</span>
             <span className="font-mono font-bold">
-              {Number(account.last_known_balance).toFixed(2)} {account.currency}
+              {Number(account.displayed_balance ?? account.last_known_balance).toFixed(2)} {account.currency}
             </span>
           </div>
           <div className="flex justify-between">

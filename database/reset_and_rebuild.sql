@@ -4,6 +4,7 @@
 
 BEGIN;
 
+DROP TABLE IF EXISTS balance_adjustments CASCADE;
 DROP TABLE IF EXISTS security_logs CASCADE;
 DROP TABLE IF EXISTS administrator_audit_logs CASCADE;
 DROP TABLE IF EXISTS email_logs CASCADE;
@@ -56,6 +57,8 @@ CREATE TABLE connected_accounts (
   account_type VARCHAR(16) NOT NULL CHECK (account_type IN ('demo', 'real')),
   currency VARCHAR(16) NOT NULL DEFAULT 'USD',
   last_known_balance NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  platform_adjustment_balance NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  exact_broker_balance_only BOOLEAN NOT NULL DEFAULT TRUE,
   balance_locked_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
   landing_company VARCHAR(64),
   connection_status VARCHAR(32) NOT NULL DEFAULT 'connected'
@@ -67,6 +70,38 @@ CREATE TABLE connected_accounts (
   UNIQUE (user_id, deriv_login_id)
 );
 CREATE INDEX idx_connected_accounts_user ON connected_accounts(user_id, is_primary DESC);
+
+CREATE TABLE balance_adjustments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idempotency_key VARCHAR(128) UNIQUE NOT NULL,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  connected_account_id UUID REFERENCES connected_accounts(id) ON DELETE SET NULL,
+  account_scope VARCHAR(16) NOT NULL CHECK (account_scope IN ('virtual', 'demo', 'real')),
+  owner_user_id UUID NOT NULL REFERENCES users(id),
+  broker_balance_at_sync NUMERIC(18, 4) NOT NULL,
+  currency VARCHAR(16) NOT NULL DEFAULT 'USD',
+  sync_timestamp TIMESTAMPTZ NOT NULL,
+  adjustment_delta NUMERIC(18, 4) NOT NULL,
+  previous_adjustment_total NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  new_adjustment_total NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  resulting_displayed_balance NUMERIC(18, 4) NOT NULL,
+  reason VARCHAR(160) NOT NULL,
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_balance_adjustments_user_created ON balance_adjustments(user_id, created_at DESC);
+CREATE INDEX idx_balance_adjustments_account_created ON balance_adjustments(connected_account_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION prevent_balance_adjustments_mutation_fn()
+RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'balance_adjustments ledger is immutable and cannot be modified or deleted';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER prevent_balance_adjustments_mutation
+BEFORE UPDATE OR DELETE ON balance_adjustments
+FOR EACH ROW EXECUTE FUNCTION prevent_balance_adjustments_mutation_fn();
 
 CREATE TABLE account_authorizations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -213,10 +248,12 @@ CREATE INDEX idx_security_logs_user_created ON security_logs(user_id, created_at
 
 INSERT INTO roles (id, name, description)
 VALUES
-  (1, 'trader', 'Standard Pipflowtrades workspace user'),
-  (2, 'admin', 'Platform administrator');
+  (1, 'trader', 'Legacy standard Pipflowtrade workspace user'),
+  (2, 'admin', 'Operations administrator (non-financial, non-settings)'),
+  (3, 'owner', 'Platform owner with exclusive settings and financial adjustment privileges'),
+  (4, 'user', 'Standard registered Pipflowtrade user');
 
-SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 2) FROM roles));
+SELECT setval('roles_id_seq', (SELECT COALESCE(MAX(id), 4) FROM roles));
 
 INSERT INTO application_settings (setting_key, setting_value, is_secret)
 VALUES

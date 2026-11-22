@@ -5,7 +5,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { VirtualOrderItem } from '../../components/trading/OrderTicket';
 
 export const ReportsPage: React.FC = () => {
-  const { token, activeDerivAccount, orderVersion } = useAuth();
+  const { authenticated, activeDerivAccount, orderVersion } = useAuth();
   const [subTab, setSubTab] = useState<'trades' | 'statement'>('trades');
   const [range, setRange] = useState<'today' | '7d' | '30d' | 'all'>('7d');
   const [orders, setOrders] = useState<VirtualOrderItem[]>([]);
@@ -13,7 +13,7 @@ export const ReportsPage: React.FC = () => {
   const [error, setError] = useState('');
 
   const loadData = () => {
-    if (!token) return;
+    if (!authenticated) return;
     setError('');
     apiFetch<{ orders?: VirtualOrderItem[] }>('/orders')
       .then((res) => setOrders(Array.isArray(res?.orders) ? res.orders : []))
@@ -26,7 +26,7 @@ export const ReportsPage: React.FC = () => {
     }
   };
 
-  useEffect(loadData, [token, subTab, activeDerivAccount?.id, orderVersion]);
+  useEffect(loadData, [authenticated, subTab, activeDerivAccount?.id, orderVersion]);
 
   const safeOrders = Array.isArray(orders) ? orders : [];
   const safeStatement = Array.isArray(statement) ? statement : [];

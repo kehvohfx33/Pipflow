@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ArrowDownRight, ArrowUpRight, Clock } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { apiFetch } from '../../services/api';
@@ -7,6 +7,7 @@ import { SmartChartWrapper } from '../../components/deriv/SmartChartWrapper';
 import { SymbolSelector, useDerivSymbolsCatalog } from '../../components/deriv/SymbolSelector';
 import { ContractPositionsList } from '../../components/deriv/PositionsCards';
 import { VirtualOrderItem } from '../../components/trading/OrderTicket';
+import { calculateContractMarkersFromOrders } from '../../utils/chartMarkers';
 
 interface RiseFallPageProps {
   symbol: string;
@@ -25,7 +26,7 @@ export const RiseFallPage: React.FC<RiseFallPageProps> = ({
   liveTick,
   livePricesMap
 }) => {
-  const { token, activeDerivAccount, refreshDerivAccounts, refreshProfile, orderVersion, bumpOrderVersion } = useAuth();
+  const { authenticated, activeDerivAccount, refreshDerivAccounts, refreshProfile, orderVersion, bumpOrderVersion } = useAuth();
   const symbols = useDerivSymbolsCatalog(false);
 
   const [direction, setDirection] = useState<Direction>('rise');
@@ -56,7 +57,7 @@ export const RiseFallPage: React.FC<RiseFallPageProps> = ({
       : undefined;
 
   const loadOrders = () => {
-    if (!token) return;
+    if (!authenticated) return;
     apiFetch<{ orders?: VirtualOrderItem[]; liveContracts?: Record<string, { currentSpot: number; profit: number; bidPrice?: number }> }>('/orders')
       .then((res) => {
         setOrders(Array.isArray(res?.orders) ? res.orders : []);
@@ -67,14 +68,14 @@ export const RiseFallPage: React.FC<RiseFallPageProps> = ({
 
   useEffect(() => {
     loadOrders();
-  }, [token, orderVersion]);
+  }, [authenticated, orderVersion]);
 
   // Live Deriv proposal quote
   useEffect(() => {
     let cancelled = false;
     setQuoteErr('');
     const t = setTimeout(() => {
-      apiFetch<{ payout: number; askPrice: number; spot: number }>('/deriv/proposal', {
+      apiFetch<{ proposal?: { payout: number; askPrice: number; spot: number }; payout?: number; askPrice?: number; spot?: number }>('/deriv/proposal', {
         method: 'POST',
         body: JSON.stringify({
           symbol,
@@ -87,7 +88,9 @@ export const RiseFallPage: React.FC<RiseFallPageProps> = ({
         })
       })
         .then((res) => {
-          if (!cancelled) setQuote(res);
+          if (cancelled) return;
+          const p = res.proposal ?? (res as { payout: number; askPrice: number; spot: number });
+          if (p && typeof p.payout === 'number') setQuote(p);
         })
         .catch((err) => {
           if (!cancelled) setQuoteErr((err as Error).message);
@@ -100,7 +103,7 @@ export const RiseFallPage: React.FC<RiseFallPageProps> = ({
   }, [symbol, contractType, stake, duration, durationUnit, expiryMode, endDateStr, endTimeStr, allowEquals]);
 
   const handleBuy = async () => {
-    if (!token) {
+    if (!authenticated) {
       setTradeNotice('Please sign in to place Rise/Fall trades.');
       return;
     }
@@ -157,6 +160,18 @@ export const RiseFallPage: React.FC<RiseFallPageProps> = ({
 
   const payoutPct = quote && quote.askPrice > 0 ? (((quote.payout - quote.askPrice) / quote.askPrice) * 100).toFixed(1) : null;
 
+  const contractMarkers = useMemo(
+    () =>
+      calculateContractMarkersFromOrders({
+        orders: orders.filter((o) => ['CALL', 'PUT', 'CALLE', 'PUTE'].includes(String(o.contract_type || '').toUpperCase())),
+        activeSymbol: symbol,
+        liveContracts,
+        livePricesMap,
+        currency: activeDerivAccount?.currency || 'USD'
+      }),
+    [orders, symbol, liveContracts, livePricesMap, activeDerivAccount?.currency]
+  );
+
   return (
     <div className="max-w-7xl mx-auto p-3 sm:p-4 space-y-4">
       <div className="grid lg:grid-cols-12 gap-4 items-start">
@@ -181,6 +196,7 @@ export const RiseFallPage: React.FC<RiseFallPageProps> = ({
             symbol={symbol}
             onSymbolChange={onSymbolChange}
             defaultGranularity={0}
+            contractsArray={contractMarkers}
             fallbackSpot={liveTick?.quote}
           />
         </div>

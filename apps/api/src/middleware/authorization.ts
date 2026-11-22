@@ -12,17 +12,33 @@ export async function requireDb(_req: Request, _res: Response, next: NextFunctio
 }
 
 export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  if (!req.user || req.user.role !== 'admin') {
+  if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'owner')) {
     return res.status(403).json({ error: 'Administrator privileges required' });
   }
-  // Verify role directly against storage (PostgreSQL or in-memory fallback)
   const q = await pool.query(
     `SELECT r.name as role_name, u.is_active FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
     [req.user.userId]
   );
-  if (!q.rows[0] || !q.rows[0].is_active || q.rows[0].role_name !== 'admin') {
+  const roleName = q.rows[0]?.role_name;
+  if (!q.rows[0] || !q.rows[0].is_active || (roleName !== 'admin' && roleName !== 'owner')) {
     return res.status(403).json({ error: 'Server-side administrator verification failed' });
   }
+  req.user.role = roleName;
+  next();
+}
+
+export async function requireOwner(req: Request, res: Response, next: NextFunction) {
+  if (!req.user || req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Platform Owner privileges required' });
+  }
+  const q = await pool.query(
+    `SELECT r.name as role_name, u.is_active FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1`,
+    [req.user.userId]
+  );
+  if (!q.rows[0] || !q.rows[0].is_active || q.rows[0].role_name !== 'owner') {
+    return res.status(403).json({ error: 'Server-side owner verification failed' });
+  }
+  req.user.role = 'owner';
   next();
 }
 

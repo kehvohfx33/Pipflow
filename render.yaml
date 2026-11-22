@@ -1,6 +1,6 @@
-# Render Blueprint — deploys as a fresh new Pipflowtrades web service.
-# Connect a clean Neon / PostgreSQL database via DATABASE_URL and visit /#/_console on first boot
-# to initialize your Administrator email and password directly in the database.
+# Render Blueprint — deploys Pipflowtrade.site (Pipflowtrades) as a unified Node.js web service.
+# Connect a clean Neon / PostgreSQL database via DATABASE_URL and initialize your Owner account
+# on first deploy via /#/_console (or the configured ADMIN_PRIVATE_SLUG ops route).
 services:
   - type: web
     name: pipflowtrades
@@ -10,11 +10,18 @@ services:
     buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
+    domains:
+      - pipflowtrade.site
+      - www.pipflowtrade.site
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 10000
+      - key: PUBLIC_SITE_URL
+        value: https://pipflowtrade.site
+      - key: FRONTEND_URL
+        value: https://pipflowtrade.site
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET
@@ -23,6 +30,8 @@ services:
         generateValue: true
       - key: TOKEN_ENCRYPTION_KEY
         generateValue: true
+      - key: ADMIN_PRIVATE_SLUG
+        generateValue: true
       - key: DERIV_APP_ID
         sync: false
       - key: DERIV_CLIENT_SECRET
@@ -30,7 +39,7 @@ services:
       - key: DERIV_OAUTH_URL
         value: https://auth.deriv.com/oauth2/auth
       - key: DERIV_OAUTH_REDIRECT_URI
-        sync: false
+        value: https://pipflowtrade.site/api/deriv/oauth/callback
       - key: DERIV_OAUTH_SCOPES
         value: trade account_manage
       - key: DERIV_WS_URL
@@ -41,7 +50,11 @@ services:
         sync: false
       - key: BREVO_SENDER_NAME
         value: Pipflowtrades
-      - key: FRONTEND_URL
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: XAUUSD_FEED_PROVIDER
+        sync: false
+      - key: XAUUSD_FEED_URL
         sync: false
       - key: VITE_DERIV_APP_ID
         sync: false

@@ -50,7 +50,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   onSymbolChange
 }) => {
   const {
-    token,
+    authenticated,
     darkTheme,
     activeDerivAccount,
     refreshDerivAccounts,
@@ -93,7 +93,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   }, [symbolProp]);
 
   const loadOpenOrders = () => {
-    if (!token) return;
+    if (!authenticated) return;
     apiFetch<{ orders?: VirtualOrderItem[] }>('/orders')
       .then((res) => {
         const list = Array.isArray(res?.orders) ? res.orders : [];
@@ -104,7 +104,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
 
   useEffect(() => {
     loadOpenOrders();
-  }, [token, orderVersion]);
+  }, [authenticated, orderVersion]);
 
   useEffect(() => {
     let cancelled = false;
@@ -371,7 +371,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   }, [liveTick, symbol, granularity, engine]);
 
   const handlePlaceDtraderOrder = async (tradeSide: 'BUY' | 'SELL') => {
-    if (!token || !latestPrice) return;
+    if (!authenticated || !latestPrice) return;
     setSide(tradeSide);
     setNotice('');
     setNoticeType('ok');
@@ -557,7 +557,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
           <div className="grid grid-cols-2 gap-3">
             <button
               type="button"
-              disabled={!token || latestPrice <= 0}
+              disabled={!authenticated || latestPrice <= 0}
               onClick={() => handlePlaceDtraderOrder('BUY')}
               className={`w-full py-3 rounded-lg bg-[#26a69a] hover:bg-teal-600 disabled:opacity-50 text-white font-bold text-sm ${
                 side === 'BUY' ? 'ring-2 ring-emerald-300' : ''
@@ -569,7 +569,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
             </button>
             <button
               type="button"
-              disabled={!token || latestPrice <= 0}
+              disabled={!authenticated || latestPrice <= 0}
               onClick={() => handlePlaceDtraderOrder('SELL')}
               className={`w-full py-3 rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-bold text-sm ${
                 side === 'SELL' ? 'ring-2 ring-rose-300' : ''

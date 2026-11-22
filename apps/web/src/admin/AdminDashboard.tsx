@@ -23,7 +23,10 @@ import {
   ExternalLink,
   CheckCircle2,
   AlertTriangle,
-  Copy
+  Copy,
+  History,
+  Lock,
+  PowerOff
 } from 'lucide-react';
 import { apiFetch } from '../services/api';
 import { useAuth, UserProfile } from '../contexts/AuthContext';
@@ -32,7 +35,7 @@ interface AdminUserRow {
   id: string;
   email: string;
   full_name: string;
-  role: 'trader' | 'admin';
+  role: 'user' | 'trader' | 'admin' | 'owner';
   virtual_workspace_balance: number;
   is_active: boolean;
   created_at: string;
@@ -43,12 +46,53 @@ interface AdminConnectedAccount {
   user_id: string;
   user_email: string;
   deriv_login_id: string;
-  account_type: string;
+  account_type: 'demo' | 'real';
   currency: string;
   last_known_balance: number;
-  balance_locked_by_admin?: boolean;
+  platform_adjustment_balance: number;
+  exact_broker_balance_only: boolean;
+  displayed_balance: number;
   connection_status: string;
+  last_synced_at: string | null;
   granted_scopes?: string[];
+}
+
+interface BalanceAdjustmentRow {
+  id: string;
+  idempotency_key: string;
+  user_id: string;
+  user_email?: string;
+  owner_email?: string;
+  deriv_login_id?: string | null;
+  account_scope: 'virtual' | 'demo' | 'real';
+  broker_balance_at_sync: number;
+  currency: string;
+  sync_timestamp: string;
+  adjustment_delta: number;
+  previous_adjustment_total: number;
+  new_adjustment_total: number;
+  resulting_displayed_balance: number;
+  reason: string;
+  note: string | null;
+  created_at: string;
+}
+
+interface SyncedAccountPreview {
+  account: {
+    id: string;
+    userId: string;
+    userEmail: string;
+    userFullName: string;
+    derivLoginId: string;
+    accountType: 'demo' | 'real';
+    currency: string;
+    brokerBalance: number;
+    platformAdjustmentBalance: number;
+    exactBrokerBalanceOnly: boolean;
+    displayedBalance: number;
+    syncTimestamp: string;
+  };
+  syncProofToken: string;
 }
 
 interface AdminStrategyRow {
@@ -193,13 +237,31 @@ interface CommissionsResponse {
   };
 }
 
-type AdminSectionTab = 'commissions' | 'connections' | 'users' | 'strategies' | 'orders' | 'settings' | 'logs';
+type AdminSectionTab =
+  | 'commissions'
+  | 'connections'
+  | 'ledger'
+  | 'users'
+  | 'strategies'
+  | 'orders'
+  | 'settings'
+  | 'logs';
+
+function newIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `adj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 export const AdminDashboard: React.FC = () => {
-  const { token, user, setSession, refreshBranding, refreshProfile, refreshDerivAccounts, logout } = useAuth();
+  const { authenticated, user, setSession, refreshBranding, refreshProfile, refreshDerivAccounts, logout } = useAuth();
   const navigate = useNavigate();
 
-  const [activeSection, setActiveSection] = useState<AdminSectionTab>('commissions');
+  const isConsoleUser = user?.role === 'owner' || user?.role === 'admin';
+  const isOwner = user?.role === 'owner';
+
+  const [activeSection, setActiveSection] = useState<AdminSectionTab>('connections');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [bootstrapChecked, setBootstrapChecked] = useState(false);
   const [adminInitialized, setAdminInitialized] = useState(true);
@@ -231,24 +293,44 @@ export const AdminDashboard: React.FC = () => {
   const [commAdminToken, setCommAdminToken] = useState('');
   const [connectingCommOAuth, setConnectingCommOAuth] = useState(false);
 
-  // Connections state
-  const [editingAccId, setEditingAccId] = useState<string | null>(null);
-  const [editAccBalanceVal, setEditAccBalanceVal] = useState('');
+  // Connections & 8-Step Synchronized Balance Management state
   const [connectTargetUserId, setConnectTargetUserId] = useState('');
   const [connectApiToken, setConnectApiToken] = useState('');
   const [connectBusy, setConnectBusy] = useState(false);
+  const [syncModalAccount, setSyncModalAccount] = useState<AdminConnectedAccount | null>(null);
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [syncPreview, setSyncPreview] = useState<SyncedAccountPreview | null>(null);
+  const [syncError, setSyncError] = useState('');
+  const [adjDelta, setAdjDelta] = useState('');
+  const [adjReason, setAdjReason] = useState('');
+  const [adjNote, setAdjNote] = useState('');
+  const [adjIdempotencyKey, setAdjIdempotencyKey] = useState(() => newIdempotencyKey());
+  const [adjAllowRealOverlay, setAdjAllowRealOverlay] = useState(false);
+  const [adjSubmitting, setAdjSubmitting] = useState(false);
+
+  // Immutable Balance Adjustment Ledger
+  const [adjustmentsList, setAdjustmentsList] = useState<BalanceAdjustmentRow[]>([]);
+  const [loadingLedger, setLoadingLedger] = useState(false);
+
+  // Virtual Workspace Adjustment Modal
+  const [virtualAdjUser, setVirtualAdjUser] = useState<AdminUserRow | null>(null);
+  const [virtualAdjMode, setVirtualAdjMode] = useState<'delta' | 'target'>('delta');
+  const [virtualAdjVal, setVirtualAdjVal] = useState('');
+  const [virtualAdjReason, setVirtualAdjReason] = useState('');
+  const [virtualAdjNote, setVirtualAdjNote] = useState('');
+  const [virtualAdjKey, setVirtualAdjKey] = useState(() => newIdempotencyKey());
+  const [virtualAdjBusy, setVirtualAdjBusy] = useState(false);
 
   // Users CRUD state
   const [userSearch, setUserSearch] = useState('');
   const [newUserEmail, setNewUserEmail] = useState('');
   const [newUserName, setNewUserName] = useState('');
   const [newUserPassword, setNewUserPassword] = useState('');
-  const [newUserRole, setNewUserRole] = useState<'trader' | 'admin'>('trader');
+  const [newUserRole, setNewUserRole] = useState<'user' | 'trader' | 'admin' | 'owner'>('trader');
   const [newUserBalance, setNewUserBalance] = useState(10000);
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [editUserName, setEditUserName] = useState('');
-  const [editUserBalance, setEditUserBalance] = useState('');
-  const [editUserRole, setEditUserRole] = useState<'trader' | 'admin'>('trader');
+  const [editUserRole, setEditUserRole] = useState<'user' | 'trader' | 'admin' | 'owner'>('trader');
   const [editUserPassword, setEditUserPassword] = useState('');
 
   // Strategies CRUD state
@@ -330,8 +412,16 @@ export const AdminDashboard: React.FC = () => {
     }
   }, []);
 
+  useEffect(() => {
+    if (isOwner) {
+      setActiveSection((prev) => (prev === 'connections' ? 'commissions' : prev));
+    } else if (activeSection === 'commissions' || activeSection === 'ledger') {
+      setActiveSection('connections');
+    }
+  }, [isOwner, activeSection]);
+
   const loadCommissions = (from = dateFrom, to = dateTo) => {
-    if (!token || user?.role !== 'admin') return;
+    if (!authenticated || !isOwner) return;
     setLoadingComm(true);
     apiFetch<CommissionsResponse>(
       `/admin/commissions?dateFrom=${encodeURIComponent(from)}&dateTo=${encodeURIComponent(to)}`
@@ -352,8 +442,19 @@ export const AdminDashboard: React.FC = () => {
       .finally(() => setLoadingComm(false));
   };
 
+  const loadLedger = () => {
+    if (!authenticated || !isOwner) return;
+    setLoadingLedger(true);
+    apiFetch<{ adjustments: BalanceAdjustmentRow[] }>('/owner/balance-adjustments')
+      .then((res) => {
+        setAdjustmentsList(Array.isArray(res.adjustments) ? res.adjustments : []);
+      })
+      .catch(() => {})
+      .finally(() => setLoadingLedger(false));
+  };
+
   const loadOverview = () => {
-    if (!token || user?.role !== 'admin') return;
+    if (!authenticated || !isConsoleUser) return;
     setError('');
     setLoadingOverview(true);
     apiFetch<AdminOverviewData>('/admin/overview')
@@ -404,8 +505,36 @@ export const AdminDashboard: React.FC = () => {
 
   useEffect(() => {
     loadOverview();
-    loadCommissions();
-  }, [token, user?.role]);
+    if (isOwner) {
+      loadCommissions();
+      loadLedger();
+    }
+  }, [authenticated, user?.role]);
+
+  const openSynchronizedAdjustmentModal = async (acc: AdminConnectedAccount) => {
+    setSyncModalAccount(acc);
+    setSyncLoading(true);
+    setSyncPreview(null);
+    setSyncError('');
+    setAdjDelta('');
+    setAdjReason('');
+    setAdjNote('');
+    setAdjIdempotencyKey(newIdempotencyKey());
+    setAdjAllowRealOverlay(false);
+
+    try {
+      const preview = await apiFetch<SyncedAccountPreview>(`/owner/accounts/${acc.id}/sync-for-adjustment`, {
+        method: 'POST'
+      });
+      setSyncPreview(preview);
+      loadOverview();
+      refreshDerivAccounts(false);
+    } catch (err) {
+      setSyncError((err as Error).message || 'Live Deriv synchronization failed');
+    } finally {
+      setSyncLoading(false);
+    }
+  };
 
   const handleAdminAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -413,7 +542,7 @@ export const AdminDashboard: React.FC = () => {
     setAuthSubmitting(true);
     try {
       const endpoint = adminInitialized ? '/admin/login' : '/admin/bootstrap';
-      const res = await apiFetch<{ token: string; user: UserProfile }>(endpoint, {
+      const res = await apiFetch<{ authenticated: boolean; user: UserProfile }>(endpoint, {
         method: 'POST',
         body: JSON.stringify({
           email: loginEmail,
@@ -421,7 +550,7 @@ export const AdminDashboard: React.FC = () => {
           ...(adminInitialized ? {} : { fullName })
         })
       });
-      setSession(res.token, res.user);
+      setSession(res.user);
       setAdminInitialized(true);
     } catch (err) {
       setError((err as Error).message);
@@ -430,19 +559,19 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
-  const handleExitAdmin = (signOutCompletely: boolean) => {
+  const handleExitAdmin = async (signOutCompletely: boolean) => {
     try {
       sessionStorage.removeItem('pf_secret_console');
     } catch {
       // ignore
     }
     if (signOutCompletely) {
-      logout();
+      await logout();
     }
     navigate('/');
   };
 
-  if (!token || user?.role !== 'admin') {
+  if (!authenticated || !isConsoleUser) {
     return (
       <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4">
         <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 space-y-4 shadow-2xl">
@@ -453,8 +582,8 @@ export const AdminDashboard: React.FC = () => {
                 {!bootstrapChecked
                   ? 'Checking Database Setup...'
                   : adminInitialized
-                    ? 'Pipflowtrades Owner Console'
-                    : 'Initialize Owner Account'}
+                    ? 'Pipflowtrade.site Console'
+                    : 'Initialize Platform Owner'}
               </span>
             </div>
             <button type="button" onClick={() => navigate('/')} className="text-xs text-slate-400 hover:text-white">
@@ -465,8 +594,8 @@ export const AdminDashboard: React.FC = () => {
             {!bootstrapChecked
               ? 'Verifying PostgreSQL owner configuration...'
               : adminInitialized
-                ? 'Sign in with your PostgreSQL owner/administrator credentials to manage live Deriv commissions, users, bots, and orders.'
-                : 'No administrator exists yet. Set your platform owner email and password below to initialize the console.'}
+                ? 'Sign in with your Platform Owner or Operations Admin credentials. Financial adjustments and global settings remain restricted to OWNER.'
+                : 'No Platform Owner exists yet. Set the Platform Owner email and password below to initialize the console.'}
           </p>
           {error && (
             <div className="rounded-lg bg-rose-950/60 border border-rose-700 px-3 py-2 text-xs text-rose-300">
@@ -487,7 +616,7 @@ export const AdminDashboard: React.FC = () => {
               type="email"
               value={loginEmail}
               onChange={(e) => setLoginEmail(e.target.value)}
-              placeholder="Owner Email"
+              placeholder="Owner / Admin Email"
               className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm"
               required
             />
@@ -535,15 +664,25 @@ export const AdminDashboard: React.FC = () => {
   const realCount = accountsList.filter((a) => a.account_type === 'real' && a.connection_status === 'connected').length;
   const demoCount = accountsList.filter((a) => a.account_type === 'demo' && a.connection_status === 'connected').length;
 
-  const navItems: Array<{ id: AdminSectionTab; label: string; icon: React.FC<{ className?: string }> }> = [
-    { id: 'commissions', label: 'Commissions & Markup', icon: DollarSign },
-    { id: 'connections', label: 'Deriv Accounts', icon: Link2 },
-    { id: 'users', label: 'Users CRUD', icon: Users },
+  const allNavItems: Array<{
+    id: AdminSectionTab;
+    label: string;
+    icon: React.FC<{ className?: string }>;
+    ownerOnly?: boolean;
+  }> = [
+    { id: 'commissions', label: 'Commissions & Markup', icon: DollarSign, ownerOnly: true },
+    { id: 'connections', label: 'Deriv Accounts (Real/Demo)', icon: Link2 },
+    { id: 'ledger', label: 'Balance Ledger', icon: History, ownerOnly: true },
+    { id: 'users', label: 'Users & Sessions', icon: Users },
     { id: 'strategies', label: 'Bots & Strategies', icon: Bot },
     { id: 'orders', label: 'Orders & Trades', icon: Activity },
     { id: 'settings', label: 'Site & Announcements', icon: Sliders },
     { id: 'logs', label: 'Audit & Security', icon: FileText }
   ];
+  const navItems = allNavItems.filter((item) => !item.ownerOnly || isOwner);
+
+  const realAccountsList = accountsList.filter((a) => a.account_type === 'real');
+  const demoAccountsList = accountsList.filter((a) => a.account_type !== 'real');
 
   const SidebarContent = (
     <div className="flex flex-col h-full justify-between p-4 bg-slate-900 text-white">
@@ -551,7 +690,7 @@ export const AdminDashboard: React.FC = () => {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 font-black text-sm tracking-tight">
             <Shield className="w-5 h-5 text-sky-400" />
-            <span>Pipflow Owner</span>
+            <span>{isOwner ? 'Pipflow Owner' : 'Pipflow Ops Admin'}</span>
           </div>
           <button type="button" onClick={() => setDrawerOpen(false)} className="lg:hidden text-slate-400">
             <X className="w-5 h-5" />
@@ -585,7 +724,16 @@ export const AdminDashboard: React.FC = () => {
       </div>
 
       <div className="space-y-2 border-t border-slate-800 pt-4 text-xs">
-        <div className="px-2 text-[11px] text-slate-400 truncate">{data?.adminAccount?.email ?? user.email}</div>
+        <div className="px-2 flex items-center justify-between gap-2">
+          <span className="text-[11px] text-slate-400 truncate">{data?.adminAccount?.email ?? user.email}</span>
+          <span
+            className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+              isOwner ? 'bg-amber-500/20 text-amber-300' : 'bg-sky-500/20 text-sky-300'
+            }`}
+          >
+            {user.role}
+          </span>
+        </div>
         <button
           type="button"
           onClick={() => handleExitAdmin(false)}
@@ -598,7 +746,7 @@ export const AdminDashboard: React.FC = () => {
           onClick={() => handleExitAdmin(true)}
           className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 font-semibold"
         >
-          <LogOut className="w-3.5 h-3.5" /> Sign Out Owner
+          <LogOut className="w-3.5 h-3.5" /> Sign Out Console
         </button>
       </div>
     </div>
@@ -651,9 +799,12 @@ export const AdminDashboard: React.FC = () => {
               type="button"
               onClick={() => {
                 loadOverview();
-                loadCommissions();
+                if (isOwner) {
+                  loadCommissions();
+                  loadLedger();
+                }
               }}
-              disabled={loadingOverview || loadingComm}
+              disabled={loadingOverview || loadingComm || loadingLedger}
               className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-slate-100 dark:hover:bg-slate-800"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loadingOverview || loadingComm ? 'animate-spin' : ''}`} />
@@ -746,8 +897,8 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
 
-          {/* TAB 1: DERIV APP MARKUP & AFFILIATE COMMISSIONS */}
-          {activeSection === 'commissions' && (
+          {/* TAB 1: DERIV APP MARKUP & AFFILIATE COMMISSIONS (OWNER EXCLUSIVE) */}
+          {activeSection === 'commissions' && isOwner && (
             <div className="space-y-4">
               {/* Commission Setup & Status Checklist */}
               <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
@@ -1186,205 +1337,374 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
 
-          {/* TAB 2: DERIV CONNECTED ACCOUNTS CRUD */}
+          {/* TAB 2: DERIV CONNECTED ACCOUNTS (SEPARATED REAL & DEMO + 8-STEP SYNCHRONIZED ADJUSTMENTS) */}
           {activeSection === 'connections' && (
+            <div className="space-y-4">
+              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-bold text-sm sm:text-base">Manage Deriv Connections (REAL vs DEMO Separated)</h2>
+                    <p className="text-xs text-slate-500">
+                      Actual broker-reported balances are synced directly from Deriv and never overwritten. Platform-side
+                      adjustments (Owner-only) require live 8-step Deriv synchronization and append to the immutable ledger.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setError('');
+                      try {
+                        const res = await apiFetch<{ url: string }>('/deriv/oauth-url');
+                        window.location.href = res.url;
+                      } catch (err) {
+                        setError((err as Error).message);
+                      }
+                    }}
+                    className="px-3.5 py-2 rounded-lg bg-[#ff444f] hover:bg-rose-600 text-white text-xs font-bold shrink-0"
+                  >
+                    Connect via Deriv OAuth2
+                  </button>
+                </div>
+
+                {isOwner && (
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      setError('');
+                      setConnectBusy(true);
+                      try {
+                        const res = await apiFetch<{ primaryLoginId: string; count: number }>(
+                          '/admin/connected-accounts/connect',
+                          {
+                            method: 'POST',
+                            body: JSON.stringify({
+                              userId: connectTargetUserId || undefined,
+                              apiToken: connectApiToken
+                            })
+                          }
+                        );
+                        setConnectApiToken('');
+                        setNotice(`Connected ${res.count} Deriv account(s) (Primary: ${res.primaryLoginId}).`);
+                        refreshDerivAccounts(false);
+                        loadOverview();
+                      } catch (err) {
+                        setError((err as Error).message);
+                      } finally {
+                        setConnectBusy(false);
+                      }
+                    }}
+                    className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 bg-slate-50 dark:bg-slate-950/60 p-3 rounded-xl border border-slate-200 dark:border-slate-800"
+                  >
+                    <select
+                      value={connectTargetUserId}
+                      onChange={(e) => setConnectTargetUserId(e.target.value)}
+                      className="sm:col-span-4 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs"
+                    >
+                      <option value="">Owner Account ({user.email})</option>
+                      {usersList.map((u) => (
+                        <option key={u.id} value={u.id}>
+                          {u.email}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="password"
+                      value={connectApiToken}
+                      onChange={(e) => setConnectApiToken(e.target.value)}
+                      placeholder="Deriv API token (Read + Trade)..."
+                      className="sm:col-span-5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                      required
+                    />
+                    <button
+                      type="submit"
+                      disabled={connectBusy}
+                      className="sm:col-span-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-bold"
+                    >
+                      {connectBusy ? 'Linking...' : 'Link Deriv Token'}
+                    </button>
+                  </form>
+                )}
+              </div>
+
+              {[
+                {
+                  key: 'real',
+                  title: 'REAL Connected Deriv Accounts',
+                  subtitle:
+                    'REAL accounts default to Exact Broker Balance Equality (last_known_balance) unless Owner explicitly enables a platform overlay.',
+                  rows: realAccountsList,
+                  accent: 'border-emerald-500/40'
+                },
+                {
+                  key: 'demo',
+                  title: 'DEMO Connected Deriv Accounts',
+                  subtitle: 'Virtual practice accounts connected via Deriv.',
+                  rows: demoAccountsList,
+                  accent: 'border-sky-500/30'
+                }
+              ].map((panel) => (
+                <div
+                  key={panel.key}
+                  className={`bg-white dark:bg-slate-900 border ${panel.accent} rounded-2xl p-4 sm:p-5 space-y-3`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="font-bold text-sm">{panel.title} ({panel.rows.length})</h3>
+                      <p className="text-[11px] text-slate-500">{panel.subtitle}</p>
+                    </div>
+                  </div>
+                  <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
+                    {panel.rows.length === 0 ? (
+                      <div className="py-6 text-center text-slate-400">
+                        No {panel.key.toUpperCase()} Deriv accounts connected yet.
+                      </div>
+                    ) : (
+                      panel.rows.map((a) => {
+                        const canTrade = a.granted_scopes?.includes('trade');
+                        const brokerBal = Number(a.last_known_balance ?? 0);
+                        const adjBal = Number(a.platform_adjustment_balance ?? 0);
+                        const dispBal = Number(a.displayed_balance ?? brokerBal);
+                        const exactOnly = Boolean(a.exact_broker_balance_only ?? true);
+                        return (
+                          <div key={a.id} className="py-3.5 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                            <div className="space-y-1 min-w-0">
+                              <div className="font-mono font-bold flex flex-wrap items-center gap-2">
+                                <span>{a.deriv_login_id}</span>
+                                <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[10px] uppercase">
+                                  {a.account_type}
+                                </span>
+                                <span className={canTrade ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600'}>
+                                  {canTrade ? 'Read + Trade' : 'Read-Only'}
+                                </span>
+                                {a.account_type === 'real' && (
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-sans font-semibold ${
+                                      exactOnly
+                                        ? 'bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
+                                        : 'bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300'
+                                    }`}
+                                  >
+                                    {exactOnly ? 'Exact Broker Mode' : 'Overlay Active'}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-slate-500 truncate">
+                                {a.user_email} · Status: {a.connection_status} · Last Synced:{' '}
+                                {a.last_synced_at ? new Date(a.last_synced_at).toLocaleString() : 'Never'}
+                              </div>
+                              <div className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] pt-0.5">
+                                <span>
+                                  Broker:{' '}
+                                  <strong className="text-slate-800 dark:text-slate-200">
+                                    {brokerBal.toFixed(2)} {a.currency}
+                                  </strong>
+                                </span>
+                                <span>
+                                  Platform Adj (Non-Deriv):{' '}
+                                  <strong className={adjBal === 0 ? 'text-slate-400' : 'text-amber-600'}>
+                                    {adjBal >= 0 ? '+' : ''}
+                                    {adjBal.toFixed(2)} {a.currency}
+                                  </strong>
+                                </span>
+                                <span>
+                                  Displayed:{' '}
+                                  <strong className="text-blue-600 dark:text-sky-400">
+                                    {dispBal.toFixed(2)} {a.currency}
+                                  </strong>
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                              {isOwner && (
+                                <button
+                                  type="button"
+                                  onClick={() => openSynchronizedAdjustmentModal(a)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+                                >
+                                  Sync &amp; Platform Adjust
+                                </button>
+                              )}
+                              {isOwner && a.account_type === 'real' && (
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    setError('');
+                                    try {
+                                      await apiFetch(`/owner/accounts/${a.id}/exact-mode`, {
+                                        method: 'POST',
+                                        body: JSON.stringify({ exactBrokerBalanceOnly: !exactOnly })
+                                      });
+                                      setNotice(
+                                        `${a.deriv_login_id} set to ${!exactOnly ? 'Exact Broker Balance Equality' : 'Platform Overlay Mode'}.`
+                                      );
+                                      loadOverview();
+                                      refreshDerivAccounts(false);
+                                    } catch (err) {
+                                      setError((err as Error).message);
+                                    }
+                                  }}
+                                  className="px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 font-semibold"
+                                >
+                                  {exactOnly ? 'Enable Overlay' : 'Enforce Exact'}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  setError('');
+                                  try {
+                                    await apiFetch(`/admin/connected-accounts/${a.id}/sync`, { method: 'POST' });
+                                    setNotice(`Synced ${a.deriv_login_id} live from Deriv.`);
+                                    refreshDerivAccounts(false);
+                                    loadOverview();
+                                  } catch (err) {
+                                    setError((err as Error).message);
+                                  }
+                                }}
+                                className="px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sky-600 font-semibold"
+                              >
+                                Sync
+                              </button>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  setError('');
+                                  try {
+                                    await apiFetch(`/admin/connected-accounts/${a.id}/revoke`, { method: 'POST' });
+                                    setNotice(`Revoked ${a.deriv_login_id}.`);
+                                    loadOverview();
+                                  } catch (err) {
+                                    setError((err as Error).message);
+                                  }
+                                }}
+                                className="px-2 py-1.5 rounded-lg border border-amber-200 dark:border-amber-900 text-amber-600 font-semibold"
+                              >
+                                Revoke
+                              </button>
+                              {isOwner && (
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    setError('');
+                                    try {
+                                      await apiFetch(`/admin/connected-accounts/${a.id}`, { method: 'DELETE' });
+                                      setNotice(`Deleted ${a.deriv_login_id}.`);
+                                      loadOverview();
+                                    } catch (err) {
+                                      setError((err as Error).message);
+                                    }
+                                  }}
+                                  className="px-2 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900 text-rose-600 font-semibold"
+                                >
+                                  Delete
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* TAB: IMMUTABLE PLATFORM BALANCE LEDGER (OWNER EXCLUSIVE) */}
+          {activeSection === 'ledger' && isOwner && (
             <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <h2 className="font-bold text-sm sm:text-base">Manage Deriv Connections</h2>
+                  <h2 className="font-bold text-sm sm:text-base flex items-center gap-2">
+                    <History className="w-4 h-4 text-sky-600" />
+                    <span>Immutable Platform Balance Adjustment Ledger ({adjustmentsList.length})</span>
+                  </h2>
                   <p className="text-xs text-slate-500">
-                    Connect user accounts via Official OAuth2 or API Token, sync balances, revoke tokens, or delete links.
+                    Append-only audit trail of synchronized platform-side adjustments across VIRTUAL, DEMO, and REAL
+                    accounts. Broker-reported balances are never altered and no Deriv transactions are fabricated.
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={async () => {
-                    setError('');
-                    try {
-                      const res = await apiFetch<{ url: string }>('/deriv/oauth-url');
-                      window.location.href = res.url;
-                    } catch (err) {
-                      setError((err as Error).message);
-                    }
-                  }}
-                  className="px-3.5 py-2 rounded-lg bg-[#ff444f] hover:bg-rose-600 text-white text-xs font-bold shrink-0"
+                  onClick={loadLedger}
+                  disabled={loadingLedger}
+                  className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold"
                 >
-                  Connect via Deriv OAuth2
+                  {loadingLedger ? 'Refreshing...' : 'Refresh Ledger'}
                 </button>
               </div>
-
-              <form
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  setError('');
-                  setConnectBusy(true);
-                  try {
-                    const res = await apiFetch<{ primaryLoginId: string; count: number }>(
-                      '/admin/connected-accounts/connect',
-                      {
-                        method: 'POST',
-                        body: JSON.stringify({
-                          userId: connectTargetUserId || undefined,
-                          apiToken: connectApiToken
-                        })
-                      }
-                    );
-                    setConnectApiToken('');
-                    setNotice(`Connected ${res.count} Deriv account(s) (Primary: ${res.primaryLoginId}).`);
-                    refreshDerivAccounts(false);
-                    loadOverview();
-                  } catch (err) {
-                    setError((err as Error).message);
-                  } finally {
-                    setConnectBusy(false);
-                  }
-                }}
-                className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 bg-slate-50 dark:bg-slate-950/60 p-3 rounded-xl border border-slate-200 dark:border-slate-800"
-              >
-                <select
-                  value={connectTargetUserId}
-                  onChange={(e) => setConnectTargetUserId(e.target.value)}
-                  className="sm:col-span-4 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs"
-                >
-                  <option value="">Owner Account ({user.email})</option>
-                  {usersList.map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.email}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  type="password"
-                  value={connectApiToken}
-                  onChange={(e) => setConnectApiToken(e.target.value)}
-                  placeholder="Deriv API token (Read + Trade)..."
-                  className="sm:col-span-5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-                  required
-                />
-                <button
-                  type="submit"
-                  disabled={connectBusy}
-                  className="sm:col-span-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-bold"
-                >
-                  {connectBusy ? 'Linking...' : 'Link Deriv Token'}
-                </button>
-              </form>
-
-              <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
-                {accountsList.length === 0 ? (
-                  <div className="py-8 text-center text-slate-400">No Deriv accounts connected yet.</div>
-                ) : (
-                  accountsList.map((a) => {
-                    const canTrade = a.granted_scopes?.includes('trade');
-                    return (
-                      <div key={a.id} className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                        <div className="space-y-0.5 min-w-0">
-                          <div className="font-mono font-bold flex flex-wrap items-center gap-2">
-                            <span>{a.deriv_login_id}</span>
-                            <span className="text-[10px] uppercase text-slate-500">({a.account_type})</span>
-                            <span className={canTrade ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600'}>
-                              {canTrade ? 'Read + Trade' : 'Read-Only'}
-                            </span>
-                            {a.balance_locked_by_admin && (
-                              <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 text-[10px] font-sans font-semibold">
-                                DB Locked
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-slate-500 truncate">
-                            {a.user_email} · {a.connection_status}
-                          </div>
-                        </div>
-
-                        <div className="flex flex-wrap items-center sm:justify-end gap-2 font-mono">
-                          {editingAccId === a.id ? (
-                            <div className="flex items-center gap-1.5">
-                              <input
-                                type="number"
-                                value={editAccBalanceVal}
-                                onChange={(e) => setEditAccBalanceVal(e.target.value)}
-                                className="w-24 border border-slate-300 dark:border-slate-700 rounded px-2 py-1 text-xs bg-transparent"
-                              />
-                              <button
-                                type="button"
-                                onClick={async () => {
-                                  await apiFetch(`/admin/connected-accounts/${a.id}/balance`, {
-                                    method: 'PATCH',
-                                    body: JSON.stringify({ balance: Number(editAccBalanceVal) })
-                                  });
-                                  setEditingAccId(null);
-                                  refreshDerivAccounts(false);
-                                  loadOverview();
-                                }}
-                                className="px-2 py-1 rounded bg-emerald-600 text-white font-sans font-bold"
-                              >
-                                Save
-                              </button>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
+                      <th className="py-2">Recorded / Synced</th>
+                      <th>Trader / Account</th>
+                      <th>Scope</th>
+                      <th className="text-right">Broker at Sync</th>
+                      <th className="text-right">Delta</th>
+                      <th className="text-right">Resulting Displayed</th>
+                      <th>Reason &amp; Owner</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {adjustmentsList.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} className="py-8 text-center text-slate-400">
+                          No platform-side balance adjustments have been recorded yet.
+                        </td>
+                      </tr>
+                    ) : (
+                      adjustmentsList.map((row) => (
+                        <tr key={row.id}>
+                          <td className="py-2.5 font-mono text-[11px] whitespace-nowrap">
+                            <div>{new Date(row.created_at).toLocaleString()}</div>
+                            <div className="text-[10px] text-slate-400">
+                              Sync: {new Date(row.sync_timestamp).toLocaleString()}
                             </div>
-                          ) : (
-                            <span className="font-bold tabular-nums mr-2">
-                              {Number(a.last_known_balance).toFixed(2)} {a.currency}
+                          </td>
+                          <td className="py-2.5">
+                            <div className="font-semibold">{row.user_email || row.user_id}</div>
+                            <div className="font-mono text-[10px] text-slate-400">
+                              {row.deriv_login_id || 'Virtual Workspace'} · key: {row.idempotency_key.slice(0, 14)}…
+                            </div>
+                          </td>
+                          <td>
+                            <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 font-mono text-[10px] uppercase">
+                              {row.account_scope}
                             </span>
-                          )}
-
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setEditingAccId(a.id);
-                              setEditAccBalanceVal(String(a.last_known_balance));
-                            }}
-                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 text-blue-600 font-sans font-semibold"
+                          </td>
+                          <td className="text-right font-mono tabular-nums">
+                            {Number(row.broker_balance_at_sync).toFixed(2)} {row.currency}
+                          </td>
+                          <td
+                            className={`text-right font-mono font-bold tabular-nums ${
+                              Number(row.adjustment_delta) >= 0 ? 'text-emerald-600' : 'text-rose-600'
+                            }`}
                           >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              try {
-                                await apiFetch(`/admin/connected-accounts/${a.id}/sync`, { method: 'POST' });
-                                setNotice(`Synced ${a.deriv_login_id} from Deriv.`);
-                                refreshDerivAccounts(false);
-                                loadOverview();
-                              } catch (err) {
-                                setError((err as Error).message);
-                              }
-                            }}
-                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 text-sky-600 font-sans font-semibold"
-                          >
-                            Sync
-                          </button>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              await apiFetch(`/admin/connected-accounts/${a.id}/revoke`, { method: 'POST' });
-                              setNotice(`Revoked ${a.deriv_login_id}.`);
-                              loadOverview();
-                            }}
-                            className="px-2 py-1 rounded border border-amber-200 dark:border-amber-900 text-amber-600 font-sans font-semibold"
-                          >
-                            Revoke
-                          </button>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              await apiFetch(`/admin/connected-accounts/${a.id}`, { method: 'DELETE' });
-                              setNotice(`Deleted ${a.deriv_login_id}.`);
-                              loadOverview();
-                            }}
-                            className="px-2 py-1 rounded border border-rose-200 dark:border-rose-900 text-rose-600 font-sans font-semibold"
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })
-                )}
+                            {Number(row.adjustment_delta) >= 0 ? '+' : ''}
+                            {Number(row.adjustment_delta).toFixed(2)} {row.currency}
+                          </td>
+                          <td className="text-right font-mono font-bold tabular-nums">
+                            {Number(row.resulting_displayed_balance).toFixed(2)} {row.currency}
+                          </td>
+                          <td className="max-w-xs">
+                            <div className="font-semibold truncate">{row.reason}</div>
+                            <div className="text-[10px] text-slate-400 truncate">
+                              By {row.owner_email || 'Owner'}
+                              {row.note ? ` · ${row.note}` : ''}
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
           )}
 
-          {/* TAB 3: USERS FULL CRUD */}
+          {/* TAB 3: USERS CRUD & SESSION REVOCATION */}
           {activeSection === 'users' && (
             <div className="space-y-4">
               {/* Create User Form */}
@@ -1435,20 +1755,22 @@ export const AdminDashboard: React.FC = () => {
                 <input
                   type="password"
                   required
-                  minLength={6}
+                  minLength={8}
                   value={newUserPassword}
                   onChange={(e) => setNewUserPassword(e.target.value)}
-                  placeholder="Password (min 6)"
+                  placeholder="Password (min 8)"
                   className="rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2.5 py-2"
                 />
                 <div className="flex gap-1.5">
                   <select
                     value={newUserRole}
-                    onChange={(e) => setNewUserRole(e.target.value as 'trader' | 'admin')}
+                    onChange={(e) => setNewUserRole(e.target.value as 'user' | 'trader' | 'admin' | 'owner')}
                     className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-2"
                   >
                     <option value="trader">Trader</option>
-                    <option value="admin">Admin</option>
+                    <option value="user">User</option>
+                    {isOwner && <option value="admin">Admin</option>}
+                    {isOwner && <option value="owner">Owner</option>}
                   </select>
                   <input
                     type="number"
@@ -1485,143 +1807,203 @@ export const AdminDashboard: React.FC = () => {
                         <th>Role</th>
                         <th>Virtual Balance</th>
                         <th>Status</th>
-                        <th className="text-right">CRUD Actions</th>
+                        <th className="text-right">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                      {filteredUsers.map((u) => (
-                        <tr key={u.id}>
-                          <td className="py-2.5">
-                            <div className="font-semibold">{u.email}</div>
-                            {editingUserId === u.id ? (
-                              <div className="mt-1 flex flex-wrap gap-1.5">
-                                <input
-                                  value={editUserName}
-                                  onChange={(e) => setEditUserName(e.target.value)}
-                                  placeholder="Full Name"
-                                  className="border rounded px-2 py-0.5 text-xs bg-transparent"
-                                />
-                                <input
-                                  type="password"
-                                  value={editUserPassword}
-                                  onChange={(e) => setEditUserPassword(e.target.value)}
-                                  placeholder="New password (optional)"
-                                  className="border rounded px-2 py-0.5 text-xs bg-transparent"
-                                />
+                      {filteredUsers.map((u) => {
+                        const targetIsOwner = u.role === 'owner';
+                        const canManageTarget = isOwner || !targetIsOwner;
+                        return (
+                          <tr key={u.id}>
+                            <td className="py-2.5">
+                              <div className="font-semibold">{u.email}</div>
+                              {editingUserId === u.id ? (
+                                <div className="mt-1 flex flex-wrap gap-1.5">
+                                  <input
+                                    value={editUserName}
+                                    onChange={(e) => setEditUserName(e.target.value)}
+                                    placeholder="Full Name"
+                                    className="border rounded px-2 py-0.5 text-xs bg-transparent"
+                                  />
+                                  <input
+                                    type="password"
+                                    value={editUserPassword}
+                                    onChange={(e) => setEditUserPassword(e.target.value)}
+                                    placeholder="New password (min 8, optional)"
+                                    className="border rounded px-2 py-0.5 text-xs bg-transparent"
+                                  />
+                                </div>
+                              ) : (
+                                <div className="text-[11px] text-slate-400">{u.full_name}</div>
+                              )}
+                            </td>
+                            <td className="uppercase text-[11px] font-semibold">
+                              {editingUserId === u.id && isOwner ? (
+                                <select
+                                  value={editUserRole}
+                                  onChange={(e) =>
+                                    setEditUserRole(e.target.value as 'user' | 'trader' | 'admin' | 'owner')
+                                  }
+                                  className="border rounded px-1.5 py-0.5 bg-white dark:bg-slate-900"
+                                >
+                                  <option value="user">user</option>
+                                  <option value="trader">trader</option>
+                                  <option value="admin">admin</option>
+                                  <option value="owner">owner</option>
+                                </select>
+                              ) : (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] ${
+                                    u.role === 'owner'
+                                      ? 'bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300'
+                                      : u.role === 'admin'
+                                        ? 'bg-sky-100 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300'
+                                        : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                                  }`}
+                                >
+                                  {u.role}
+                                </span>
+                              )}
+                            </td>
+                            <td className="font-mono tabular-nums">
+                              <div className="flex items-center gap-2">
+                                <span>${Number(u.virtual_workspace_balance).toFixed(2)}</span>
+                                {isOwner && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setVirtualAdjUser(u);
+                                      setVirtualAdjMode('delta');
+                                      setVirtualAdjVal('');
+                                      setVirtualAdjReason('');
+                                      setVirtualAdjNote('');
+                                      setVirtualAdjKey(newIdempotencyKey());
+                                    }}
+                                    className="font-sans text-[11px] text-sky-600 hover:underline font-semibold"
+                                  >
+                                    Adjust
+                                  </button>
+                                )}
                               </div>
-                            ) : (
-                              <div className="text-[11px] text-slate-400">{u.full_name}</div>
-                            )}
-                          </td>
-                          <td className="uppercase text-[11px] font-semibold">
-                            {editingUserId === u.id ? (
-                              <select
-                                value={editUserRole}
-                                onChange={(e) => setEditUserRole(e.target.value as 'trader' | 'admin')}
-                                className="border rounded px-1.5 py-0.5 bg-white dark:bg-slate-900"
-                              >
-                                <option value="trader">trader</option>
-                                <option value="admin">admin</option>
-                              </select>
-                            ) : (
-                              u.role
-                            )}
-                          </td>
-                          <td className="font-mono tabular-nums">
-                            {editingUserId === u.id ? (
-                              <input
-                                type="number"
-                                value={editUserBalance}
-                                onChange={(e) => setEditUserBalance(e.target.value)}
-                                className="w-24 border rounded px-1.5 py-0.5 text-xs bg-transparent"
-                              />
-                            ) : (
-                              `$${Number(u.virtual_workspace_balance).toFixed(2)}`
-                            )}
-                          </td>
-                          <td>{u.is_active ? 'Active' : 'Suspended'}</td>
-                          <td className="text-right space-x-2">
-                            {editingUserId === u.id ? (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={async () => {
-                                    await apiFetch(`/admin/users/${u.id}`, {
-                                      method: 'PATCH',
-                                      body: JSON.stringify({
-                                        fullName: editUserName,
-                                        role: editUserRole,
-                                        virtualBalance: Number(editUserBalance),
-                                        ...(editUserPassword.length >= 6 ? { newPassword: editUserPassword } : {})
-                                      })
-                                    });
-                                    setEditingUserId(null);
-                                    setEditUserPassword('');
-                                    setNotice(`Updated user ${u.email}.`);
-                                    refreshProfile();
-                                    loadOverview();
-                                  }}
-                                  className="px-2 py-1 rounded bg-emerald-600 text-white font-bold"
-                                >
-                                  Save
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setEditingUserId(null);
-                                    setEditUserPassword('');
-                                  }}
-                                  className="px-2 py-1 rounded border border-slate-300"
-                                >
-                                  Cancel
-                                </button>
-                              </>
-                            ) : (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setEditingUserId(u.id);
-                                    setEditUserName(u.full_name || '');
-                                    setEditUserBalance(String(u.virtual_workspace_balance));
-                                    setEditUserRole(u.role);
-                                    setEditUserPassword('');
-                                  }}
-                                  className="text-blue-600 font-semibold hover:underline inline-flex items-center gap-0.5"
-                                >
-                                  <Edit3 className="w-3 h-3" /> Edit
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={async () => {
-                                    await apiFetch(`/admin/users/${u.id}/status`, {
-                                      method: 'PATCH',
-                                      body: JSON.stringify({ isActive: !u.is_active })
-                                    });
-                                    loadOverview();
-                                  }}
-                                  className="text-amber-600 font-semibold hover:underline"
-                                >
-                                  {u.is_active ? 'Suspend' : 'Activate'}
-                                </button>
-                                {u.id !== user.id && (
+                            </td>
+                            <td>{u.is_active ? 'Active' : 'Suspended'}</td>
+                            <td className="text-right space-x-2 whitespace-nowrap">
+                              {editingUserId === u.id ? (
+                                <>
                                   <button
                                     type="button"
                                     onClick={async () => {
-                                      await apiFetch(`/admin/users/${u.id}`, { method: 'DELETE' });
-                                      setNotice(`Deleted user ${u.email}.`);
-                                      loadOverview();
+                                      setError('');
+                                      try {
+                                        await apiFetch(`/admin/users/${u.id}`, {
+                                          method: 'PATCH',
+                                          body: JSON.stringify({
+                                            fullName: editUserName,
+                                            ...(isOwner ? { role: editUserRole } : {}),
+                                            ...(editUserPassword.length >= 8 ? { newPassword: editUserPassword } : {})
+                                          })
+                                        });
+                                        setEditingUserId(null);
+                                        setEditUserPassword('');
+                                        setNotice(`Updated user ${u.email}.`);
+                                        refreshProfile();
+                                        loadOverview();
+                                      } catch (err) {
+                                        setError((err as Error).message);
+                                      }
                                     }}
-                                    className="text-rose-600 font-semibold hover:underline inline-flex items-center gap-0.5"
+                                    className="px-2 py-1 rounded bg-emerald-600 text-white font-bold"
                                   >
-                                    <Trash2 className="w-3 h-3" /> Delete
+                                    Save
                                   </button>
-                                )}
-                              </>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingUserId(null);
+                                      setEditUserPassword('');
+                                    }}
+                                    className="px-2 py-1 rounded border border-slate-300"
+                                  >
+                                    Cancel
+                                  </button>
+                                </>
+                              ) : canManageTarget ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingUserId(u.id);
+                                      setEditUserName(u.full_name || '');
+                                      setEditUserRole(u.role);
+                                      setEditUserPassword('');
+                                    }}
+                                    className="text-blue-600 font-semibold hover:underline inline-flex items-center gap-0.5"
+                                  >
+                                    <Edit3 className="w-3 h-3" /> Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      setError('');
+                                      try {
+                                        await apiFetch(`/admin/users/${u.id}/revoke-sessions`, { method: 'POST' });
+                                        setNotice(`All active sessions revoked for ${u.email}.`);
+                                        loadOverview();
+                                      } catch (err) {
+                                        setError((err as Error).message);
+                                      }
+                                    }}
+                                    className="text-violet-600 font-semibold hover:underline inline-flex items-center gap-0.5"
+                                  >
+                                    <PowerOff className="w-3 h-3" /> Revoke Sessions
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      setError('');
+                                      try {
+                                        await apiFetch(`/admin/users/${u.id}/status`, {
+                                          method: 'PATCH',
+                                          body: JSON.stringify({ isActive: !u.is_active })
+                                        });
+                                        loadOverview();
+                                      } catch (err) {
+                                        setError((err as Error).message);
+                                      }
+                                    }}
+                                    className="text-amber-600 font-semibold hover:underline"
+                                  >
+                                    {u.is_active ? 'Suspend' : 'Activate'}
+                                  </button>
+                                  {isOwner && u.id !== user.id && (
+                                    <button
+                                      type="button"
+                                      onClick={async () => {
+                                        setError('');
+                                        try {
+                                          await apiFetch(`/admin/users/${u.id}`, { method: 'DELETE' });
+                                          setNotice(`Deleted user ${u.email}.`);
+                                          loadOverview();
+                                        } catch (err) {
+                                          setError((err as Error).message);
+                                        }
+                                      }}
+                                      className="text-rose-600 font-semibold hover:underline inline-flex items-center gap-0.5"
+                                    >
+                                      <Trash2 className="w-3 h-3" /> Delete
+                                    </button>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="text-[11px] text-slate-400 inline-flex items-center gap-1">
+                                  <Lock className="w-3 h-3" /> Owner Protected
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -1907,133 +2289,139 @@ export const AdminDashboard: React.FC = () => {
           {/* TAB 6: SITE SETTINGS, BRANDING & ANNOUNCEMENTS */}
           {activeSection === 'settings' && (
             <div className="grid sm:grid-cols-2 gap-4">
-              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-2.5">
-                <h2 className="font-bold text-sm flex items-center gap-2">
-                  <KeyRound className="w-4 h-4 text-sky-600" /> Owner Email &amp; Password
-                </h2>
-                <input
-                  type="email"
-                  value={adminEmailInput}
-                  onChange={(e) => setAdminEmailInput(e.target.value)}
-                  placeholder="Admin Email"
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
-                />
-                <input
-                  type="password"
-                  value={adminPwdInput}
-                  onChange={(e) => setAdminPwdInput(e.target.value)}
-                  placeholder="New Admin Password (min 8 chars, optional)"
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
-                />
-                <button
-                  type="button"
-                  onClick={async () => {
-                    setError('');
-                    try {
-                      const res = await apiFetch<{ token: string; user: UserProfile }>(
-                        '/admin/settings/admin-credentials',
-                        {
-                          method: 'PUT',
-                          body: JSON.stringify({
-                            newEmail: adminEmailInput,
-                            ...(adminPwdInput ? { newPassword: adminPwdInput } : {})
-                          })
-                        }
-                      );
-                      setSession(res.token, res.user);
-                      setAdminPwdInput('');
-                      setNotice('Owner credentials updated.');
-                      loadOverview();
-                    } catch (err) {
-                      setError((err as Error).message);
-                    }
-                  }}
-                  className="w-full py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold"
-                >
-                  Update Credentials
-                </button>
-              </div>
+              {isOwner && (
+                <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-2.5">
+                  <h2 className="font-bold text-sm flex items-center gap-2">
+                    <KeyRound className="w-4 h-4 text-sky-600" /> Owner Email &amp; Password
+                  </h2>
+                  <input
+                    type="email"
+                    value={adminEmailInput}
+                    onChange={(e) => setAdminEmailInput(e.target.value)}
+                    placeholder="Owner Email"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
+                  />
+                  <input
+                    type="password"
+                    value={adminPwdInput}
+                    onChange={(e) => setAdminPwdInput(e.target.value)}
+                    placeholder="New Owner Password (min 8 chars, optional)"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setError('');
+                      try {
+                        const res = await apiFetch<{ updated: boolean; user: UserProfile }>(
+                          '/admin/settings/admin-credentials',
+                          {
+                            method: 'PUT',
+                            body: JSON.stringify({
+                              newEmail: adminEmailInput,
+                              ...(adminPwdInput ? { newPassword: adminPwdInput } : {})
+                            })
+                          }
+                        );
+                        setSession(res.user);
+                        setAdminPwdInput('');
+                        setNotice('Owner credentials updated.');
+                        loadOverview();
+                      } catch (err) {
+                        setError((err as Error).message);
+                      }
+                    }}
+                    className="w-full py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold"
+                  >
+                    Update Credentials
+                  </button>
+                </div>
+              )}
 
-              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-3">
-                <h2 className="font-bold text-sm flex items-center gap-2">
-                  <Sliders className="w-4 h-4 text-blue-600" /> Global Site &amp; Registration Config
-                </h2>
-                <label className="flex items-center justify-between text-xs">
-                  <span>Allow New Registrations</span>
+              {isOwner && (
+                <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-3">
+                  <h2 className="font-bold text-sm flex items-center gap-2">
+                    <Sliders className="w-4 h-4 text-blue-600" /> Global Site &amp; Registration Config
+                  </h2>
+                  <label className="flex items-center justify-between text-xs">
+                    <span>Allow New Registrations</span>
+                    <input
+                      type="checkbox"
+                      checked={allowRegistration}
+                      onChange={(e) => setAllowRegistration(e.target.checked)}
+                      className="accent-blue-600"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between text-xs">
+                    <span>Maintenance Mode</span>
+                    <input
+                      type="checkbox"
+                      checked={maintenanceMode}
+                      onChange={(e) => setMaintenanceMode(e.target.checked)}
+                      className="accent-rose-600"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between text-xs">
+                    <span>Default Virtual Balance ($)</span>
+                    <input
+                      type="number"
+                      value={defaultVirtualBalance}
+                      onChange={(e) => setDefaultVirtualBalance(Number(e.target.value))}
+                      className="w-24 border rounded px-2 py-1 text-right font-mono bg-transparent"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await apiFetch('/admin/settings/global', {
+                        method: 'PUT',
+                        body: JSON.stringify({ maintenanceMode, allowRegistration, defaultVirtualBalance })
+                      });
+                      setNotice('Global platform settings saved.');
+                      loadOverview();
+                    }}
+                    className="w-full py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
+                  >
+                    Save Global Settings
+                  </button>
+                </div>
+              )}
+
+              {isOwner && (
+                <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-3">
+                  <h2 className="font-bold text-sm flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-emerald-600" /> Branding, Marquee Ticker &amp; KES Rate
+                  </h2>
                   <input
-                    type="checkbox"
-                    checked={allowRegistration}
-                    onChange={(e) => setAllowRegistration(e.target.checked)}
-                    className="accent-blue-600"
+                    value={tickerText}
+                    onChange={(e) => setTickerText(e.target.value)}
+                    placeholder="Marquee ticker text..."
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
                   />
-                </label>
-                <label className="flex items-center justify-between text-xs">
-                  <span>Maintenance Mode</span>
-                  <input
-                    type="checkbox"
-                    checked={maintenanceMode}
-                    onChange={(e) => setMaintenanceMode(e.target.checked)}
-                    className="accent-rose-600"
-                  />
-                </label>
-                <label className="flex items-center justify-between text-xs">
-                  <span>Default Virtual Balance ($)</span>
                   <input
                     type="number"
-                    value={defaultVirtualBalance}
-                    onChange={(e) => setDefaultVirtualBalance(Number(e.target.value))}
-                    className="w-24 border rounded px-2 py-1 text-right font-mono bg-transparent"
+                    value={kesRate}
+                    onChange={(e) => setKesRate(Number(e.target.value))}
+                    placeholder="USD to KES Rate"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
                   />
-                </label>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await apiFetch('/admin/settings/global', {
-                      method: 'PUT',
-                      body: JSON.stringify({ maintenanceMode, allowRegistration, defaultVirtualBalance })
-                    });
-                    setNotice('Global platform settings saved.');
-                    loadOverview();
-                  }}
-                  className="w-full py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
-                >
-                  Save Global Settings
-                </button>
-              </div>
-
-              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-3">
-                <h2 className="font-bold text-sm flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-emerald-600" /> Branding, Marquee Ticker &amp; KES Rate
-                </h2>
-                <input
-                  value={tickerText}
-                  onChange={(e) => setTickerText(e.target.value)}
-                  placeholder="Marquee ticker text..."
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
-                />
-                <input
-                  type="number"
-                  value={kesRate}
-                  onChange={(e) => setKesRate(Number(e.target.value))}
-                  placeholder="USD to KES Rate"
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 text-xs"
-                />
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await apiFetch('/admin/settings/branding', {
-                      method: 'PUT',
-                      body: JSON.stringify({ appName: 'Pipflowtrades', tickerText, kesRate })
-                    });
-                    await refreshBranding();
-                    setNotice('Branding updated live.');
-                    loadOverview();
-                  }}
-                  className="w-full py-2 rounded-lg bg-slate-800 text-white text-xs font-bold"
-                >
-                  Save Branding
-                </button>
-              </div>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await apiFetch('/admin/settings/branding', {
+                        method: 'PUT',
+                        body: JSON.stringify({ appName: 'Pipflowtrades', tickerText, kesRate })
+                      });
+                      await refreshBranding();
+                      setNotice('Branding updated live.');
+                      loadOverview();
+                    }}
+                    className="w-full py-2 rounded-lg bg-slate-800 text-white text-xs font-bold"
+                  >
+                    Save Branding
+                  </button>
+                </div>
+              )}
 
               <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-2.5">
                 <h2 className="font-bold text-sm flex items-center gap-2">
@@ -2093,119 +2481,121 @@ export const AdminDashboard: React.FC = () => {
                 )}
               </div>
 
-              {/* Full Site Features, Cashier & Navigation Tab Controls */}
-              <div className="sm:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-4">
-                <h2 className="font-bold text-sm flex items-center gap-2">
-                  <Shield className="w-4 h-4 text-violet-600" /> Site Controls, Cashier Links &amp; Visible Workspace Tabs
-                </h2>
+              {/* Full Site Features, Cashier & Navigation Tab Controls (OWNER EXCLUSIVE) */}
+              {isOwner && (
+                <div className="sm:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 space-y-4">
+                  <h2 className="font-bold text-sm flex items-center gap-2">
+                    <Shield className="w-4 h-4 text-violet-600" /> Site Controls, Cashier Links &amp; Visible Workspace Tabs
+                  </h2>
 
-                <div className="grid sm:grid-cols-2 gap-3 text-xs">
-                  <label className="sm:col-span-2 flex items-center justify-between rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2">
-                    <span className="font-semibold">Show Top-Bar Deposit / Withdraw Cashier Button</span>
-                    <input
-                      type="checkbox"
-                      checked={showDepositWithdraw}
-                      onChange={(e) => setShowDepositWithdraw(e.target.checked)}
-                      className="accent-violet-600"
-                    />
-                  </label>
-                  <div>
-                    <label className="block text-[11px] text-slate-500 mb-1">Deposit Cashier URL</label>
-                    <input
-                      value={depositUrl}
-                      onChange={(e) => setDepositUrl(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 font-mono text-xs"
-                    />
+                  <div className="grid sm:grid-cols-2 gap-3 text-xs">
+                    <label className="sm:col-span-2 flex items-center justify-between rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2">
+                      <span className="font-semibold">Show Top-Bar Deposit / Withdraw Cashier Button</span>
+                      <input
+                        type="checkbox"
+                        checked={showDepositWithdraw}
+                        onChange={(e) => setShowDepositWithdraw(e.target.checked)}
+                        className="accent-violet-600"
+                      />
+                    </label>
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Deposit Cashier URL</label>
+                      <input
+                        value={depositUrl}
+                        onChange={(e) => setDepositUrl(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 font-mono text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Withdrawal Cashier URL</label>
+                      <input
+                        value={withdrawUrl}
+                        onChange={(e) => setWithdrawUrl(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 font-mono text-xs"
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <label className="block text-[11px] text-slate-500 mb-1">Cashier Settlement Note</label>
+                      <input
+                        value={cashierNote}
+                        onChange={(e) => setCashierNote(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 text-xs"
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <label className="block text-[11px] text-slate-500 mb-1">Risk Disclaimer Modal Text</label>
+                      <textarea
+                        rows={2}
+                        value={riskDisclaimerText}
+                        onChange={(e) => setRiskDisclaimerText(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 text-xs"
+                      />
+                    </div>
                   </div>
-                  <div>
-                    <label className="block text-[11px] text-slate-500 mb-1">Withdrawal Cashier URL</label>
-                    <input
-                      value={withdrawUrl}
-                      onChange={(e) => setWithdrawUrl(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 font-mono text-xs"
-                    />
+
+                  <div className="space-y-1.5">
+                    <div className="text-[11px] font-bold text-slate-500 uppercase">Enabled Navigation Tabs Across Site</div>
+                    <div className="flex flex-wrap gap-2">
+                      {[
+                        { id: 'dashboard', label: 'Dashboard' },
+                        { id: 'bot_builder', label: 'Bot Builder' },
+                        { id: 'charts', label: 'Charts' },
+                        { id: 'freebots', label: 'Trading Bots' },
+                        { id: 'bulk_trader', label: 'Bulk Trader' },
+                        { id: 'analysistool', label: 'Analysis Tool' },
+                        { id: 'reports', label: 'Reports' },
+                        { id: 'trading_plan', label: 'Risk Calculator' },
+                        { id: 'copy_trading', label: 'Copy Trading' },
+                        { id: 'dtrader', label: 'DTrader' },
+                        { id: 'trading_view', label: 'TradingView' }
+                      ].map((tab) => {
+                        const active = enabledTabs.includes(tab.id);
+                        return (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            onClick={() =>
+                              setEnabledTabs((prev) =>
+                                prev.includes(tab.id) ? prev.filter((x) => x !== tab.id) : [...prev, tab.id]
+                              )
+                            }
+                            className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition ${
+                              active
+                                ? 'bg-emerald-600 text-white border-emerald-600'
+                                : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border-slate-300 dark:border-slate-700'
+                            }`}
+                          >
+                            {tab.label}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
-                  <div className="sm:col-span-2">
-                    <label className="block text-[11px] text-slate-500 mb-1">Cashier Settlement Note</label>
-                    <input
-                      value={cashierNote}
-                      onChange={(e) => setCashierNote(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 text-xs"
-                    />
-                  </div>
-                  <div className="sm:col-span-2">
-                    <label className="block text-[11px] text-slate-500 mb-1">Risk Disclaimer Modal Text</label>
-                    <textarea
-                      rows={2}
-                      value={riskDisclaimerText}
-                      onChange={(e) => setRiskDisclaimerText(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-1.5 text-xs"
-                    />
-                  </div>
+
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await apiFetch('/admin/settings/site-controls', {
+                        method: 'PUT',
+                        body: JSON.stringify({
+                          showDepositWithdraw,
+                          depositUrl,
+                          withdrawUrl,
+                          cashierNote,
+                          riskDisclaimerText,
+                          enabledTabs
+                        })
+                      });
+                      await refreshBranding();
+                      setNotice('Site controls & visible workspace tabs updated live.');
+                      loadOverview();
+                    }}
+                    className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold"
+                  >
+                    Save Site Controls &amp; Visible Tabs
+                  </button>
                 </div>
-
-                <div className="space-y-1.5">
-                  <div className="text-[11px] font-bold text-slate-500 uppercase">Enabled Navigation Tabs Across Site</div>
-                  <div className="flex flex-wrap gap-2">
-                    {[
-                      { id: 'dashboard', label: 'Dashboard' },
-                      { id: 'bot_builder', label: 'Bot Builder' },
-                      { id: 'charts', label: 'Charts' },
-                      { id: 'freebots', label: 'Trading Bots' },
-                      { id: 'bulk_trader', label: 'Bulk Trader' },
-                      { id: 'analysistool', label: 'Analysis Tool' },
-                      { id: 'reports', label: 'Reports' },
-                      { id: 'trading_plan', label: 'Risk Calculator' },
-                      { id: 'copy_trading', label: 'Copy Trading' },
-                      { id: 'dtrader', label: 'DTrader' },
-                      { id: 'trading_view', label: 'TradingView' }
-                    ].map((tab) => {
-                      const active = enabledTabs.includes(tab.id);
-                      return (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          onClick={() =>
-                            setEnabledTabs((prev) =>
-                              prev.includes(tab.id) ? prev.filter((x) => x !== tab.id) : [...prev, tab.id]
-                            )
-                          }
-                          className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition ${
-                            active
-                              ? 'bg-emerald-600 text-white border-emerald-600'
-                              : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border-slate-300 dark:border-slate-700'
-                          }`}
-                        >
-                          {tab.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await apiFetch('/admin/settings/site-controls', {
-                      method: 'PUT',
-                      body: JSON.stringify({
-                        showDepositWithdraw,
-                        depositUrl,
-                        withdrawUrl,
-                        cashierNote,
-                        riskDisclaimerText,
-                        enabledTabs
-                      })
-                    });
-                    await refreshBranding();
-                    setNotice('Site controls & visible workspace tabs updated live.');
-                    loadOverview();
-                  }}
-                  className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold"
-                >
-                  Save Site Controls &amp; Visible Tabs
-                </button>
-              </div>
+              )}
             </div>
           )}
 
@@ -2259,6 +2649,348 @@ export const AdminDashboard: React.FC = () => {
           )}
         </main>
       </div>
+
+      {/* 8-STEP SYNCHRONIZED DERIV BALANCE MANAGEMENT MODAL (OWNER EXCLUSIVE) */}
+      {syncModalAccount && isOwner && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl p-5 space-y-4 text-xs">
+            <div className="flex items-center justify-between">
+              <div className="font-bold text-sm flex items-center gap-2">
+                <Shield className="w-4 h-4 text-blue-600" />
+                <span>8-Step Synchronized Balance Adjustment ({syncModalAccount.deriv_login_id})</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSyncModalAccount(null)}
+                className="p-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {syncLoading ? (
+              <div className="py-8 text-center text-slate-500 space-y-2">
+                <RefreshCw className="w-5 h-5 animate-spin mx-auto text-blue-600" />
+                <div className="font-semibold">
+                  Running Steps 1–7: Verifying Owner, Trader, Deriv Account &amp; Fetching Live Broker Balance...
+                </div>
+              </div>
+            ) : syncError ? (
+              <div className="space-y-3">
+                <div className="rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 p-3 text-rose-700 dark:text-rose-300">
+                  {syncError}
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => openSynchronizedAdjustmentModal(syncModalAccount)}
+                    className="px-3 py-1.5 rounded-lg bg-blue-600 text-white font-bold"
+                  >
+                    Retry Deriv Sync
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSyncModalAccount(null)}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            ) : syncPreview ? (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setError('');
+                  setAdjSubmitting(true);
+                  try {
+                    const deltaNum = Number(adjDelta);
+                    await apiFetch(`/owner/accounts/${syncModalAccount.id}/adjustments`, {
+                      method: 'POST',
+                      body: JSON.stringify({
+                        idempotencyKey: adjIdempotencyKey,
+                        syncProofToken: syncPreview.syncProofToken,
+                        adjustmentDelta: deltaNum,
+                        reason: adjReason,
+                        note: adjNote || undefined,
+                        allowRealOverlay:
+                          syncPreview.account.accountType === 'real' ? adjAllowRealOverlay : true
+                      })
+                    });
+                    setNotice(
+                      `Recorded platform-side adjustment (${deltaNum >= 0 ? '+' : ''}${deltaNum.toFixed(2)} ${syncPreview.account.currency}) on ${syncPreview.account.derivLoginId}. Broker balance untouched.`
+                    );
+                    setSyncModalAccount(null);
+                    loadOverview();
+                    loadLedger();
+                    refreshDerivAccounts(false);
+                  } catch (err) {
+                    setSyncError((err as Error).message);
+                  } finally {
+                    setAdjSubmitting(false);
+                  }
+                }}
+                className="space-y-3"
+              >
+                <div className="rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-950/30 p-3 space-y-1.5">
+                  <div className="font-bold text-emerald-700 dark:text-emerald-300 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Steps 1–7 Synchronized with Deriv Broker</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+                    <div>
+                      <span className="text-slate-500">Target Trader:</span>{' '}
+                      <strong>{syncPreview.account.userEmail}</strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Deriv Account:</span>{' '}
+                      <strong className="font-mono">
+                        {syncPreview.account.derivLoginId} ({syncPreview.account.accountType.toUpperCase()})
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Live Broker Balance:</span>{' '}
+                      <strong className="font-mono">
+                        {syncPreview.account.brokerBalance.toFixed(2)} {syncPreview.account.currency}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Current Platform Adj:</span>{' '}
+                      <strong className="font-mono">
+                        {syncPreview.account.platformAdjustmentBalance >= 0 ? '+' : ''}
+                        {syncPreview.account.platformAdjustmentBalance.toFixed(2)} {syncPreview.account.currency}
+                      </strong>
+                    </div>
+                    <div className="col-span-2">
+                      <span className="text-slate-500">Sync Timestamp:</span>{' '}
+                      <span className="font-mono">{new Date(syncPreview.account.syncTimestamp).toLocaleString()}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
+                  Actual Deriv broker balance is never overwritten. This action records an immutable platform-side
+                  adjustment entry and is <strong>not</strong> a Deriv deposit or withdrawal.
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">
+                      Adjustment Delta ({syncPreview.account.currency})
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      required
+                      value={adjDelta}
+                      onChange={(e) => setAdjDelta(e.target.value)}
+                      placeholder="e.g. 50.00 or -25.00"
+                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2.5 py-1.5 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">Projected Displayed Balance</label>
+                    <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 px-2.5 py-1.5 font-mono font-bold">
+                      {(
+                        syncPreview.account.brokerBalance +
+                        syncPreview.account.platformAdjustmentBalance +
+                        (Number.isFinite(Number(adjDelta)) ? Number(adjDelta) : 0)
+                      ).toFixed(2)}{' '}
+                      {syncPreview.account.currency}
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] text-slate-500 mb-1">Audit Reason (min 3 characters)</label>
+                  <input
+                    required
+                    minLength={3}
+                    value={adjReason}
+                    onChange={(e) => setAdjReason(e.target.value)}
+                    placeholder="e.g. Promotional bonus credit / reconciliation correction"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2.5 py-1.5"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] text-slate-500 mb-1">Optional Internal Note</label>
+                  <input
+                    value={adjNote}
+                    onChange={(e) => setAdjNote(e.target.value)}
+                    placeholder="Reference ticket or explanation..."
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-2.5 py-1.5"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                  <span className="font-mono truncate">Idempotency Key: {adjIdempotencyKey}</span>
+                  <button
+                    type="button"
+                    onClick={() => setAdjIdempotencyKey(newIdempotencyKey())}
+                    className="text-blue-600 hover:underline shrink-0"
+                  >
+                    New Key
+                  </button>
+                </div>
+
+                {syncPreview.account.accountType === 'real' && (
+                  <label className="flex items-start gap-2 rounded-lg border border-rose-200 dark:border-rose-900 bg-rose-50/50 dark:bg-rose-950/20 p-2.5 text-[11px]">
+                    <input
+                      type="checkbox"
+                      checked={adjAllowRealOverlay}
+                      onChange={(e) => setAdjAllowRealOverlay(e.target.checked)}
+                      required
+                      className="mt-0.5 accent-rose-600"
+                    />
+                    <span>
+                      Confirm platform-side adjustment overlay on REAL account (overrides Exact Broker Balance Equality
+                      until Exact Mode is re-enabled).
+                    </span>
+                  </label>
+                )}
+
+                <div className="flex justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setSyncModalAccount(null)}
+                    className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 font-semibold"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={adjSubmitting}
+                    className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-bold"
+                  >
+                    {adjSubmitting ? 'Recording...' : 'Record Step 8 Platform Adjustment'}
+                  </button>
+                </div>
+              </form>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {/* VIRTUAL WORKSPACE BALANCE ADJUSTMENT MODAL (OWNER EXCLUSIVE) */}
+      {virtualAdjUser && isOwner && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl p-5 space-y-4 text-xs">
+            <div className="flex items-center justify-between">
+              <div className="font-bold text-sm">Adjust Virtual Practice Balance</div>
+              <button
+                type="button"
+                onClick={() => setVirtualAdjUser(null)}
+                className="p-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="text-[11px] text-slate-500">
+              Trader: <strong>{virtualAdjUser.email}</strong> · Current Virtual Balance:{' '}
+              <strong className="font-mono">${Number(virtualAdjUser.virtual_workspace_balance).toFixed(2)}</strong>
+            </div>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setError('');
+                setVirtualAdjBusy(true);
+                try {
+                  const numVal = Number(virtualAdjVal);
+                  const res = await apiFetch<{ virtual_workspace_balance: number }>(
+                    `/owner/users/${virtualAdjUser.id}/virtual-adjustments`,
+                    {
+                      method: 'POST',
+                      body: JSON.stringify({
+                        idempotencyKey: virtualAdjKey,
+                        ...(virtualAdjMode === 'delta' ? { adjustmentDelta: numVal } : { targetBalance: numVal }),
+                        reason: virtualAdjReason,
+                        note: virtualAdjNote || undefined
+                      })
+                    }
+                  );
+                  setNotice(
+                    `Recorded virtual balance adjustment for ${virtualAdjUser.email}. New virtual balance: $${Number(res.virtual_workspace_balance).toFixed(2)}.`
+                  );
+                  setVirtualAdjUser(null);
+                  loadOverview();
+                  loadLedger();
+                  refreshProfile();
+                } catch (err) {
+                  setError((err as Error).message);
+                } finally {
+                  setVirtualAdjBusy(false);
+                }
+              }}
+              className="space-y-3"
+            >
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setVirtualAdjMode('delta')}
+                  className={`flex-1 py-1.5 rounded-lg font-bold border ${
+                    virtualAdjMode === 'delta'
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'border-slate-300 dark:border-slate-700'
+                  }`}
+                >
+                  Delta (+/-)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setVirtualAdjMode('target')}
+                  className={`flex-1 py-1.5 rounded-lg font-bold border ${
+                    virtualAdjMode === 'target'
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'border-slate-300 dark:border-slate-700'
+                  }`}
+                >
+                  Set Target Balance
+                </button>
+              </div>
+              <input
+                type="number"
+                step="0.01"
+                required
+                value={virtualAdjVal}
+                onChange={(e) => setVirtualAdjVal(e.target.value)}
+                placeholder={virtualAdjMode === 'delta' ? 'Adjustment delta (e.g. 500 or -100)' : 'New target balance'}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2 font-mono"
+              />
+              <input
+                required
+                minLength={3}
+                value={virtualAdjReason}
+                onChange={(e) => setVirtualAdjReason(e.target.value)}
+                placeholder="Audit Reason (min 3 chars)"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2"
+              />
+              <input
+                value={virtualAdjNote}
+                onChange={(e) => setVirtualAdjNote(e.target.value)}
+                placeholder="Optional note"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent px-3 py-2"
+              />
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setVirtualAdjUser(null)}
+                  className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={virtualAdjBusy}
+                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-bold"
+                >
+                  {virtualAdjBusy ? 'Saving...' : 'Record Virtual Adjustment'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -40,6 +40,8 @@ interface ConnectedAccountRow {
   account_type: 'demo' | 'real';
   currency: string;
   last_known_balance: number;
+  platform_adjustment_balance: number;
+  exact_broker_balance_only: boolean;
   balance_locked_by_admin: boolean;
   landing_company: string | null;
   connection_status: 'connected' | 'disconnected' | 'revoked' | 'error';
@@ -47,6 +49,25 @@ interface ConnectedAccountRow {
   last_synced_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface BalanceAdjustmentRow {
+  id: string;
+  idempotency_key: string;
+  user_id: string;
+  connected_account_id: string | null;
+  account_scope: 'virtual' | 'demo' | 'real';
+  owner_user_id: string;
+  broker_balance_at_sync: number;
+  currency: string;
+  sync_timestamp: string;
+  adjustment_delta: number;
+  previous_adjustment_total: number;
+  new_adjustment_total: number;
+  resulting_displayed_balance: number;
+  reason: string;
+  note: string | null;
+  created_at: string;
 }
 
 interface AccountAuthorizationRow {
@@ -199,12 +220,15 @@ export function createMemoryPool() {
   logInfo('database', 'In-memory storage fallback active (DATABASE_URL not configured)');
 
   const roles: RoleRow[] = [
-    { id: 1, name: 'trader', description: 'Standard Pipflowtrades workspace user', created_at: nowIso() },
-    { id: 2, name: 'admin', description: 'Platform administrator', created_at: nowIso() }
+    { id: 1, name: 'trader', description: 'Legacy standard Pipflowtrade workspace user', created_at: nowIso() },
+    { id: 2, name: 'admin', description: 'Operations administrator (non-financial, non-settings)', created_at: nowIso() },
+    { id: 3, name: 'owner', description: 'Platform owner with exclusive settings and financial adjustment privileges', created_at: nowIso() },
+    { id: 4, name: 'user', description: 'Standard registered Pipflowtrade user', created_at: nowIso() }
   ];
 
   const users: UserRow[] = [];
   const connectedAccounts: ConnectedAccountRow[] = [];
+  const balanceAdjustments: BalanceAdjustmentRow[] = [];
   const accountAuthorizations: AccountAuthorizationRow[] = [];
   const virtualOrders: VirtualOrderRow[] = [];
   const watchlists: WatchlistRow[] = [];
@@ -290,7 +314,39 @@ export function createMemoryPool() {
     ]
   ]);
 
-  const roleNameById = (roleId: number) => roles.find((r) => r.id === roleId)?.name ?? 'trader';
+  const roleNameById = (roleId: number) => roles.find((r) => r.id === roleId)?.name ?? 'user';
+
+  const computeDisplayedBalance = (a: ConnectedAccountRow) => {
+    if (a.account_type === 'real' && a.exact_broker_balance_only) {
+      return Number(a.last_known_balance);
+    }
+    return Number((Number(a.last_known_balance) + Number(a.platform_adjustment_balance || 0)).toFixed(4));
+  };
+
+  const withDisplayedAccount = (a: ConnectedAccountRow, extras: Record<string, unknown> = {}) => ({
+    ...a,
+    platform_adjustment_balance: Number(a.platform_adjustment_balance || 0),
+    exact_broker_balance_only: Boolean(a.exact_broker_balance_only),
+    displayed_balance: computeDisplayedBalance(a),
+    ...extras
+  });
+
+  const publicUserRow = (u: UserRow) => ({
+    id: u.id,
+    email: u.email,
+    full_name: u.full_name,
+    is_email_verified: u.is_email_verified,
+    virtual_workspace_balance: Number(u.virtual_workspace_balance),
+    preferred_currency: u.preferred_currency,
+    local_currency: u.local_currency,
+    is_active: u.is_active,
+    token_version: u.token_version,
+    last_login_at: u.last_login_at,
+    created_at: u.created_at,
+    updated_at: u.updated_at,
+    role_name: roleNameById(u.role_id),
+    role: roleNameById(u.role_id)
+  });
 
   async function query<T = Record<string, unknown>>(
     rawSql: string,
@@ -302,13 +358,82 @@ export function createMemoryPool() {
     if (low === 'select 1' || low === 'begin' || low === 'commit' || low === 'rollback') {
       return { rows: [], rowCount: 0 };
     }
+    if (low.startsWith('alter table') || low.startsWith('create ') || low.startsWith('drop ')) {
+      return { rows: [], rowCount: 0 };
+    }
+
+    // IMMUTABLE BALANCE ADJUSTMENTS LEDGER
+    if (low.startsWith('update balance_adjustments') || low.startsWith('delete from balance_adjustments')) {
+      throw new Error('balance_adjustments ledger is immutable and cannot be modified or deleted');
+    }
+    if (low.startsWith('insert into balance_adjustments')) {
+      const idempotencyKey = String(params[0] ?? '').trim();
+      if (!idempotencyKey) {
+        throw new Error('idempotency_key required');
+      }
+      if (balanceAdjustments.some((b) => b.idempotency_key === idempotencyKey)) {
+        throw new Error('duplicate key value violates unique constraint "balance_adjustments_idempotency_key_key"');
+      }
+      const row: BalanceAdjustmentRow = {
+        id: crypto.randomUUID(),
+        idempotency_key: idempotencyKey,
+        user_id: String(params[1]),
+        connected_account_id: params[2] ? String(params[2]) : null,
+        account_scope: (params[3] as BalanceAdjustmentRow['account_scope']) || 'demo',
+        owner_user_id: String(params[4]),
+        broker_balance_at_sync: Number(params[5] ?? 0),
+        currency: String(params[6] ?? 'USD'),
+        sync_timestamp: String(params[7] ?? nowIso()),
+        adjustment_delta: Number(params[8] ?? 0),
+        previous_adjustment_total: Number(params[9] ?? 0),
+        new_adjustment_total: Number(params[10] ?? 0),
+        resulting_displayed_balance: Number(params[11] ?? 0),
+        reason: String(params[12] ?? 'Owner workspace adjustment'),
+        note: params[13] ? String(params[13]) : null,
+        created_at: nowIso()
+      };
+      balanceAdjustments.unshift(row);
+      return { rows: [row] as unknown as T[], rowCount: 1 };
+    }
+    if (low.includes('from balance_adjustments')) {
+      if (low.includes('where idempotency_key = $1') || low.includes('where ba.idempotency_key = $1')) {
+        const key = String(params[0] ?? '');
+        const rows = balanceAdjustments.filter((b) => b.idempotency_key === key);
+        return { rows: rows as unknown as T[], rowCount: rows.length };
+      }
+      const filterUser = low.includes('where ba.user_id = $1') || low.includes('where user_id = $1');
+      const filterAccount = low.includes('connected_account_id = $1');
+      const rows = balanceAdjustments
+        .filter((b) => {
+          if (filterUser && b.user_id !== String(params[0])) return false;
+          if (filterAccount && b.connected_account_id !== String(params[0])) return false;
+          return true;
+        })
+        .slice(0, 150)
+        .map((b) => {
+          const targetUser = users.find((u) => u.id === b.user_id);
+          const ownerUser = users.find((u) => u.id === b.owner_user_id);
+          const ca = b.connected_account_id
+            ? connectedAccounts.find((c) => c.id === b.connected_account_id)
+            : undefined;
+          return {
+            ...b,
+            user_email: targetUser?.email ?? '',
+            owner_email: ownerUser?.email ?? '',
+            deriv_login_id: ca?.deriv_login_id ?? null
+          };
+        });
+      return { rows: rows as unknown as T[], rowCount: rows.length };
+    }
 
     // ROLES
     if (low.startsWith('insert into roles')) {
       return { rows: [], rowCount: 0 };
     }
     if (low.includes('from roles where name =')) {
-      const role = roles.find((r) => r.name === 'admin');
+      const literal = sql.match(/where name\s*=\s*'([^']+)'/i)?.[1];
+      const nameToFind = literal ?? String(params[0] ?? 'user');
+      const role = roles.find((r) => r.name === nameToFind);
       return { rows: (role ? [role] : []) as unknown as T[], rowCount: role ? 1 : 0 };
     }
 
@@ -339,7 +464,11 @@ export function createMemoryPool() {
       return { rows: [], rowCount: 1 };
     }
 
-    // USERS — COUNT ADMIN
+    // USERS — COUNT OWNER / ADMIN
+    if (low.includes('count(*)::int as cnt from users') && low.includes("r.name = 'owner'")) {
+      const cnt = users.filter((u) => roleNameById(u.role_id) === 'owner').length;
+      return { rows: [{ cnt }] as unknown as T[], rowCount: 1 };
+    }
     if (low.includes('count(*)::int as cnt from users') && low.includes("r.name = 'admin'")) {
       const cnt = users.filter((u) => roleNameById(u.role_id) === 'admin').length;
       return { rows: [{ cnt }] as unknown as T[], rowCount: 1 };
@@ -351,17 +480,18 @@ export function createMemoryPool() {
       if (users.some((u) => u.email === email)) {
         throw new Error('duplicate key value violates unique constraint "users_email_key"');
       }
-      const isAdminInsert = low.includes('is_email_verified, is_active, last_login_at');
+      const isBootstrapInsert = low.includes('is_email_verified, is_active, last_login_at');
+      const isAdminCreateUser = low.includes('is_email_verified, virtual_workspace_balance) values');
       const isOAuthInsert = low.includes('is_email_verified, virtual_workspace_balance, preferred_currency, last_login_at');
 
       let newUser: UserRow;
-      if (isAdminInsert) {
+      if (isBootstrapInsert) {
         newUser = {
           id: crypto.randomUUID(),
           email,
           password_hash: String(params[1] ?? ''),
-          full_name: String(params[2] ?? 'Platform Administrator'),
-          role_id: Number(params[3] ?? 2),
+          full_name: String(params[2] ?? 'Platform Owner'),
+          role_id: Number(params[3] ?? 3),
           is_email_verified: true,
           email_verification_token: null,
           password_reset_token: null,
@@ -375,13 +505,33 @@ export function createMemoryPool() {
           created_at: nowIso(),
           updated_at: nowIso()
         };
+      } else if (isAdminCreateUser) {
+        newUser = {
+          id: crypto.randomUUID(),
+          email,
+          password_hash: String(params[1] ?? ''),
+          full_name: String(params[2] ?? 'User'),
+          role_id: Number(params[3] ?? 4),
+          is_email_verified: true,
+          email_verification_token: null,
+          password_reset_token: null,
+          password_reset_expires_at: null,
+          virtual_workspace_balance: Number(params[4] ?? 10000),
+          preferred_currency: 'USD',
+          local_currency: 'KES',
+          is_active: true,
+          token_version: 1,
+          last_login_at: null,
+          created_at: nowIso(),
+          updated_at: nowIso()
+        };
       } else if (isOAuthInsert) {
         newUser = {
           id: crypto.randomUUID(),
           email,
           password_hash: String(params[1] ?? ''),
           full_name: String(params[2] ?? 'Deriv Trader'),
-          role_id: 1,
+          role_id: 4,
           is_email_verified: true,
           email_verification_token: null,
           password_reset_token: null,
@@ -401,12 +551,12 @@ export function createMemoryPool() {
           email,
           password_hash: String(params[1] ?? ''),
           full_name: String(params[2] ?? 'Trader'),
-          role_id: 1,
+          role_id: Number(params[3] ?? 4),
           is_email_verified: false,
-          email_verification_token: params[4] ? String(params[4]) : null,
+          email_verification_token: params[5] ? String(params[5]) : null,
           password_reset_token: null,
           password_reset_expires_at: null,
-          virtual_workspace_balance: Number(params[3] ?? 10000),
+          virtual_workspace_balance: Number(params[4] ?? 10000),
           preferred_currency: 'USD',
           local_currency: 'KES',
           is_active: true,
@@ -418,7 +568,7 @@ export function createMemoryPool() {
       }
       users.push(newUser);
       return {
-        rows: [{ ...newUser, role_name: roleNameById(newUser.role_id) }] as unknown as T[],
+        rows: [publicUserRow(newUser)] as unknown as T[],
         rowCount: 1
       };
     }
@@ -435,15 +585,20 @@ export function createMemoryPool() {
         const id = String(params[0] ?? '');
         const u = users.find((x) => x.id === id);
         if (!u) return { rows: [], rowCount: 0 };
+        const needsSecretFields = low.includes('select u.*') || low.includes('password_hash');
         return {
-          rows: [{ ...u, role_name: roleNameById(u.role_id), role: roleNameById(u.role_id) }] as unknown as T[],
+          rows: [
+            needsSecretFields
+              ? { ...u, role_name: roleNameById(u.role_id), role: roleNameById(u.role_id) }
+              : publicUserRow(u)
+          ] as unknown as T[],
           rowCount: 1
         };
       }
       if (low.includes('order by u.created_at desc')) {
         const rows = [...users]
           .sort((a, b) => b.created_at.localeCompare(a.created_at))
-          .map((u) => ({ ...u, role: roleNameById(u.role_id) }));
+          .map((u) => publicUserRow(u));
         return { rows: rows as unknown as T[], rowCount: rows.length };
       }
       if (low.includes('where ca.user_id = u.id') && low.includes('ca.deriv_login_id = $1')) {
@@ -462,9 +617,44 @@ export function createMemoryPool() {
         if (u) u.last_login_at = nowIso();
         return { rows: [], rowCount: u ? 1 : 0 };
       }
+      if (low.includes('set token_version = coalesce(token_version, 1) + 1') && low.includes('where id = $1')) {
+        const u = users.find((x) => x.id === String(params[0]));
+        if (u) {
+          u.token_version += 1;
+          u.updated_at = nowIso();
+        }
+        return { rows: (u ? [{ id: u.id, email: u.email, token_version: u.token_version }] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+      }
+      if (low.includes('set role_id = $1') && low.includes('where id = $2')) {
+        const u = users.find((x) => x.id === String(params[1]));
+        if (u) {
+          u.role_id = Number(params[0]);
+          u.token_version += 1;
+          u.updated_at = nowIso();
+        }
+        return { rows: (u ? [u] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+      }
+      if (low.includes('set is_active = $1') && low.includes('where id = $2')) {
+        const nextActive = Boolean(params[0]);
+        const u = users.find((x) => x.id === String(params[1]));
+        if (u) {
+          u.is_active = nextActive;
+          if (!nextActive) u.token_version += 1;
+          u.updated_at = nowIso();
+        }
+        return { rows: (u ? [u] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+      }
       if (low.includes('set virtual_workspace_balance = 10000.00 where id = $1')) {
         const u = users.find((x) => x.id === String(params[0]));
         if (u) u.virtual_workspace_balance = 10000;
+        return { rows: (u ? [u] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+      }
+      if (low.includes('virtual_workspace_balance = $1') && low.includes('where id = $2')) {
+        const u = users.find((x) => x.id === String(params[1]));
+        if (u) {
+          u.virtual_workspace_balance = Math.max(0, Number(Number(params[0] ?? 0).toFixed(2)));
+          u.updated_at = nowIso();
+        }
         return { rows: (u ? [u] : []) as unknown as T[], rowCount: u ? 1 : 0 };
       }
       if (low.includes('virtual_workspace_balance') && low.includes('where id = $2')) {
@@ -511,6 +701,24 @@ export function createMemoryPool() {
         if (u) u.full_name = String(params[1]);
         return { rows: (u ? [u] : []) as unknown as T[], rowCount: u ? 1 : 0 };
       }
+      if (low.includes('set email = $1, full_name = $2') && low.includes('where id = $')) {
+        const id = String(params[params.length - 1]);
+        const u = users.find((x) => x.id === id);
+        if (u) {
+          const nextEmail = String(params[0]).trim().toLowerCase();
+          if (users.some((other) => other.id !== id && other.email === nextEmail)) {
+            throw new Error('duplicate key value violates unique constraint "users_email_key"');
+          }
+          u.email = nextEmail;
+          u.full_name = String(params[1] ?? u.full_name);
+          u.role_id = Number(params[2] ?? u.role_id);
+          u.is_active = Boolean(params[3]);
+          u.password_hash = String(params[4] ?? u.password_hash);
+          if (Boolean(params[5])) u.token_version += 1;
+          u.updated_at = nowIso();
+        }
+        return { rows: (u ? [publicUserRow(u)] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+      }
       if (low.includes('set email = $1, password_hash = $2') && low.includes('where id = $3')) {
         const u = users.find((x) => x.id === String(params[2]));
         if (u) {
@@ -518,7 +726,7 @@ export function createMemoryPool() {
           u.password_hash = String(params[1]);
           u.token_version += 1;
         }
-        return { rows: (u ? [u] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+        return { rows: (u ? [publicUserRow(u)] : []) as unknown as T[], rowCount: u ? 1 : 0 };
       }
       if (low.includes('set password_hash = $1') && low.includes('where id = $4')) {
         const u = users.find((x) => x.id === String(params[3]));
@@ -531,7 +739,19 @@ export function createMemoryPool() {
           u.token_version += 1;
           u.last_login_at = nowIso();
         }
-        return { rows: (u ? [u] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+        return { rows: (u ? [publicUserRow(u)] : []) as unknown as T[], rowCount: u ? 1 : 0 };
+      }
+      if (low.includes('where id = $1') && low.includes('last_login_at = now()')) {
+        const u = users.find((x) => x.id === String(params[0]));
+        if (u) {
+          u.last_login_at = nowIso();
+          u.is_email_verified = true;
+          if (params[1]) u.full_name = String(params[1]);
+          if (params[2] !== null && params[2] !== undefined) u.virtual_workspace_balance = Number(params[2]);
+          if (params[3] === true && params[4]) u.email = String(params[4]).trim().toLowerCase();
+          u.updated_at = nowIso();
+        }
+        return { rows: (u ? [{ ...u, role_name: roleNameById(u.role_id) }] : []) as unknown as T[], rowCount: u ? 1 : 0 };
       }
     }
     if (low.startsWith('delete from users where id = $1')) {
@@ -542,6 +762,37 @@ export function createMemoryPool() {
     }
 
     // BOT STRATEGIES
+    if (low.startsWith('insert into bot_strategies')) {
+      const row: BotStrategyRow = {
+        id: crypto.randomUUID(),
+        slug: String(params[0] ?? ''),
+        name: String(params[1] ?? 'Strategy'),
+        category: String(params[2] ?? 'Free Bots'),
+        symbol: String(params[3] ?? 'R_100'),
+        strategy_config: parseJsonParam(params[4]) ?? {},
+        rating: 5.0,
+        is_premium: Boolean(params[5]),
+        created_at: nowIso()
+      };
+      botStrategies.push(row);
+      return { rows: [row] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update bot_strategies')) {
+      const s = botStrategies.find((x) => x.id === String(params[5]));
+      if (!s) return { rows: [], rowCount: 0 };
+      s.name = String(params[0] ?? s.name);
+      s.category = String(params[1] ?? s.category);
+      s.symbol = String(params[2] ?? s.symbol);
+      s.strategy_config = parseJsonParam(params[3]) ?? s.strategy_config;
+      s.is_premium = Boolean(params[4]);
+      return { rows: [s] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('delete from bot_strategies where id = $1')) {
+      const idx = botStrategies.findIndex((s) => s.id === String(params[0]));
+      if (idx === -1) return { rows: [], rowCount: 0 };
+      const [removed] = botStrategies.splice(idx, 1);
+      return { rows: [{ id: removed.id, name: removed.name }] as unknown as T[], rowCount: 1 };
+    }
     if (low.includes('from bot_strategies')) {
       if (low.includes('where id = $1')) {
         const found = botStrategies.filter((s) => s.id === String(params[0]));
@@ -729,6 +980,12 @@ export function createMemoryPool() {
         return { rows: [o] as unknown as T[], rowCount: 1 };
       }
     }
+    if (low.startsWith('delete from virtual_orders where id = $1')) {
+      const idx = virtualOrders.findIndex((x) => x.id === String(params[0]));
+      if (idx === -1) return { rows: [], rowCount: 0 };
+      const [removed] = virtualOrders.splice(idx, 1);
+      return { rows: [{ id: removed.id }] as unknown as T[], rowCount: 1 };
+    }
 
     // WATCHLISTS
     if (low.includes('from watchlists')) {
@@ -796,9 +1053,60 @@ export function createMemoryPool() {
       if (n) n.is_read = true;
       return { rows: [], rowCount: n ? 1 : 0 };
     }
+    if (low.startsWith('delete from notifications where id = $1')) {
+      const idx = notifications.findIndex((x) => x.id === String(params[0]));
+      if (idx >= 0) notifications.splice(idx, 1);
+      return { rows: [], rowCount: idx >= 0 ? 1 : 0 };
+    }
 
     // CONNECTED ACCOUNTS & AUTHORIZATIONS
+    if (low.includes('from account_authorizations aa join connected_accounts ca')) {
+      const accountId = String(params[0] ?? '');
+      const requireUser = low.includes('aa.user_id = $2');
+      const userIdFilter = requireUser ? String(params[1] ?? '') : null;
+      const ca = connectedAccounts.find((a) => a.id === accountId && (!userIdFilter || a.user_id === userIdFilter));
+      if (!ca) return { rows: [], rowCount: 0 };
+      const aa = accountAuthorizations.find(
+        (au) => au.connected_account_id === ca.id && au.user_id === ca.user_id && au.revoked_at === null
+      );
+      if (!aa) return { rows: [], rowCount: 0 };
+      return {
+        rows: [
+          withDisplayedAccount(ca, {
+            encrypted_token: aa.encrypted_token,
+            token_iv: aa.token_iv,
+            token_auth_tag: aa.token_auth_tag,
+            granted_scopes: aa.granted_scopes
+          })
+        ] as unknown as T[],
+        rowCount: 1
+      };
+    }
+
     if (low.includes('from connected_accounts')) {
+      if (low.includes('where ca.id = $1') || low.includes('where id = $1')) {
+        const aid = String(params[0]);
+        const uid = params.length > 1 && low.includes('user_id = $2') ? String(params[1]) : null;
+        const rows = connectedAccounts
+          .filter((a) => a.id === aid && (!uid || a.user_id === uid))
+          .map((a) => {
+            const aa = accountAuthorizations.find(
+              (au) => au.connected_account_id === a.id && au.revoked_at === null
+            );
+            const u = users.find((usr) => usr.id === a.user_id);
+            return withDisplayedAccount(a, {
+              user_email: u?.email ?? '',
+              user_full_name: u?.full_name ?? '',
+              user_is_active: u?.is_active ?? true,
+              has_active_auth: Boolean(aa),
+              granted_scopes: aa?.granted_scopes ?? ['read'],
+              encrypted_token: aa?.encrypted_token,
+              token_iv: aa?.token_iv,
+              token_auth_tag: aa?.token_auth_tag
+            });
+          });
+        return { rows: rows as unknown as T[], rowCount: rows.length };
+      }
       if (low.includes('where ca.user_id = $1') || low.includes('where user_id = $1')) {
         const uid = String(params[0]);
         const rows = connectedAccounts
@@ -807,16 +1115,22 @@ export function createMemoryPool() {
             const auth = accountAuthorizations.find(
               (au) => au.connected_account_id === a.id && au.revoked_at === null
             );
-            return { ...a, granted_scopes: auth?.granted_scopes ?? ['read'] };
+            return withDisplayedAccount(a, {
+              granted_scopes: auth?.granted_scopes ?? ['read'],
+              encrypted_token: auth?.encrypted_token,
+              token_iv: auth?.token_iv,
+              token_auth_tag: auth?.token_auth_tag
+            });
           });
         return { rows: rows as unknown as T[], rowCount: rows.length };
       }
       if (low.includes('join users u')) {
-        const rows = connectedAccounts.map((a) => ({
-          ...a,
-          user_email: users.find((u) => u.id === a.user_id)?.email ?? '',
-          granted_scopes: ['read']
-        }));
+        const rows = connectedAccounts.map((a) =>
+          withDisplayedAccount(a, {
+            user_email: users.find((u) => u.id === a.user_id)?.email ?? '',
+            granted_scopes: ['read']
+          })
+        );
         return { rows: rows as unknown as T[], rowCount: rows.length };
       }
     }
@@ -828,6 +1142,64 @@ export function createMemoryPool() {
         });
       return { rows: [], rowCount: 0 };
     }
+    if (low.startsWith('update connected_accounts set platform_adjustment_balance =')) {
+      const nextAdj = Number(params[0] ?? 0);
+      const exactOnly = Boolean(params[1]);
+      const id = String(params[2]);
+      const acc = connectedAccounts.find((a) => a.id === id);
+      if (!acc) return { rows: [], rowCount: 0 };
+      acc.platform_adjustment_balance = nextAdj;
+      acc.exact_broker_balance_only = exactOnly;
+      acc.updated_at = nowIso();
+      return { rows: [withDisplayedAccount(acc)] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update connected_accounts set exact_broker_balance_only =')) {
+      const exactOnly = Boolean(params[0]);
+      const id = String(params[1]);
+      const acc = connectedAccounts.find((a) => a.id === id);
+      if (!acc) return { rows: [], rowCount: 0 };
+      acc.exact_broker_balance_only = exactOnly;
+      acc.updated_at = nowIso();
+      return { rows: [withDisplayedAccount(acc)] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update connected_accounts set last_known_balance = greatest(0,')) {
+      const delta = Number(params[0] ?? 0);
+      const acc = connectedAccounts.find((a) => a.id === String(params[1]));
+      if (!acc) return { rows: [], rowCount: 0 };
+      acc.last_known_balance = Math.max(0, Number((Number(acc.last_known_balance) + delta).toFixed(4)));
+      acc.last_synced_at = nowIso();
+      acc.updated_at = nowIso();
+      return { rows: [withDisplayedAccount(acc)] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update connected_accounts set last_known_balance =')) {
+      const bal = Number(params[0] ?? 0);
+      const id = String(params[1]);
+      const hasCurr = low.includes('currency = $2');
+      const accId = hasCurr ? String(params[2]) : id;
+      const acc = connectedAccounts.find((a) => a.id === accId);
+      if (!acc) return { rows: [], rowCount: 0 };
+      acc.last_known_balance = bal;
+      if (hasCurr) acc.currency = String(params[1] || acc.currency);
+      acc.connection_status = 'connected';
+      acc.last_synced_at = nowIso();
+      acc.updated_at = nowIso();
+      return { rows: [withDisplayedAccount(acc)] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update connected_accounts set connection_status =')) {
+      const statusMatch = sql.match(/connection_status\s*=\s*'([^']+)'/i);
+      const nextStatus = (statusMatch?.[1] as ConnectedAccountRow['connection_status']) || 'disconnected';
+      const acc = connectedAccounts.find((a) => a.id === String(params[0]));
+      if (!acc) return { rows: [], rowCount: 0 };
+      acc.connection_status = nextStatus;
+      acc.updated_at = nowIso();
+      return { rows: [withDisplayedAccount(acc)] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('delete from connected_accounts where id = $1')) {
+      const idx = connectedAccounts.findIndex((a) => a.id === String(params[0]));
+      if (idx === -1) return { rows: [], rowCount: 0 };
+      const [removed] = connectedAccounts.splice(idx, 1);
+      return { rows: [removed] as unknown as T[], rowCount: 1 };
+    }
     if (low.startsWith('insert into connected_accounts')) {
       const userId = String(params[0]);
       const loginId = String(params[1]);
@@ -838,16 +1210,20 @@ export function createMemoryPool() {
         acc.last_known_balance = Number(params[4] || 0);
         acc.landing_company = params[5] ? String(params[5]) : null;
         acc.connection_status = 'connected';
+        acc.is_primary = Boolean(params[6]);
         acc.last_synced_at = nowIso();
         acc.updated_at = nowIso();
       } else {
+        const accountType = (params[2] as 'demo' | 'real') || 'demo';
         acc = {
           id: crypto.randomUUID(),
           user_id: userId,
           deriv_login_id: loginId,
-          account_type: (params[2] as 'demo' | 'real') || 'demo',
+          account_type: accountType,
           currency: String(params[3] || 'USD'),
           last_known_balance: Number(params[4] || 0),
+          platform_adjustment_balance: 0,
+          exact_broker_balance_only: true,
           balance_locked_by_admin: false,
           landing_company: params[5] ? String(params[5]) : null,
           connection_status: 'connected',
@@ -858,7 +1234,16 @@ export function createMemoryPool() {
         };
         connectedAccounts.push(acc);
       }
-      return { rows: [acc] as unknown as T[], rowCount: 1 };
+      return { rows: [withDisplayedAccount(acc)] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update account_authorizations set revoked_at = now()')) {
+      const accId = String(params[0]);
+      accountAuthorizations
+        .filter((aa) => aa.connected_account_id === accId && aa.revoked_at === null)
+        .forEach((aa) => {
+          aa.revoked_at = nowIso();
+        });
+      return { rows: [], rowCount: 1 };
     }
     if (low.startsWith('insert into account_authorizations')) {
       const auth: AccountAuthorizationRow = {

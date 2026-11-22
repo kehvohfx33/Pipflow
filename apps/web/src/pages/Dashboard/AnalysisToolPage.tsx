@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Activity, TrendingUp, Zap } from 'lucide-react';
+import { Activity, ArrowUpRight, RefreshCw, Sparkles, TrendingUp, Zap } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { apiFetch } from '../../services/api';
 import {
@@ -7,6 +7,37 @@ import {
   fetchDerivTickHistoryDirect,
   subscribeDerivTicksDirect
 } from '../../services/derivBrowserWs';
+
+interface AiAnalysisResult {
+  symbol: string;
+  timeframe: string;
+  dataSource: string;
+  status: string;
+  timestamp: string;
+  spot: number;
+  bias: 'BUY' | 'SELL' | 'NEUTRAL';
+  regime: string;
+  confidence: number;
+  indicators: {
+    ema20: number;
+    ema50: number;
+    ema200: number;
+    rsi14: number;
+    macd: number;
+    macdSignal: number;
+    macdHistogram: number;
+    atr14: number;
+    support: number;
+    resistance: number;
+  };
+  entryZone: { low: number; high: number };
+  stopLoss: number;
+  takeProfit: number;
+  riskRewardRatio: number;
+  invalidationCondition: string;
+  rationale: string[];
+  aiSummary?: string | null;
+}
 
 interface DigitStats {
   symbol: string;
@@ -82,11 +113,23 @@ function computeRsi(prices: number[], period = 14): number {
   return Number((100 - 100 / (1 + rs)).toFixed(1));
 }
 
-export const AnalysisToolPage: React.FC = () => {
+interface AnalysisToolPageProps {
+  initialSymbol?: string;
+  onSendSetupToTrader?: (symbol: string, side: 'BUY' | 'SELL', sl: number, tp: number) => void;
+}
+
+export const AnalysisToolPage: React.FC<AnalysisToolPageProps> = ({
+  initialSymbol,
+  onSendSetupToTrader
+}) => {
   const { token, activeDerivAccount, refreshDerivAccounts, refreshProfile, bumpOrderVersion } = useAuth();
-  const [subTab, setSubTab] = useState<'Dcircles' | 'Signals' | 'Over/Under' | 'Rise/Fall'>('Dcircles');
+  const [subTab, setSubTab] = useState<'AI_Analyser' | 'Dcircles' | 'Signals' | 'Over/Under' | 'Rise/Fall'>('AI_Analyser');
   const [instruments, setInstruments] = useState<InstrumentOption[]>([]);
-  const [symbol, setSymbol] = useState('R_100');
+  const [symbol, setSymbol] = useState(initialSymbol || 'R_100');
+  const [granularity, setGranularity] = useState(300);
+  const [aiReport, setAiReport] = useState<AiAnalysisResult | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState('');
   const [ticksWindow, setTicksWindow] = useState(500);
   const [barrierDigit, setBarrierDigit] = useState(4);
   const [stake, setStake] = useState(5);
@@ -96,6 +139,31 @@ export const AnalysisToolPage: React.FC = () => {
   const [error, setError] = useState('');
   const [tradeMsg, setTradeMsg] = useState('');
   const [executing, setExecuting] = useState(false);
+
+  const loadAiAnalysis = async (sym = symbol, gran = granularity) => {
+    setAiLoading(true);
+    setAiError('');
+    try {
+      const res = await apiFetch<AiAnalysisResult>(
+        `/market/ai-analysis?symbol=${encodeURIComponent(sym)}&granularity=${gran}&count=200`
+      );
+      setAiReport(res);
+    } catch (err) {
+      setAiError((err as Error).message);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (initialSymbol && initialSymbol !== symbol) {
+      setSymbol(initialSymbol);
+    }
+  }, [initialSymbol]);
+
+  useEffect(() => {
+    loadAiAnalysis(symbol, granularity);
+  }, [symbol, granularity]);
 
   useEffect(() => {
     let cancelled = false;
@@ -259,7 +327,7 @@ export const AnalysisToolPage: React.FC = () => {
     <div className="max-w-4xl mx-auto p-4 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
-          {(['Dcircles', 'Over/Under', 'Rise/Fall', 'Signals'] as const).map((t) => (
+          {(['AI_Analyser', 'Dcircles', 'Over/Under', 'Rise/Fall', 'Signals'] as const).map((t) => (
             <button
               key={t}
               type="button"
@@ -270,17 +338,161 @@ export const AnalysisToolPage: React.FC = () => {
                   : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-800'
               }`}
             >
-              {t}
+              {t === 'AI_Analyser' ? 'AI Market Analyser' : t}
             </button>
           ))}
         </div>
 
         <div className="flex items-center gap-2 text-xs">
           <span className="inline-flex items-center gap-1 font-semibold text-emerald-600 dark:text-emerald-400">
-            <Activity className="w-3.5 h-3.5" /> Live Deriv Feed
+            <Activity className="w-3.5 h-3.5" /> Live Deriv &amp; XAUUSD Feed
           </span>
         </div>
       </div>
+
+      {/* AI Market Technical Analyser Panel */}
+      {subTab === 'AI_Analyser' && (
+        <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-5 space-y-4 shadow-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={symbol}
+                onChange={(e) => setSymbol(e.target.value)}
+                className="border border-slate-300 dark:border-slate-700 rounded-lg px-3 py-2 text-xs font-bold bg-white dark:bg-slate-800"
+              >
+                <option value="XAUUSD">XAU/USD — Spot Gold (External Feed)</option>
+                <option value="R_100">R_100 — Volatility 100 Index</option>
+                <option value="R_75">R_75 — Volatility 75 Index</option>
+                <option value="R_50">R_50 — Volatility 50 Index</option>
+                <option value="R_25">R_25 — Volatility 25 Index</option>
+                <option value="1HZ100V">1HZ100V — Volatility 100 (1s)</option>
+                <option value="1HZ90V">1HZ90V — Volatility 90 (1s)</option>
+                <option value="frxEURUSD">frxEURUSD — EUR/USD</option>
+                <option value="frxGBPUSD">frxGBPUSD — GBP/USD</option>
+                <option value="cryBTCUSD">cryBTCUSD — BTC/USD</option>
+              </select>
+
+              <select
+                value={granularity}
+                onChange={(e) => setGranularity(Number(e.target.value))}
+                className="border border-slate-300 dark:border-slate-700 rounded-lg px-3 py-2 text-xs font-bold bg-white dark:bg-slate-800"
+              >
+                <option value={60}>1m TF</option>
+                <option value={300}>5m TF</option>
+                <option value={900}>15m TF</option>
+                <option value={3600}>1H TF</option>
+                <option value={14400}>4H TF</option>
+              </select>
+            </div>
+
+            <button
+              type="button"
+              disabled={aiLoading}
+              onClick={() => loadAiAnalysis(symbol, granularity)}
+              className="px-3.5 py-2 rounded-lg bg-[#00a884] hover:bg-[#008f70] text-white text-xs font-bold inline-flex items-center gap-1.5"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${aiLoading ? 'animate-spin' : ''}`} />
+              <span>Run Quantitative Scan</span>
+            </button>
+          </div>
+
+          {aiError && (
+            <div className="rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 px-3 py-2 text-xs text-rose-600">
+              {aiError}
+            </div>
+          )}
+
+          {aiReport && (
+            <div className="space-y-4">
+              <div className="rounded-xl bg-slate-900 text-white p-4 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-mono text-slate-400">
+                    {aiReport.symbol} ({aiReport.timeframe}) · {aiReport.dataSource} · {new Date(aiReport.timestamp).toLocaleTimeString()}
+                  </div>
+                  <div className="text-xl font-extrabold flex items-center gap-2 mt-0.5">
+                    <span>Spot: {aiReport.spot}</span>
+                    <span
+                      className={`px-2.5 py-0.5 rounded-full text-xs font-black ${
+                        aiReport.bias === 'BUY'
+                          ? 'bg-emerald-500 text-white'
+                          : aiReport.bias === 'SELL'
+                            ? 'bg-rose-600 text-white'
+                            : 'bg-slate-700 text-slate-200'
+                      }`}
+                    >
+                      {aiReport.bias} · {aiReport.regime} ({aiReport.confidence}%)
+                    </span>
+                  </div>
+                </div>
+
+                {aiReport.bias !== 'NEUTRAL' && onSendSetupToTrader && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onSendSetupToTrader(
+                        aiReport.symbol === 'XAUUSD' ? 'frxXAUUSD' : aiReport.symbol,
+                        aiReport.bias === 'BUY' ? 'BUY' : 'SELL',
+                        aiReport.stopLoss,
+                        aiReport.takeProfit
+                      )
+                    }
+                    className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold inline-flex items-center gap-1"
+                  >
+                    <span>Send Setup to Trader</span>
+                    <ArrowUpRight className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                  <div className="text-[10px] text-slate-400">Entry Zone</div>
+                  <div className="font-bold">
+                    {aiReport.entryZone.low} – {aiReport.entryZone.high}
+                  </div>
+                </div>
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                  <div className="text-[10px] text-rose-500">Stop Loss</div>
+                  <div className="font-bold text-rose-600">{aiReport.stopLoss}</div>
+                </div>
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                  <div className="text-[10px] text-emerald-500">Take Profit</div>
+                  <div className="font-bold text-emerald-600">{aiReport.takeProfit}</div>
+                </div>
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                  <div className="text-[10px] text-slate-400">Risk : Reward</div>
+                  <div className="font-bold text-blue-600">1 : {aiReport.riskRewardRatio}</div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px] font-mono bg-slate-50 dark:bg-slate-800/70 rounded-xl p-3">
+                <div>RSI(14): <strong>{aiReport.indicators.rsi14}</strong></div>
+                <div>MACD Hist: <strong>{aiReport.indicators.macdHistogram}</strong></div>
+                <div>EMA 20/50: <strong>{aiReport.indicators.ema20}/{aiReport.indicators.ema50}</strong></div>
+                <div>ATR(14): <strong>{aiReport.indicators.atr14}</strong></div>
+                <div>S/R: <strong>{aiReport.indicators.support} / {aiReport.indicators.resistance}</strong></div>
+              </div>
+
+              <div className="space-y-1.5 text-xs">
+                <div className="font-bold text-amber-600 dark:text-amber-400">
+                  Invalidation: {aiReport.invalidationCondition}
+                </div>
+                {aiReport.rationale.map((line, i) => (
+                  <div key={i} className="text-slate-600 dark:text-slate-300">
+                    • {line}
+                  </div>
+                ))}
+                {aiReport.aiSummary && (
+                  <div className="mt-2 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 p-3 text-xs text-emerald-800 dark:text-emerald-200 flex items-start gap-2">
+                    <Sparkles className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>{aiReport.aiSummary}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-5 space-y-4 shadow-xs">
         <div className="grid sm:grid-cols-3 gap-3">

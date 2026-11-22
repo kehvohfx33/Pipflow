@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { pool } from '../database/pool';
-import { env } from '../config/env';
+import { env, validateEnvironmentConfig } from '../config/env';
 import { derivConnectionManager } from '../integrations/deriv/connection-manager';
 import {
   authorizeReadOnlyAccount,
@@ -234,6 +234,7 @@ export async function getAdminOverview(req: Request, res: Response) {
     users: users.rows,
     connectedAccounts: accounts.rows,
     derivDiagnostics: derivConnectionManager.getDiagnostics(),
+    configStatus: validateEnvironmentConfig(),
     auditLogs: auditLogs.rows,
     securityLogs: securityLogs.rows,
     emailLogs: emailLogs.rows,

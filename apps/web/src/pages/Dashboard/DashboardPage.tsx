@@ -148,6 +148,36 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ onSelectTab }) => 
             </button>
           ))}
         </div>
+        <div className="pt-2 border-t border-slate-800/80">
+          <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
+            Unified Trading Modules
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {[
+              { id: 'markets', label: 'Markets' },
+              { id: 'trading_view', label: 'Trader (MT5)' },
+              { id: 'rise_fall', label: 'Rise/Fall' },
+              { id: 'digits', label: 'Digits' },
+              { id: 'accumulators', label: 'Accumulators' },
+              { id: 'charts', label: 'Charts & SmartChart' },
+              { id: 'analysistool', label: 'AI Analyser' },
+              { id: 'signals', label: 'Signals' },
+              { id: 'automated_bots', label: 'Automated Bots' },
+              { id: 'wallets', label: 'Wallets' },
+              { id: 'portfolio', label: 'Portfolio' },
+              { id: 'analytics', label: 'Analytics' }
+            ].map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => onSelectTab(m.id)}
+                className="px-2.5 py-1 rounded-lg bg-slate-900/90 border border-slate-700 hover:border-sky-400 text-[11px] font-semibold text-slate-200 transition"
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* Summary / Transactions / Journal Panel matching Screenshots 3 & 5 */}

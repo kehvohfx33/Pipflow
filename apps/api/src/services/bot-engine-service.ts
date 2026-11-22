@@ -21,6 +21,7 @@ export interface BotEntryCondition {
 
 export interface StartBotOptions {
   userId: string;
+  workspaceId?: string | null;
   symbol: string;
   botName: string;
   stake: number;
@@ -31,12 +32,14 @@ export interface StartBotOptions {
   stopLossUsd?: number | null;
   maxWins?: number | null;
   connectedAccountId?: string | null;
+  confirmRealTrading?: boolean;
   contractType?: string;
   barrier?: string | number;
   recoveryPrediction?: string | number;
   duration?: number;
   durationUnit?: 't' | 's' | 'm' | 'h' | 'd';
   multiplier?: number;
+  growthRate?: number;
   martingale?: number;
   useMartingale?: boolean;
   allowBulkPurchase?: boolean;
@@ -46,9 +49,12 @@ export interface StartBotOptions {
 }
 
 interface ActiveBotSession {
+  runId: string | null;
+  workspaceId: string | null;
   userId: string;
   symbol: string;
   botName: string;
+  accountType: 'virtual' | 'demo' | 'real';
   baseStake: number;
   currentStake: number;
   tpPct: number;
@@ -65,6 +71,7 @@ interface ActiveBotSession {
   duration: number;
   durationUnit: 't' | 's' | 'm' | 'h' | 'd';
   multiplier: number;
+  growthRate: number;
   martingale: number;
   useMartingale: boolean;
   allowBulkPurchase: boolean;
@@ -75,7 +82,9 @@ interface ActiveBotSession {
   lastPrices: number[];
   pipSize: number;
   isRunning: boolean;
+  isPaused: boolean;
   startedAt: string;
+  lastTickAt: number;
   tradesCount: number;
   wins: number;
   losses: number;
@@ -90,6 +99,35 @@ const botTradeLocks = new Set<string>();
 const virtualTickCounters = new Map<string, number>();
 let listenerAttached = false;
 let broadcastFn: ((userId: string, event: unknown) => void) | null = null;
+
+function persistBotRunStats(session: ActiveBotSession) {
+  if (!session.runId || !isStorageReady) return;
+  pool
+    .query(
+      `UPDATE bot_runs SET trades_count = $2, wins = $3, losses = $4, session_pnl = $5, last_action = $6 WHERE id = $1`,
+      [session.runId, session.tradesCount, session.wins, session.losses, Number(session.sessionPnl.toFixed(2)), session.lastAction]
+    )
+    .catch(() => {});
+}
+
+function finalizeBotRunInDb(session: ActiveBotSession, status: 'stopped' | 'emergency_stopped', reason: string) {
+  if (!session.runId || !isStorageReady) return;
+  pool
+    .query(
+      `UPDATE bot_runs SET status = $2, stop_reason = $3, trades_count = $4, wins = $5, losses = $6, session_pnl = $7, last_action = $8, stopped_at = NOW() WHERE id = $1`,
+      [
+        session.runId,
+        status,
+        reason,
+        session.tradesCount,
+        session.wins,
+        session.losses,
+        Number(session.sessionPnl.toFixed(2)),
+        session.lastAction
+      ]
+    )
+    .catch(() => {});
+}
 
 function applyBotOrderSettlement(
   userId: string,
@@ -115,10 +153,12 @@ function applyBotOrderSettlement(
     }
   }
   botSession.lastAction = `Closed ${symbol} (${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD)`;
+  persistBotRunStats(botSession);
 
   if (botSession.maxWins !== null && botSession.wins >= botSession.maxWins) {
     botSession.isRunning = false;
     botSession.lastAction = `Target reached: ${botSession.wins} win(s) completed (+$${botSession.sessionPnl.toFixed(2)})`;
+    finalizeBotRunInDb(botSession, 'stopped', botSession.lastAction);
     activeBots.delete(userId);
     broadcastFn?.(userId, {
       type: 'bot_stopped',
@@ -131,6 +171,7 @@ function applyBotOrderSettlement(
   ) {
     botSession.isRunning = false;
     botSession.lastAction = `Stop Loss reached ($${botSession.sessionPnl.toFixed(2)})`;
+    finalizeBotRunInDb(botSession, 'stopped', botSession.lastAction);
     activeBots.delete(userId);
     broadcastFn?.(userId, {
       type: 'bot_stopped',
@@ -225,10 +266,19 @@ function resolveBotSignal(session: ActiveBotSession, quote: number): {
       reason: `${requested} digit ${barrier}`
     };
   }
-  if (requested === 'CALL' || requested === 'PUT') {
-    const contractType = momentumUp ? 'CALL' : 'PUT';
+  if (requested === 'ACCU') {
     return {
-      side: contractType === 'CALL' ? 'BUY' : 'SELL',
+      side: 'BUY',
+      contractType: 'ACCU',
+      reason: `Accumulator ${(session.growthRate * 100).toFixed(0)}% growth rate`
+    };
+  }
+  if (requested === 'CALL' || requested === 'PUT' || requested === 'CALLE' || requested === 'PUTE') {
+    const contractType = requested === 'CALLE' || requested === 'PUTE'
+      ? momentumUp ? 'CALLE' : 'PUTE'
+      : momentumUp ? 'CALL' : 'PUT';
+    return {
+      side: contractType.startsWith('CALL') ? 'BUY' : 'SELL',
       contractType,
       reason: `Rise/Fall ${contractType} (${quote.toFixed(session.pipSize)} vs avg ${avg.toFixed(session.pipSize)})`
     };
@@ -249,13 +299,16 @@ function resolveBotSignal(session: ActiveBotSession, quote: number): {
 }
 
 async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: number, isInitialBurst = false) {
-  if (!session.isRunning || !isStorageReady) return;
+  if (!session.isRunning || session.isPaused || !isStorageReady) return;
   if (botTradeLocks.has(session.userId)) return;
+
+  session.lastTickAt = Date.now();
 
   // Enforce Number of Wins target & Stop Loss USD hard stop
   if (session.maxWins !== null && session.wins >= session.maxWins) {
     session.isRunning = false;
     session.lastAction = `Target reached: ${session.wins} win(s) completed (+$${session.sessionPnl.toFixed(2)})`;
+    finalizeBotRunInDb(session, 'stopped', session.lastAction);
     activeBots.delete(session.userId);
     broadcastFn?.(session.userId, { type: 'bot_stopped', reason: session.lastAction, botStatus: formatBotStatus(session) });
     return;
@@ -263,6 +316,7 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
   if (session.stopLossUsd !== null && session.sessionPnl <= -Math.abs(session.stopLossUsd)) {
     session.isRunning = false;
     session.lastAction = `Stop Loss reached ($${session.sessionPnl.toFixed(2)})`;
+    finalizeBotRunInDb(session, 'stopped', session.lastAction);
     activeBots.delete(session.userId);
     broadcastFn?.(session.userId, { type: 'bot_stopped', reason: session.lastAction, botStatus: formatBotStatus(session) });
     return;
@@ -312,7 +366,8 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
             duration: session.duration,
             durationUnit: session.durationUnit,
             barrier: signal.barrier,
-            multiplier: session.multiplier
+            multiplier: session.multiplier,
+            growthRate: session.growthRate
           });
 
           const resolvedEntry = exec.spotPrice > 0 ? exec.spotPrice : quote;
@@ -339,6 +394,7 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
           );
           session.tradesCount += 1;
           session.lastAction = `Placed ${tradesToOpen > 1 ? `${i + 1}/${tradesToOpen} ` : ''}${exec.contractType} #${exec.contractId} ($${exec.buyPrice.toFixed(2)}) — ${signal.reason}`;
+          persistBotRunStats(session);
           broadcastFn?.(session.userId, {
             type: 'bot_order_opened',
             order: inserted.rows[0],
@@ -349,6 +405,7 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
       } catch (derivErr) {
         session.isRunning = false;
         session.lastAction = `Stopped: ${(derivErr as Error).message}`;
+        finalizeBotRunInDb(session, 'stopped', session.lastAction);
         activeBots.delete(session.userId);
         await createNotification(
           session.userId,
@@ -364,11 +421,15 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
     const isShortTermContract =
       signal.contractType.startsWith('DIGIT') ||
       signal.contractType === 'CALL' ||
-      signal.contractType === 'PUT';
+      signal.contractType === 'PUT' ||
+      signal.contractType === 'CALLE' ||
+      signal.contractType === 'PUTE' ||
+      signal.contractType === 'ACCU';
     const contractMeta = isShortTermContract
       ? {
           barrier: signal.barrier !== undefined && signal.barrier !== '' ? String(signal.barrier) : null,
-          durationTicks: Math.max(1, Number(session.duration || 1)),
+          durationTicks: signal.contractType === 'ACCU' ? Math.max(2, Number(session.duration || 4)) : Math.max(1, Number(session.duration || 1)),
+          growthRate: signal.contractType === 'ACCU' ? session.growthRate : undefined,
           ticksElapsed: 0
         }
       : null;
@@ -393,6 +454,7 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
       );
       session.tradesCount += 1;
       session.lastAction = `Placed ${tradesToOpen > 1 ? `${i + 1}/${tradesToOpen} ` : ''}${signal.contractType} ($${session.currentStake.toFixed(2)}) — ${signal.reason}`;
+      persistBotRunStats(session);
       broadcastFn?.(session.userId, {
         type: 'bot_order_opened',
         order: inserted.rows[0],
@@ -406,7 +468,11 @@ async function evaluateAndExecuteBotTick(session: ActiveBotSession, quote: numbe
 
 function formatBotStatus(s: ActiveBotSession) {
   return {
+    runId: s.runId,
+    workspaceId: s.workspaceId,
     running: s.isRunning,
+    paused: s.isPaused,
+    accountType: s.accountType,
     symbol: s.symbol,
     botName: s.botName,
     stake: s.baseStake,
@@ -417,6 +483,7 @@ function formatBotStatus(s: ActiveBotSession) {
     duration: s.duration,
     durationUnit: s.durationUnit,
     multiplier: s.multiplier,
+    growthRate: s.growthRate,
     martingale: s.martingale,
     useMartingale: s.useMartingale,
     tpPct: s.tpPct,
@@ -447,7 +514,7 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
     applyBotOrderSettlement(info.userId, info.source, info.symbol, info.pnl);
   });
 
-  // Poll live open Deriv contracts (including 1-tick / N-tick Digit & Rise/Fall trades) every 5s
+  // Poll live open Deriv contracts + Watchdog for stale tick feeds
   let derivPollBusy = false;
   setInterval(async () => {
     if (derivPollBusy || !isStorageReady) return;
@@ -458,6 +525,24 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
       );
       for (const row of q.rows) {
         await syncOpenDerivOrdersForUser(row.user_id).catch(() => {});
+      }
+
+      // Stale tick feed safety stop (> 40s without ticks on active unpaused bot)
+      const now = Date.now();
+      for (const [uid, sess] of activeBots.entries()) {
+        if (sess.isRunning && !sess.isPaused && now - sess.lastTickAt > 40_000) {
+          sess.isRunning = false;
+          sess.lastAction = `Auto-stopped: stale tick feed on ${sess.symbol} (>40s)`;
+          finalizeBotRunInDb(sess, 'stopped', sess.lastAction);
+          activeBots.delete(uid);
+          await createNotification(
+            uid,
+            'system',
+            `Bot Auto-Stopped (${sess.botName})`,
+            sess.lastAction
+          ).catch(() => {});
+          broadcastFn?.(uid, { type: 'bot_stopped', reason: sess.lastAction, botStatus: formatBotStatus(sess) });
+        }
       }
     } catch {
       // Ignore transient polling errors
@@ -493,7 +578,10 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
           (Boolean(meta?.durationTicks) ||
             cType.startsWith('DIGIT') ||
             cType === 'CALL' ||
-            cType === 'PUT');
+            cType === 'PUT' ||
+            cType === 'CALLE' ||
+            cType === 'PUTE' ||
+            cType === 'ACCU');
 
         if (isShortTermVirtual) {
           const targetTicks = Math.max(1, Number(meta?.durationTicks ?? 1));
@@ -535,6 +623,17 @@ export function attachTickEvaluator(broadcastToUser: (userId: string, event: unk
             } else if (cType === 'PUT') {
               won = quote < entry;
               winRate = 0.95;
+            } else if (cType === 'CALLE') {
+              won = quote >= entry;
+              winRate = 0.90;
+            } else if (cType === 'PUTE') {
+              won = quote <= entry;
+              winRate = 0.90;
+            } else if (cType === 'ACCU') {
+              const rate = Number((meta as { growthRate?: number } | null)?.growthRate ?? 0.03);
+              const pctMove = Math.abs(quote - entry) / Math.max(1e-6, entry);
+              won = pctMove <= Math.max(0.002, (0.06 - rate) * 0.05);
+              winRate = Math.min(2.5, Math.pow(1 + rate, targetTicks) - 1);
             }
 
             const pnl = won ? Number((stake * winRate).toFixed(2)) : Number((-stake).toFixed(2));
@@ -695,6 +794,26 @@ export async function startBotSession(
         }
       : input;
 
+  // Check target account safety: Demo/Virtual is default; Real accounts require explicit confirmRealTrading
+  let resolvedAccountType: 'virtual' | 'demo' | 'real' = 'virtual';
+  if (opts.connectedAccountId) {
+    const acct = await getAuthorizedAccountForTrading(opts.userId, opts.connectedAccountId).catch(() => null);
+    if (!acct) {
+      throw new Error('Selected Deriv account is not connected or authorized.');
+    }
+    if (acct.accountType === 'real' && !opts.confirmRealTrading) {
+      throw new Error('Real-account automated trading requires explicit confirmation.');
+    }
+    resolvedAccountType = acct.accountType;
+  }
+
+  // Finalize any prior active run for this user
+  const prev = activeBots.get(opts.userId);
+  if (prev) {
+    prev.isRunning = false;
+    finalizeBotRunInDb(prev, 'stopped', 'Replaced by new bot run');
+  }
+
   await ensureLiveTickSubscription(opts.symbol);
 
   // Seed recent tick history immediately so bot places its first trade with zero delay
@@ -709,10 +828,41 @@ export async function startBotSession(
     seededPrices = [];
   }
 
+  let runId: string | null = null;
+  try {
+    const runRes = await pool.query(
+      `INSERT INTO bot_runs (user_id, workspace_id, connected_account_id, bot_name, symbol, contract_type, account_type, config_json)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id`,
+      [
+        opts.userId,
+        opts.workspaceId ?? null,
+        opts.connectedAccountId ?? null,
+        opts.botName,
+        opts.symbol,
+        opts.contractType ?? null,
+        resolvedAccountType,
+        JSON.stringify({
+          stake: opts.stake,
+          duration: opts.duration ?? 5,
+          durationUnit: opts.durationUnit ?? 't',
+          martingale: opts.martingale ?? 1.5,
+          useMartingale: Boolean(opts.useMartingale),
+          growthRate: opts.growthRate ?? 0.03
+        })
+      ]
+    );
+    runId = runRes.rows[0]?.id ?? null;
+  } catch {
+    runId = null;
+  }
+
   const session: ActiveBotSession = {
+    runId,
+    workspaceId: opts.workspaceId ?? null,
     userId: opts.userId,
     symbol: opts.symbol,
     botName: opts.botName,
+    accountType: resolvedAccountType,
     baseStake: Math.max(0.35, Number(opts.stake || 10)),
     currentStake: Math.max(0.35, Number(opts.stake || 10)),
     tpPct: Number(opts.tpPct ?? 0.08),
@@ -729,6 +879,7 @@ export async function startBotSession(
     duration: Math.max(1, Number(opts.duration ?? 5)),
     durationUnit: opts.durationUnit ?? 't',
     multiplier: Math.max(10, Number(opts.multiplier ?? 100)),
+    growthRate: Math.min(0.05, Math.max(0.01, Number(opts.growthRate ?? 0.03))),
     martingale: Math.max(1, Number(opts.martingale ?? 1.5)),
     useMartingale: Boolean(opts.useMartingale),
     allowBulkPurchase: Boolean(opts.allowBulkPurchase),
@@ -739,7 +890,9 @@ export async function startBotSession(
     lastPrices: seededPrices,
     pipSize,
     isRunning: true,
+    isPaused: false,
     startedAt: new Date().toISOString(),
+    lastTickAt: Date.now(),
     tradesCount: 0,
     wins: 0,
     losses: 0,
@@ -759,15 +912,78 @@ export async function startBotSession(
   return formatBotStatus(session);
 }
 
-export function stopBotSession(userId: string) {
+export function pauseBotSession(userId: string) {
   const existing = activeBots.get(userId);
-  if (existing) existing.isRunning = false;
+  if (!existing) return { running: false, paused: false };
+  existing.isPaused = true;
+  existing.lastAction = 'Paused by user';
+  if (existing.runId) {
+    pool
+      .query(`UPDATE bot_runs SET status = 'paused', paused_at = NOW(), last_action = $2 WHERE id = $1`, [
+        existing.runId,
+        existing.lastAction
+      ])
+      .catch(() => {});
+  }
+  return formatBotStatus(existing);
+}
+
+export function resumeBotSession(userId: string) {
+  const existing = activeBots.get(userId);
+  if (!existing) return { running: false, paused: false };
+  existing.isPaused = false;
+  existing.lastTickAt = Date.now();
+  existing.lastAction = 'Resumed by user';
+  if (existing.runId) {
+    pool
+      .query(`UPDATE bot_runs SET status = 'running', paused_at = NULL, last_action = $2 WHERE id = $1`, [
+        existing.runId,
+        existing.lastAction
+      ])
+      .catch(() => {});
+  }
+  return formatBotStatus(existing);
+}
+
+export function stopBotSession(userId: string, reason = 'Stopped by user') {
+  const existing = activeBots.get(userId);
+  if (existing) {
+    existing.isRunning = false;
+    existing.lastAction = reason;
+    finalizeBotRunInDb(existing, 'stopped', reason);
+  }
   activeBots.delete(userId);
-  return { running: false };
+  return { running: false, paused: false };
+}
+
+export async function emergencyStopBot(userId: string, fallbackPriceMap?: Record<string, number>) {
+  const existing = activeBots.get(userId);
+  if (existing) {
+    existing.isRunning = false;
+    existing.lastAction = 'Emergency stop triggered';
+    finalizeBotRunInDb(existing, 'emergency_stopped', 'Emergency stop triggered by user');
+    activeBots.delete(userId);
+  }
+  const closed = await closeAllBotOrders(userId, fallbackPriceMap);
+  await createNotification(
+    userId,
+    'security',
+    'Bot Emergency Stop Executed',
+    `All automated bot execution halted and ${closed.closedCount} open bot position(s) closed.`
+  ).catch(() => {});
+  return { ...closed, emergencyStopped: true };
+}
+
+export async function getBotRunsHistory(userId: string) {
+  const q = await pool.query(
+    `SELECT * FROM bot_runs WHERE user_id = $1 ORDER BY started_at DESC LIMIT 50`,
+    [userId]
+  );
+  return q.rows;
 }
 
 export async function closeAllBotOrders(userId: string, fallbackPriceMap?: Record<string, number>) {
-  stopBotSession(userId);
+  stopBotSession(userId, 'Stopped while closing all bot trades');
   const openRes = await pool.query(
     `SELECT * FROM virtual_orders WHERE user_id = $1 AND source = 'bot' AND status = 'OPEN'`,
     [userId]
@@ -832,5 +1048,5 @@ export async function closeAllBotOrders(userId: string, fallbackPriceMap?: Recor
 
 export function getBotStatus(userId: string) {
   const s = activeBots.get(userId);
-  return s ? formatBotStatus(s) : { running: false };
+  return s ? formatBotStatus(s) : { running: false, paused: false };
 }

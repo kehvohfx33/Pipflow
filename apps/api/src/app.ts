@@ -6,7 +6,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import { WebSocketServer, WebSocket } from 'ws';
-import { env } from './config/env';
+import { env, validateEnvironmentConfig } from './config/env';
 import { router } from './routes';
 import { handleDerivOAuthCallback } from './controllers/derivController';
 import { requireDb } from './middleware/authorization';
@@ -142,11 +142,9 @@ export function createApiApp() {
     Promise.resolve(handleDerivOAuthCallback(req, res)).catch(next);
   });
 
-  if (env.nodeEnv === 'production' && (!process.env.JWT_SECRET || !process.env.TOKEN_ENCRYPTION_KEY)) {
-    logError(
-      'security',
-      'JWT_SECRET or TOKEN_ENCRYPTION_KEY is unset in production; ephemeral fallback keys invalidate sessions on restart'
-    );
+  const envReport = validateEnvironmentConfig();
+  for (const w of envReport.warnings) {
+    logError('config', w);
   }
 
   // Global Express JSON error handler so unhandled DB/API errors never leak stack traces or infra details

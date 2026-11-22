@@ -124,6 +124,41 @@ interface AppSettingRow {
   updated_at: string;
 }
 
+interface BotWorkspaceRow {
+  id: string;
+  user_id: string;
+  name: string;
+  symbol: string;
+  strategy_type: string;
+  xml_content: string;
+  config_json: Record<string, unknown>;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+interface BotRunRow {
+  id: string;
+  user_id: string;
+  workspace_id: string | null;
+  connected_account_id: string | null;
+  bot_name: string;
+  symbol: string;
+  contract_type: string | null;
+  account_type: string;
+  status: 'running' | 'paused' | 'stopped' | 'emergency_stopped';
+  config_json: Record<string, unknown>;
+  trades_count: number;
+  wins: number;
+  losses: number;
+  session_pnl: number;
+  last_action: string | null;
+  stop_reason: string | null;
+  started_at: string;
+  paused_at: string | null;
+  stopped_at: string | null;
+}
+
 const SEEDED_STRATEGIES: Array<Omit<BotStrategyRow, 'id' | 'rating' | 'created_at'>> = [
   { slug: '07-over-hit-n-run', name: '07_Over_Hit_n_Run', category: 'Free Bots', symbol: 'R_100', strategy_config: { tradeType: 'Digits > Over/Under', stake: 10, tpPct: 0.08, slPct: 0.05, martingale: 2 }, is_premium: true },
   { slug: 'autodifferbylegoo', name: 'AutoDifferbylegoo', category: 'Free Bots', symbol: 'R_25', strategy_config: { tradeType: 'Digits > Matches/Differs', stake: 5, tpPct: 0.06, slPct: 0.04, martingale: 1.5 }, is_premium: true },
@@ -178,6 +213,8 @@ export function createMemoryPool() {
   const securityLogs: Array<Record<string, unknown>> = [];
   const emailLogs: Array<Record<string, unknown>> = [];
   const adminAuditLogs: Array<Record<string, unknown>> = [];
+  const botWorkspaces: BotWorkspaceRow[] = [];
+  const botRuns: BotRunRow[] = [];
 
   const botStrategies: BotStrategyRow[] = SEEDED_STRATEGIES.map((s, idx) => ({
     ...s,
@@ -861,6 +898,118 @@ export function createMemoryPool() {
     }
     if (low.includes('from administrator_audit_logs')) {
       return { rows: adminAuditLogs.slice(0, 100) as unknown as T[], rowCount: adminAuditLogs.length };
+    }
+
+    // BOT WORKSPACES
+    if (low.includes('from bot_workspaces')) {
+      if (low.includes('where id = $1 and user_id = $2')) {
+        const rows = botWorkspaces.filter(
+          (w) => w.id === String(params[0]) && w.user_id === String(params[1])
+        );
+        return { rows: rows as unknown as T[], rowCount: rows.length };
+      }
+      const rows = botWorkspaces
+        .filter((w) => w.user_id === String(params[0]) && w.is_active)
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      return { rows: rows as unknown as T[], rowCount: rows.length };
+    }
+    if (low.startsWith('insert into bot_workspaces')) {
+      const ws: BotWorkspaceRow = {
+        id: crypto.randomUUID(),
+        user_id: String(params[0]),
+        name: String(params[1] ?? 'Untitled Strategy'),
+        symbol: String(params[2] ?? 'R_100'),
+        strategy_type: String(params[3] ?? 'custom'),
+        xml_content: String(params[4] ?? ''),
+        config_json: parseJsonParam(params[5]) ?? {},
+        is_active: true,
+        created_at: nowIso(),
+        updated_at: nowIso()
+      };
+      botWorkspaces.unshift(ws);
+      return { rows: [ws] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update bot_workspaces')) {
+      const ws = botWorkspaces.find(
+        (w) => w.id === String(params[4]) && w.user_id === String(params[5])
+      );
+      if (!ws) return { rows: [], rowCount: 0 };
+      ws.name = String(params[0] ?? ws.name);
+      ws.symbol = String(params[1] ?? ws.symbol);
+      ws.xml_content = String(params[2] ?? ws.xml_content);
+      ws.config_json = parseJsonParam(params[3]) ?? ws.config_json;
+      ws.updated_at = nowIso();
+      return { rows: [ws] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('delete from bot_workspaces')) {
+      const idx = botWorkspaces.findIndex(
+        (w) => w.id === String(params[0]) && w.user_id === String(params[1])
+      );
+      if (idx >= 0) botWorkspaces.splice(idx, 1);
+      return { rows: [], rowCount: idx >= 0 ? 1 : 0 };
+    }
+
+    // BOT RUNS
+    if (low.includes('from bot_runs')) {
+      const rows = botRuns
+        .filter((r) => r.user_id === String(params[0]))
+        .sort((a, b) => b.started_at.localeCompare(a.started_at))
+        .slice(0, 50);
+      return { rows: rows as unknown as T[], rowCount: rows.length };
+    }
+    if (low.startsWith('insert into bot_runs')) {
+      const run: BotRunRow = {
+        id: crypto.randomUUID(),
+        user_id: String(params[0]),
+        workspace_id: params[1] ? String(params[1]) : null,
+        connected_account_id: params[2] ? String(params[2]) : null,
+        bot_name: String(params[3] ?? 'PipFlow Bot'),
+        symbol: String(params[4] ?? 'R_100'),
+        contract_type: params[5] ? String(params[5]) : null,
+        account_type: String(params[6] ?? 'virtual'),
+        status: 'running',
+        config_json: parseJsonParam(params[7]) ?? {},
+        trades_count: 0,
+        wins: 0,
+        losses: 0,
+        session_pnl: 0,
+        last_action: 'Bot run started',
+        stop_reason: null,
+        started_at: nowIso(),
+        paused_at: null,
+        stopped_at: null
+      };
+      botRuns.unshift(run);
+      return { rows: [run] as unknown as T[], rowCount: 1 };
+    }
+    if (low.startsWith('update bot_runs set')) {
+      const run = botRuns.find((r) => r.id === String(params[0]));
+      if (!run) return { rows: [], rowCount: 0 };
+      if (low.includes("status = 'paused'")) {
+        run.status = 'paused';
+        run.paused_at = nowIso();
+        run.last_action = String(params[1] ?? 'Paused by user');
+      } else if (low.includes("status = 'running'")) {
+        run.status = 'running';
+        run.paused_at = null;
+        run.last_action = String(params[1] ?? 'Resumed by user');
+      } else if (low.includes('stopped_at = now()')) {
+        run.status = (params[1] as BotRunRow['status']) || 'stopped';
+        run.stop_reason = params[2] ? String(params[2]) : null;
+        run.trades_count = Number(params[3] ?? run.trades_count);
+        run.wins = Number(params[4] ?? run.wins);
+        run.losses = Number(params[5] ?? run.losses);
+        run.session_pnl = Number(params[6] ?? run.session_pnl);
+        run.last_action = params[7] ? String(params[7]) : run.last_action;
+        run.stopped_at = nowIso();
+      } else {
+        run.trades_count = Number(params[1] ?? run.trades_count);
+        run.wins = Number(params[2] ?? run.wins);
+        run.losses = Number(params[3] ?? run.losses);
+        run.session_pnl = Number(params[4] ?? run.session_pnl);
+        run.last_action = params[5] ? String(params[5]) : run.last_action;
+      }
+      return { rows: [run] as unknown as T[], rowCount: 1 };
     }
 
     return { rows: [], rowCount: 0 };

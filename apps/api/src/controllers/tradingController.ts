@@ -1,7 +1,16 @@
 import { Request, Response } from 'express';
 import { pool } from '../database/pool';
 import { ensureLiveTickSubscription } from '../services/market-data-service';
-import { closeAllBotOrders, startBotSession, stopBotSession, getBotStatus } from '../services/bot-engine-service';
+import {
+  closeAllBotOrders,
+  emergencyStopBot,
+  getBotRunsHistory,
+  getBotStatus,
+  pauseBotSession,
+  resumeBotSession,
+  startBotSession,
+  stopBotSession
+} from '../services/bot-engine-service';
 import { createNotification } from '../services/notification-service';
 import { broadcastToUser } from '../services/realtime-hub';
 import { derivConnectionManager } from '../integrations/deriv/connection-manager';
@@ -37,6 +46,7 @@ export async function runBot(req: Request, res: Response) {
   const {
     symbol = 'R_100',
     botName = '07_Over_Hit_n_Run',
+    workspaceId = null,
     stake = 10,
     tpPct = 0.08,
     slPct = 0.05,
@@ -45,6 +55,7 @@ export async function runBot(req: Request, res: Response) {
     stopLossUsd = null,
     maxWins = null,
     connectedAccountId = null,
+    confirmRealTrading = false,
     contractType,
     barrier,
     prediction,
@@ -52,6 +63,7 @@ export async function runBot(req: Request, res: Response) {
     duration,
     durationUnit,
     multiplier,
+    growthRate,
     martingale,
     useMartingale,
     allowBulkPurchase,
@@ -61,6 +73,7 @@ export async function runBot(req: Request, res: Response) {
   } = req.body as {
     symbol?: string;
     botName?: string;
+    workspaceId?: string | null;
     stake?: number;
     tpPct?: number;
     slPct?: number;
@@ -69,6 +82,7 @@ export async function runBot(req: Request, res: Response) {
     stopLossUsd?: number | null;
     maxWins?: number | null;
     connectedAccountId?: string | null;
+    confirmRealTrading?: boolean;
     contractType?: string;
     barrier?: string | number;
     prediction?: string | number;
@@ -76,6 +90,7 @@ export async function runBot(req: Request, res: Response) {
     duration?: number;
     durationUnit?: 't' | 's' | 'm' | 'h' | 'd';
     multiplier?: number;
+    growthRate?: number;
     martingale?: number;
     useMartingale?: boolean;
     allowBulkPurchase?: boolean;
@@ -92,6 +107,7 @@ export async function runBot(req: Request, res: Response) {
   try {
     const status = await startBotSession({
       userId: req.user!.userId,
+      workspaceId,
       symbol,
       botName,
       stake: Number(stake),
@@ -102,12 +118,14 @@ export async function runBot(req: Request, res: Response) {
       stopLossUsd: stopLossUsd !== null && stopLossUsd !== undefined ? Number(stopLossUsd) : null,
       maxWins: maxWins !== null && maxWins !== undefined ? Number(maxWins) : null,
       connectedAccountId,
+      confirmRealTrading: Boolean(confirmRealTrading),
       contractType,
       barrier: barrier ?? prediction,
       recoveryPrediction,
       duration: duration ? Number(duration) : undefined,
       durationUnit,
       multiplier: multiplier ? Number(multiplier) : undefined,
+      growthRate: growthRate !== undefined ? Number(growthRate) : undefined,
       martingale: martingale ? Number(martingale) : undefined,
       useMartingale,
       allowBulkPurchase,
@@ -117,12 +135,77 @@ export async function runBot(req: Request, res: Response) {
     });
     res.json(status);
   } catch (err) {
-    res.status(502).json({ error: (err as Error).message });
+    const msg = (err as Error).message || 'Bot start failed';
+    res.status(msg.toLowerCase().includes('confirmation') ? 400 : 502).json({ error: msg });
   }
+}
+
+export function pauseBot(req: Request, res: Response) {
+  res.json(pauseBotSession(req.user!.userId));
+}
+
+export function resumeBot(req: Request, res: Response) {
+  res.json(resumeBotSession(req.user!.userId));
 }
 
 export function stopBot(req: Request, res: Response) {
   res.json(stopBotSession(req.user!.userId));
+}
+
+export async function emergencyStopBotHandler(req: Request, res: Response) {
+  const { prices } = (req.body || {}) as { prices?: Record<string, number> };
+  try {
+    const result = await emergencyStopBot(req.user!.userId, prices);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+}
+
+export async function listBotRuns(req: Request, res: Response) {
+  const runs = await getBotRunsHistory(req.user!.userId);
+  res.json({ runs });
+}
+
+export async function listBotWorkspaces(req: Request, res: Response) {
+  const q = await pool.query(
+    `SELECT * FROM bot_workspaces WHERE user_id = $1 AND is_active = TRUE ORDER BY updated_at DESC`,
+    [req.user!.userId]
+  );
+  res.json({ workspaces: q.rows });
+}
+
+export async function saveBotWorkspace(req: Request, res: Response) {
+  const { id, name, symbol = 'R_100', strategyType = 'custom', xmlContent, configJson = {} } = req.body as {
+    id?: string;
+    name?: string;
+    symbol?: string;
+    strategyType?: string;
+    xmlContent?: string;
+    configJson?: Record<string, unknown>;
+  };
+  if (!name?.trim() || !xmlContent?.trim()) {
+    return res.status(400).json({ error: 'Workspace name and Blockly XML content are required' });
+  }
+  if (id) {
+    const upd = await pool.query(
+      `UPDATE bot_workspaces SET name = $1, symbol = $2, xml_content = $3, config_json = $4::jsonb, updated_at = NOW()
+       WHERE id = $5 AND user_id = $6 RETURNING *`,
+      [name.trim(), symbol, xmlContent, JSON.stringify(configJson), id, req.user!.userId]
+    );
+    if (upd.rows[0]) return res.json({ workspace: upd.rows[0] });
+  }
+  const ins = await pool.query(
+    `INSERT INTO bot_workspaces (user_id, name, symbol, strategy_type, xml_content, config_json)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING *`,
+    [req.user!.userId, name.trim(), symbol, strategyType, xmlContent, JSON.stringify(configJson)]
+  );
+  res.status(201).json({ workspace: ins.rows[0] });
+}
+
+export async function deleteBotWorkspace(req: Request, res: Response) {
+  await pool.query(`DELETE FROM bot_workspaces WHERE id = $1 AND user_id = $2`, [req.params.id, req.user!.userId]);
+  res.json({ deleted: true });
 }
 
 export async function closeBotOrders(req: Request, res: Response) {
@@ -165,8 +248,11 @@ export async function placeVirtualOrder(req: Request, res: Response) {
     contractType,
     duration,
     durationUnit,
+    dateExpiry,
     barrier,
-    multiplier
+    multiplier,
+    growthRate,
+    allowEquals
   } = req.body as {
     symbol?: string;
     side?: 'BUY' | 'SELL';
@@ -181,8 +267,11 @@ export async function placeVirtualOrder(req: Request, res: Response) {
     contractType?: string;
     duration?: number;
     durationUnit?: 't' | 's' | 'm' | 'h' | 'd';
+    dateExpiry?: number;
     barrier?: string | number;
     multiplier?: number;
+    growthRate?: number;
+    allowEquals?: boolean;
   };
 
   if (!symbol || !side || !stake || Number(stake) <= 0) {
@@ -214,8 +303,11 @@ export async function placeVirtualOrder(req: Request, res: Response) {
         contractType,
         duration,
         durationUnit,
+        dateExpiry,
         barrier,
-        multiplier
+        multiplier,
+        growthRate,
+        allowEquals
       });
 
       const resolvedEntry = exec.spotPrice > 0 ? exec.spotPrice : resolvedSpot;
@@ -263,13 +355,22 @@ export async function placeVirtualOrder(req: Request, res: Response) {
   }
 
   // Fallback to Virtual Workspace Ledger when no Deriv account is connected or virtual mode is chosen
-  const resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
+  let resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
+  if (allowEquals && (resolvedContract === 'CALL' || resolvedContract === 'PUT')) {
+    resolvedContract = resolvedContract === 'CALL' ? 'CALLE' : 'PUTE';
+  }
   const isShortTermContract =
-    resolvedContract.startsWith('DIGIT') || resolvedContract === 'CALL' || resolvedContract === 'PUT';
+    resolvedContract.startsWith('DIGIT') ||
+    resolvedContract === 'CALL' ||
+    resolvedContract === 'PUT' ||
+    resolvedContract === 'CALLE' ||
+    resolvedContract === 'PUTE' ||
+    resolvedContract === 'ACCU';
   const contractMeta = isShortTermContract
     ? {
         barrier: barrier !== undefined && barrier !== '' ? String(barrier) : null,
-        durationTicks: Math.max(1, Number(duration ?? 1)),
+        durationTicks: resolvedContract === 'ACCU' ? Math.max(3, Number(duration ?? 5)) : Math.max(1, Number(duration ?? 1)),
+        growthRate: resolvedContract === 'ACCU' ? Number(growthRate ?? 0.03) : undefined,
         ticksElapsed: 0
       }
     : null;
@@ -309,8 +410,11 @@ export async function placeBulkOrders(req: Request, res: Response) {
     contractType,
     duration,
     durationUnit,
+    dateExpiry,
     barrier,
-    multiplier
+    multiplier,
+    growthRate,
+    allowEquals
   } = req.body as {
     symbol?: string;
     side?: 'BUY' | 'SELL';
@@ -326,8 +430,11 @@ export async function placeBulkOrders(req: Request, res: Response) {
     contractType?: string;
     duration?: number;
     durationUnit?: 't' | 's' | 'm' | 'h' | 'd';
+    dateExpiry?: number;
     barrier?: string | number;
     multiplier?: number;
+    growthRate?: number;
+    allowEquals?: boolean;
   };
 
   if (!symbol || !side || !stake || Number(stake) <= 0) {
@@ -367,8 +474,11 @@ export async function placeBulkOrders(req: Request, res: Response) {
           contractType,
           duration,
           durationUnit,
+          dateExpiry,
           barrier,
-          multiplier
+          multiplier,
+          growthRate,
+          allowEquals
         });
         const resolvedEntry = exec.spotPrice > 0 ? exec.spotPrice : resolvedSpot;
         const q = await pool.query(
@@ -403,13 +513,22 @@ export async function placeBulkOrders(req: Request, res: Response) {
     }
   } else {
     const tasks = Array.from({ length: orderCount }).map(async () => {
-      const resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
+      let resolvedContract = (contractType || (side === 'BUY' ? 'MULTUP' : 'MULTDOWN')).toUpperCase();
+      if (allowEquals && (resolvedContract === 'CALL' || resolvedContract === 'PUT')) {
+        resolvedContract = resolvedContract === 'CALL' ? 'CALLE' : 'PUTE';
+      }
       const isShortTermContract =
-        resolvedContract.startsWith('DIGIT') || resolvedContract === 'CALL' || resolvedContract === 'PUT';
+        resolvedContract.startsWith('DIGIT') ||
+        resolvedContract === 'CALL' ||
+        resolvedContract === 'PUT' ||
+        resolvedContract === 'CALLE' ||
+        resolvedContract === 'PUTE' ||
+        resolvedContract === 'ACCU';
       const contractMeta = isShortTermContract
         ? {
             barrier: barrier !== undefined && barrier !== '' ? String(barrier) : null,
-            durationTicks: Math.max(1, Number(duration ?? 1)),
+            durationTicks: resolvedContract === 'ACCU' ? Math.max(3, Number(duration ?? 5)) : Math.max(1, Number(duration ?? 1)),
+            growthRate: resolvedContract === 'ACCU' ? Number(growthRate ?? 0.03) : undefined,
             ticksElapsed: 0
           }
         : null;

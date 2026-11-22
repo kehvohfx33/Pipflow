@@ -10,6 +10,9 @@ import { LiveTick } from '../../hooks/useDerivStream';
 import { useAuth } from '../../contexts/AuthContext';
 import { VirtualOrderItem } from '../../components/trading/OrderTicket';
 
+import { SmartChartWrapper } from '../../components/deriv/SmartChartWrapper';
+import { CandlestickSeries } from 'lightweight-charts';
+
 interface ChartsPageProps {
   mode: 'charts' | 'dtrader';
   symbol?: string;
@@ -29,6 +32,16 @@ const CHART_TIMEFRAMES = [
 
 import { InstrumentItem } from '../../trading/market-watch/MarketWatchPanel';
 
+interface ExternalFeedResp {
+  symbol: string;
+  price: number | null;
+  provider: string;
+  status: 'live' | 'delayed' | 'unavailable';
+  timestamp: string;
+  message?: string;
+  candles: Array<{ time: number; open: number; high: number; low: number; close: number }>;
+}
+
 export const ChartsPage: React.FC<ChartsPageProps> = ({
   mode,
   symbol: symbolProp,
@@ -47,10 +60,15 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   } = useAuth();
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const barrierLinesRef = useRef<IPriceLine[]>([]);
   const lastBarTimeRef = useRef<number>(0);
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
   const [symbol, setSymbol] = useState(symbolProp || 'R_25');
+  const [engine, setEngine] = useState<'candles' | 'smartchart' | 'xauusd'>(() =>
+    symbolProp === 'XAUUSD' ? 'xauusd' : 'smartchart'
+  );
+  const [externalMeta, setExternalMeta] = useState<Omit<ExternalFeedResp, 'candles'> | null>(null);
   const [granularity, setGranularityState] = useState(() => {
     const saved = Number(localStorage.getItem('pipflow_chart_granularity'));
     return Number.isFinite(saved) && saved > 0 ? saved : 60;
@@ -70,6 +88,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   useEffect(() => {
     if (symbolProp && symbolProp !== symbol) {
       setSymbol(symbolProp);
+      if (symbolProp === 'XAUUSD') setEngine('xauusd');
     }
   }, [symbolProp]);
 
@@ -130,11 +149,17 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   }, [instruments]);
 
   const selectSymbol = (next: string) => {
+    if (next === 'XAUUSD') {
+      setEngine('xauusd');
+    } else if (engine === 'xauusd') {
+      setEngine('smartchart');
+    }
     setSymbol(next);
     onSymbolChange?.(next);
   };
 
   useEffect(() => {
+    if (engine === 'smartchart') return;
     const el = chartContainerRef.current;
     if (!el) return;
     const chart = createChart(el, {
@@ -153,13 +178,27 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
         secondsVisible: false
       }
     });
-    const area = chart.addSeries(AreaSeries, {
-      lineColor: '#334155',
-      topColor: 'rgba(100, 116, 139, 0.28)',
-      bottomColor: 'rgba(100, 116, 139, 0.02)',
-      lineWidth: 2
-    });
-    seriesRef.current = area;
+
+    if (engine === 'xauusd') {
+      const cs = chart.addSeries(CandlestickSeries, {
+        upColor: '#26a69a',
+        downColor: '#ef5350',
+        borderVisible: false,
+        wickUpColor: '#26a69a',
+        wickDownColor: '#ef5350'
+      });
+      candleSeriesRef.current = cs;
+      seriesRef.current = null;
+    } else {
+      const area = chart.addSeries(AreaSeries, {
+        lineColor: '#334155',
+        topColor: 'rgba(100, 116, 139, 0.28)',
+        bottomColor: 'rgba(100, 116, 139, 0.02)',
+        lineWidth: 2
+      });
+      seriesRef.current = area;
+      candleSeriesRef.current = null;
+    }
 
     const ro = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect;
@@ -177,12 +216,46 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
       barrierLinesRef.current = [];
       chart.remove();
       seriesRef.current = null;
+      candleSeriesRef.current = null;
     };
-  }, [darkTheme]);
+  }, [darkTheme, engine]);
 
   useEffect(() => {
+    if (engine === 'smartchart') return;
     let cancelled = false;
     setChartError('');
+
+    if (engine === 'xauusd') {
+      const fetchGold = () => {
+        apiFetch<ExternalFeedResp>(`/market/external-feed?symbol=XAUUSD&granularity=${granularity}&count=180`)
+          .then((res) => {
+            if (cancelled) return;
+            setExternalMeta({
+              symbol: res.symbol,
+              price: res.price,
+              provider: res.provider,
+              status: res.status,
+              timestamp: res.timestamp,
+              message: res.message
+            });
+            if (res.price) setLatestPrice(res.price);
+            if (candleSeriesRef.current && Array.isArray(res.candles) && res.candles.length > 0) {
+              candleSeriesRef.current.setData(res.candles.map((c) => ({ ...c, time: c.time as Time })));
+            } else if (res.status === 'unavailable') {
+              setChartError(res.message || 'External XAUUSD feed temporarily unavailable.');
+            }
+          })
+          .catch((err) => {
+            if (!cancelled) setChartError((err as Error).message);
+          });
+      };
+      fetchGold();
+      const id = setInterval(fetchGold, 15000);
+      return () => {
+        cancelled = true;
+        clearInterval(id);
+      };
+    }
 
     const load = async () => {
       try {
@@ -224,7 +297,6 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
         if (!cancelled) setChartError((err as Error).message);
       });
 
-    // Guarantee direct real Deriv tick stream for current chart symbol even before parent tick map warms
     const directUnsub = subscribeDerivTicksDirect(symbol, (tick) => {
       if (cancelled || tick.symbol !== symbol || !seriesRef.current) return;
       const barTime = Math.floor(tick.epoch / granularity) * granularity;
@@ -238,10 +310,10 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
       cancelled = true;
       directUnsub();
     };
-  }, [symbol, granularity, mode, darkTheme]);
+  }, [symbol, granularity, mode, darkTheme, engine]);
 
   useEffect(() => {
-    if (!seriesRef.current) return;
+    if (!seriesRef.current || engine !== 'candles') return;
     barrierLinesRef.current.forEach((l) => {
       try {
         seriesRef.current?.removePriceLine(l);
@@ -286,17 +358,17 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
           );
         }
       });
-  }, [openOrders, symbol, darkTheme]);
+  }, [openOrders, symbol, darkTheme, engine]);
 
   useEffect(() => {
-    if (liveTick && liveTick.symbol === symbol && seriesRef.current) {
+    if (engine === 'candles' && liveTick && liveTick.symbol === symbol && seriesRef.current) {
       const barTime = Math.floor(liveTick.epoch / granularity) * granularity;
       if (barTime < lastBarTimeRef.current) return;
       lastBarTimeRef.current = barTime;
       setLatestPrice(liveTick.quote);
       seriesRef.current.update({ time: barTime as Time, value: liveTick.quote });
     }
-  }, [liveTick, symbol, granularity]);
+  }, [liveTick, symbol, granularity, engine]);
 
   const handlePlaceDtraderOrder = async (tradeSide: 'BUY' | 'SELL') => {
     if (!token || !latestPrice) return;
@@ -335,54 +407,98 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
   };
 
   return (
-    <div className="max-w-5xl mx-auto p-3 space-y-3">
+    <div className="max-w-6xl mx-auto p-3 space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3">
         <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={symbol}
-            onChange={(e) => selectSymbol(e.target.value)}
-            className="text-xs font-bold border border-slate-300 dark:border-slate-700 rounded-lg px-3 py-2 bg-white dark:bg-slate-800 max-w-[260px]"
-          >
-            {instruments.length === 0 ? (
-              <>
-                <option value="1HZ90V">Volatility 90 (1s) Index</option>
-                <option value="1HZ100V">Volatility 100 (1s) Index</option>
-                <option value="R_100">Volatility 100 Index</option>
-                <option value="R_75">Volatility 75 Index</option>
-                <option value="R_25">Volatility 25 Index</option>
-              </>
-            ) : (
-              Object.entries(groupedInstruments).map(([market, list]) => (
-                <optgroup key={market} label={market.replace(/_/g, ' ').toUpperCase()}>
-                  {list.map((i) => (
-                    <option key={i.symbol} value={i.symbol}>
-                      {i.symbol} — {i.display_name}
-                    </option>
-                  ))}
-                </optgroup>
-              ))
-            )}
-          </select>
-
-          <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-0.5">
-            {CHART_TIMEFRAMES.map((tf) => (
-              <button
-                key={tf.value}
-                type="button"
-                onClick={() => setGranularity(tf.value)}
-                className={`px-2 py-1 rounded text-[11px] font-bold transition ${
-                  granularity === tf.value
-                    ? 'bg-blue-600 text-white'
-                    : 'text-slate-600 dark:text-slate-300 hover:bg-white/60 dark:hover:bg-slate-700'
-                }`}
-              >
-                {tf.label}
-              </button>
-            ))}
+          {/* Chart Engine Selector */}
+          <div className="inline-flex rounded-lg bg-slate-100 dark:bg-slate-800 p-0.5 text-xs font-bold">
+            <button
+              type="button"
+              onClick={() => setEngine('smartchart')}
+              className={`px-3 py-1.5 rounded-md ${
+                engine === 'smartchart' ? 'bg-blue-600 text-white' : 'text-slate-600 dark:text-slate-300'
+              }`}
+            >
+              Deriv SmartChart
+            </button>
+            <button
+              type="button"
+              onClick={() => setEngine('candles')}
+              className={`px-3 py-1.5 rounded-md ${
+                engine === 'candles' ? 'bg-blue-600 text-white' : 'text-slate-600 dark:text-slate-300'
+              }`}
+            >
+              Lightweight Feed
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setEngine('xauusd');
+                setSymbol('XAUUSD');
+              }}
+              className={`px-3 py-1.5 rounded-md ${
+                engine === 'xauusd' ? 'bg-amber-500 text-slate-950' : 'text-slate-600 dark:text-slate-300'
+              }`}
+            >
+              XAU/USD Gold
+            </button>
           </div>
+
+          {engine !== 'xauusd' && (
+            <select
+              value={symbol}
+              onChange={(e) => selectSymbol(e.target.value)}
+              className="text-xs font-bold border border-slate-300 dark:border-slate-700 rounded-lg px-3 py-2 bg-white dark:bg-slate-800 max-w-[230px]"
+            >
+              {instruments.length === 0 ? (
+                <>
+                  <option value="1HZ90V">Volatility 90 (1s) Index</option>
+                  <option value="1HZ100V">Volatility 100 (1s) Index</option>
+                  <option value="R_100">Volatility 100 Index</option>
+                  <option value="R_75">Volatility 75 Index</option>
+                  <option value="R_25">Volatility 25 Index</option>
+                </>
+              ) : (
+                Object.entries(groupedInstruments).map(([market, list]) => (
+                  <optgroup key={market} label={market.replace(/_/g, ' ').toUpperCase()}>
+                    {list.map((i) => (
+                      <option key={i.symbol} value={i.symbol}>
+                        {i.symbol} — {i.display_name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))
+              )}
+            </select>
+          )}
+
+          {engine !== 'smartchart' && (
+            <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-0.5">
+              {CHART_TIMEFRAMES.map((tf) => (
+                <button
+                  key={tf.value}
+                  type="button"
+                  onClick={() => setGranularity(tf.value)}
+                  className={`px-2 py-1 rounded text-[11px] font-bold transition ${
+                    granularity === tf.value
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-600 dark:text-slate-300 hover:bg-white/60 dark:hover:bg-slate-700'
+                  }`}
+                >
+                  {tf.label}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-3">
+          {engine === 'xauusd' && externalMeta && (
+            <span className="text-[11px] font-mono text-amber-600 dark:text-amber-400">
+              {externalMeta.provider} · {externalMeta.status.toUpperCase()} ·{' '}
+              {new Date(externalMeta.timestamp).toLocaleTimeString()}
+            </span>
+          )}
           <span className="px-3 py-1 rounded bg-slate-900 text-white font-mono text-xs font-bold tabular-nums">
             {latestPrice.toFixed(latestPrice > 0 && latestPrice < 20 ? 4 : 3)}
           </span>
@@ -392,7 +508,7 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
               onClick={onOpenTradingView}
               className="px-4 py-2 rounded-lg bg-[#1d6ae5] hover:bg-blue-700 text-white text-xs font-bold"
             >
-              Trading View
+              MT5 Terminal
             </button>
           )}
         </div>
@@ -404,9 +520,20 @@ export const ChartsPage: React.FC<ChartsPageProps> = ({
         </div>
       )}
 
-      <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
-        <div ref={chartContainerRef} className="w-full h-[460px] sm:h-[560px] lg:h-[640px]" />
-      </div>
+      {engine === 'smartchart' ? (
+        <SmartChartWrapper
+          chartId="unified-trading-smartchart"
+          symbol={symbol === 'XAUUSD' ? 'frxXAUUSD' : symbol}
+          onSymbolChange={selectSymbol}
+          defaultGranularity={granularity}
+          heightClass="h-[480px] sm:h-[580px] lg:h-[640px]"
+          fallbackSpot={liveTick?.quote ?? latestPrice}
+        />
+      ) : (
+        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
+          <div ref={chartContainerRef} className="w-full h-[460px] sm:h-[560px] lg:h-[640px]" />
+        </div>
+      )}
 
       {mode === 'dtrader' && (
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-3">

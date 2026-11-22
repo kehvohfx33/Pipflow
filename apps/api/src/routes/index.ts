@@ -60,16 +60,29 @@ router.post('/deriv/accounts/:id/sync', requireDb, asyncHandler(requireAuth), as
 router.post('/deriv/accounts/:id/disconnect', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.disconnectAccount));
 router.post('/deriv/accounts/:id/revoke', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.revokeAccountAuthorization));
 router.get('/deriv/statement/:accountId', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.getReadOnlyStatement));
+router.post('/deriv/proposal', asyncHandler(derivCtrl.getDerivProposal));
+router.get('/deriv/contracts-for', asyncHandler(derivCtrl.getContractsForSymbol));
+router.get('/deriv/open-contract/:contractId', requireDb, asyncHandler(requireAuth), asyncHandler(derivCtrl.getOpenContractSnapshot));
 
-// Official Deriv Public Market Data
+// Official Deriv Public Market Data + Independent External XAUUSD Feed + AI Analysis & Signals
 router.get('/market/instruments', asyncHandler(marketCtrl.listInstruments));
 router.get('/market/candles', asyncHandler(marketCtrl.getSymbolCandles));
+router.get('/market/external-feed', asyncHandler(marketCtrl.getExternalFeed));
+router.get('/market/ai-analysis', asyncHandler(marketCtrl.getAiMarketAnalysis));
+router.get('/market/signals', asyncHandler(marketCtrl.getMarketSignals));
 
-// Open Market Analyser & Instant Trading Bots (No Password Gate)
+// Open Market Analyser & Instant Trading Bots + Persistent Workspaces & Runs
 router.get('/market/digit-analysis', asyncHandler(marketCtrl.getDigitAnalysis));
 router.get('/bots/strategies', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.listStrategies));
+router.get('/bots/workspaces', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.listBotWorkspaces));
+router.post('/bots/workspaces', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.saveBotWorkspace));
+router.delete('/bots/workspaces/:id', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.deleteBotWorkspace));
+router.get('/bots/runs', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.listBotRuns));
 router.post('/bots/run', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.runBot));
+router.post('/bots/pause', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.pauseBot));
+router.post('/bots/resume', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.resumeBot));
 router.post('/bots/stop', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.stopBot));
+router.post('/bots/emergency-stop', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.emergencyStopBotHandler));
 router.post('/bots/close-all', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.closeBotOrders));
 router.get('/bots/status', requireDb, asyncHandler(requireAuth), asyncHandler(tradingCtrl.botStatus));
 

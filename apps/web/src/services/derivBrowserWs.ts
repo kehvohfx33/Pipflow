@@ -41,6 +41,14 @@ const pendingRequests = new Map<
   { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }
 >();
 const tickListeners = new Map<string, Set<(tick: DirectTick) => void>>();
+const rawQuoteSubscribers = new Map<
+  string,
+  {
+    req: Record<string, unknown>;
+    callbacks: Set<(msg: unknown) => void>;
+    subscriptionId: string | null;
+  }
+>();
 const subscribedOnSocket = new Set<string>();
 const latestTickCache = new Map<string, DirectTick>();
 const candleCache = new Map<string, { at: number; bars: DirectCandleBar[] }>();
@@ -114,7 +122,9 @@ function attachSharedSocket(ws: WebSocket, url: string) {
       const msg = JSON.parse(ev.data) as {
         req_id?: number;
         error?: { message: string };
+        subscription?: { id?: string };
         tick?: { symbol: string; quote: number; epoch: number; pip_size?: number };
+        ohlc?: { symbol?: string };
       };
 
       if (msg.req_id && pendingRequests.has(msg.req_id)) {
@@ -123,6 +133,21 @@ function attachSharedSocket(ws: WebSocket, url: string) {
         pendingRequests.delete(msg.req_id);
         if (msg.error) entry.reject(new Error(msg.error.message));
         else entry.resolve(msg);
+      }
+
+      if (msg.subscription?.id) {
+        const subId = msg.subscription.id;
+        rawQuoteSubscribers.forEach((entry) => {
+          if (entry.subscriptionId === subId) {
+            entry.callbacks.forEach((cb) => cb(msg));
+          }
+        });
+      } else if (msg.tick?.symbol) {
+        rawQuoteSubscribers.forEach((entry, key) => {
+          if (key.startsWith(`${msg.tick!.symbol}:0`)) {
+            entry.callbacks.forEach((cb) => cb(msg));
+          }
+        });
       }
 
       if (msg.tick?.symbol) {
@@ -427,4 +452,150 @@ export function subscribeDerivMultiTicksDirect(
       }
     }
   };
+}
+
+export async function sendPublicDerivRawRequest<T = Record<string, unknown>>(
+  payload: Record<string, unknown>,
+  timeoutMs = 7000
+): Promise<T> {
+  return sendPublicDerivRequest<T>(payload, timeoutMs);
+}
+
+export async function fetchDerivSmartChartData(): Promise<{
+  activeSymbols: Array<{
+    symbol: string;
+    display_name: string;
+    exchange_is_open: 0 | 1;
+    is_trading_suspended: 0 | 1;
+    market: string;
+    market_display_name: string;
+    pip: number;
+    subgroup: string;
+    subgroup_display_name: string;
+    submarket: string;
+    submarket_display_name: string;
+    symbol_type: string;
+  }>;
+  tradingTimes: Record<string, { isOpen: boolean; openTime: string; closeTime: string }>;
+}> {
+  const [symRes, ttRes] = await Promise.all([
+    sendPublicDerivRequest<{
+      active_symbols?: Array<Record<string, unknown>>;
+    }>({ active_symbols: 'brief', product_type: 'basic' }, 7000).catch(() => ({ active_symbols: [] })),
+    sendPublicDerivRequest<{
+      trading_times?: {
+        markets?: Array<{
+          submarkets?: Array<{
+            symbols?: Array<{ underlying_symbol?: string; symbol?: string; times?: { open: string[]; close: string[] } }>;
+          }>;
+        }>;
+      };
+    }>({ trading_times: 'today' }, 7000).catch(() => ({ trading_times: undefined }))
+  ]);
+
+  const activeSymbols = (symRes.active_symbols ?? [])
+    .map((s) => ({
+      symbol: String(s.underlying_symbol ?? s.symbol ?? ''),
+      display_name: String(s.underlying_symbol_name ?? s.display_name ?? s.symbol ?? ''),
+      exchange_is_open: (Number(s.exchange_is_open ?? 1) ? 1 : 0) as 0 | 1,
+      is_trading_suspended: (Number(s.is_trading_suspended ?? 0) ? 1 : 0) as 0 | 1,
+      market: String(s.market ?? 'synthetic_index'),
+      market_display_name: String(s.market_display_name ?? s.market ?? 'Derived'),
+      pip: Number(s.pip ?? s.pip_size ?? 0.01),
+      subgroup: String(s.subgroup ?? 'synthetics'),
+      subgroup_display_name: String(s.subgroup_display_name ?? 'Synthetics'),
+      submarket: String(s.submarket ?? 'random_index'),
+      submarket_display_name: String(s.submarket_display_name ?? 'Continuous Indices'),
+      symbol_type: String(s.underlying_symbol_type ?? s.symbol_type ?? 'stockindex')
+    }))
+    .filter((s) => s.symbol.length > 0);
+
+  const tradingTimes: Record<string, { isOpen: boolean; openTime: string; closeTime: string }> = {};
+  const markets = ttRes.trading_times?.markets ?? [];
+  const now = new Date();
+  const dateStr = now.toISOString().substring(0, 11);
+  for (const m of markets) {
+    for (const sm of m.submarkets ?? []) {
+      for (const symObj of sm.symbols ?? []) {
+        const code = symObj.underlying_symbol || symObj.symbol;
+        const times = symObj.times;
+        if (!code || !times) continue;
+        const open = times.open ?? [];
+        const close = times.close ?? [];
+        const allDay = open[0] === '00:00:00' && close[0] === '23:59:59';
+        const closedDay = open[0] === '--' && close[0] === '--';
+        let isOpen = allDay;
+        let openTime = '';
+        let closeTime = '';
+        if (!closedDay && open.length > 0 && close.length > 0) {
+          openTime = `${dateStr}${open[0]}Z`;
+          closeTime = `${dateStr}${close[0]}Z`;
+          isOpen = now >= new Date(openTime) && now < new Date(closeTime);
+        }
+        tradingTimes[code] = { isOpen, openTime, closeTime };
+      }
+    }
+  }
+  for (const s of activeSymbols) {
+    if (!tradingTimes[s.symbol]) {
+      tradingTimes[s.symbol] = { isOpen: Boolean(s.exchange_is_open), openTime: '', closeTime: '' };
+    }
+  }
+  return { activeSymbols, tradingTimes };
+}
+
+export function subscribeSmartChartsQuotes(
+  params: { symbol: string; granularity?: number; style?: string },
+  callback: (data: unknown) => void
+): () => void {
+  const gran = Number(params.granularity ?? 0);
+  const key = `${params.symbol}:${gran}`;
+  let entry = rawQuoteSubscribers.get(key);
+  if (!entry) {
+    entry = { req: params, callbacks: new Set(), subscriptionId: null };
+    rawQuoteSubscribers.set(key, entry);
+    const payload: Record<string, unknown> = {
+      ticks_history: params.symbol,
+      style: params.style || (gran > 0 ? 'candles' : 'ticks'),
+      adjust_start_time: 1,
+      count: 1,
+      end: 'latest',
+      subscribe: 1
+    };
+    if (gran > 0) payload.granularity = gran;
+    sendPublicDerivRequest<{ subscription?: { id?: string } }>(payload, 7000)
+      .then((res) => {
+        if (entry && res?.subscription?.id) {
+          entry.subscriptionId = res.subscription.id;
+        }
+        callback(res);
+      })
+      .catch(() => {});
+  }
+  entry.callbacks.add(callback);
+
+  return () => {
+    unsubscribeSmartChartsQuotes(params, callback);
+  };
+}
+
+export function unsubscribeSmartChartsQuotes(
+  request?: { symbol?: string; granularity?: number },
+  callback?: (data: unknown) => void
+) {
+  if (!request?.symbol) return;
+  const key = `${request.symbol}:${Number(request.granularity ?? 0)}`;
+  const entry = rawQuoteSubscribers.get(key);
+  if (!entry) return;
+  if (callback) {
+    entry.callbacks.delete(callback);
+  } else {
+    entry.callbacks.clear();
+  }
+  if (entry.callbacks.size === 0) {
+    rawQuoteSubscribers.delete(key);
+    if (entry.subscriptionId) {
+      sendPublicDerivRequest({ forget: entry.subscriptionId }, 3000).catch(() => {});
+    }
+  }
 }

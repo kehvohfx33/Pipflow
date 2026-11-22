@@ -12,6 +12,11 @@ import {
   isOAuth2AccessToken,
   ReadOnlyDerivAccount
 } from '../integrations/deriv/account-data';
+import {
+  fetchContractsForSymbol,
+  fetchOpenContractSnapshot,
+  requestDerivProposal
+} from '../integrations/deriv/trade-execution';
 import { createNotification, logSecurityEvent } from '../services/notification-service';
 import { sendBrevoEmail } from '../emails/brevo-service';
 
@@ -1216,4 +1221,87 @@ export async function getReadOnlyStatement(req: Request, res: Response) {
   );
   const transactions = await fetchReadOnlyStatement(rawToken, 30, authRow.rows[0].deriv_login_id);
   res.json({ transactions });
+}
+
+function tryExtractUserId(req: Request): string | null {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return null;
+  try {
+    const payload = jwt.verify(header.slice(7), env.jwtSecret) as { userId?: string };
+    return payload.userId ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getDerivProposal(req: Request, res: Response) {
+  const body = (req.body || {}) as {
+    symbol?: string;
+    contractType?: string;
+    stake?: number;
+    currency?: string;
+    duration?: number;
+    durationUnit?: 't' | 's' | 'm' | 'h' | 'd';
+    dateExpiry?: number;
+    barrier?: string | number;
+    multiplier?: number;
+    growthRate?: number;
+    allowEquals?: boolean;
+    takeProfitUsd?: number | null;
+    connectedAccountId?: string | null;
+  };
+  if (!body.symbol || !body.contractType) {
+    return res.status(400).json({ error: 'symbol and contractType are required' });
+  }
+  const userId = tryExtractUserId(req);
+  try {
+    const quote = await requestDerivProposal({
+      userId,
+      connectedAccountId: body.connectedAccountId,
+      symbol: body.symbol,
+      contractType: body.contractType,
+      stake: Number(body.stake ?? 1),
+      currency: body.currency ?? 'USD',
+      duration: body.duration !== undefined ? Number(body.duration) : undefined,
+      durationUnit: body.durationUnit,
+      dateExpiry: body.dateExpiry !== undefined ? Number(body.dateExpiry) : undefined,
+      barrier: body.barrier,
+      multiplier: body.multiplier !== undefined ? Number(body.multiplier) : undefined,
+      growthRate: body.growthRate !== undefined ? Number(body.growthRate) : undefined,
+      allowEquals: Boolean(body.allowEquals),
+      takeProfitUsd: body.takeProfitUsd ?? null
+    });
+    res.json({ proposal: quote });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+}
+
+export async function getContractsForSymbol(req: Request, res: Response) {
+  const symbol = String(req.query.symbol ?? 'R_100').trim();
+  const currency = String(req.query.currency ?? 'USD').trim();
+  if (!/^[A-Za-z0-9_.-]{1,32}$/.test(symbol)) {
+    return res.status(400).json({ error: 'Invalid symbol' });
+  }
+  const userId = tryExtractUserId(req);
+  try {
+    const available = await fetchContractsForSymbol(symbol, currency, userId);
+    res.json({ symbol, currency, available });
+  } catch (err) {
+    res.status(502).json({ error: (err as Error).message });
+  }
+}
+
+export async function getOpenContractSnapshot(req: Request, res: Response) {
+  const contractId = Number(req.params.contractId);
+  const connectedAccountId = String(req.query.connectedAccountId ?? '');
+  if (!Number.isFinite(contractId) || contractId <= 0 || !connectedAccountId) {
+    return res.status(400).json({ error: 'Valid contractId and connectedAccountId required' });
+  }
+  try {
+    const snapshot = await fetchOpenContractSnapshot(req.user!.userId, connectedAccountId, contractId);
+    res.json({ contract: snapshot });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
 }

@@ -3,6 +3,7 @@ import { pool } from '../../database/pool';
 import { decryptToken } from '../../utils/crypto';
 import { broadcastToUser } from '../../services/realtime-hub';
 import { DerivClient, OtpDerivClient } from './deriv-client';
+import { derivConnectionManager } from './connection-manager';
 import { DerivMessage } from './websocket';
 import {
   getApiDerivAccountOtpUrl,
@@ -54,8 +55,11 @@ export interface ExecuteDerivTradeInput {
   contractType?: string;
   duration?: number;
   durationUnit?: 't' | 's' | 'm' | 'h' | 'd';
+  dateExpiry?: number;
   barrier?: string | number;
   multiplier?: number;
+  growthRate?: number;
+  allowEquals?: boolean;
 }
 
 export interface ExecuteDerivTradeResult {
@@ -86,7 +90,12 @@ interface ContractsForRes extends DerivMessage {
   contracts_for?: {
     available?: Array<{
       contract_type: string;
+      contract_category?: string;
+      contract_category_display?: string;
       multiplier_range?: number[];
+      growth_rate_range?: number[];
+      min_contract_duration?: string;
+      max_contract_duration?: string;
       min_stake?: string | number;
       max_stake?: string | number;
     }>;
@@ -99,6 +108,16 @@ interface ProposalRes extends DerivMessage {
     ask_price: number;
     payout?: number;
     spot?: number;
+    spot_time?: number;
+    longcode?: string;
+    display_value?: string;
+    contract_details?: {
+      high_barrier?: string | number;
+      low_barrier?: string | number;
+      maximum_ticks?: number;
+      maximum_payout?: string | number;
+      tick_size_percentage?: number;
+    };
   };
 }
 
@@ -116,16 +135,29 @@ interface BuyRes extends DerivMessage {
 interface OpenContractRes extends DerivMessage {
   proposal_open_contract?: {
     contract_id: number;
+    contract_type?: string;
+    underlying_symbol?: string;
+    underlying?: string;
     status?: string;
     is_sold?: number;
     is_expired?: number;
+    is_valid_to_sell?: number;
     buy_price?: number;
     sell_price?: number;
     bid_price?: number;
     profit?: number;
+    profit_percentage?: number;
+    payout?: number;
     entry_spot?: number;
     exit_tick?: number;
     current_spot?: number;
+    high_barrier?: string | number;
+    low_barrier?: string | number;
+    tick_count?: number;
+    current_spot_time?: number;
+    date_start?: number;
+    date_expiry?: number;
+    tick_stream?: Array<{ epoch: number; tick: number }>;
   };
 }
 
@@ -675,16 +707,38 @@ export async function executeDerivTrade(input: ExecuteDerivTradeInput): Promise<
           throw lastMultError ?? (fallbackErr as Error);
         }
       }
+    } else if (requestedType === 'ACCU') {
+      const growthRate = Math.min(0.05, Math.max(0.01, Number(input.growthRate ?? 0.03)));
+      const accuPayload: Record<string, unknown> = {
+        proposal: 1,
+        amount: Number(input.stake),
+        basis: 'stake',
+        contract_type: 'ACCU',
+        currency,
+        growth_rate: Number(growthRate.toFixed(2))
+      };
+      if (typeof input.takeProfitUsd === 'number' && input.takeProfitUsd > 0) {
+        accuPayload.limit_order = { take_profit: Number(input.takeProfitUsd.toFixed(2)) };
+      }
+      const propRes = await requestProposalWithSymbolFallback(sock, input.symbol, accuPayload);
+      proposal = propRes.proposal;
     } else {
+      if (input.allowEquals && (finalContractType === 'CALL' || finalContractType === 'PUT')) {
+        finalContractType = finalContractType === 'CALL' ? 'CALLE' : 'PUTE';
+      }
       const payload: Record<string, unknown> = {
         proposal: 1,
         amount: Number(input.stake),
         basis: 'stake',
         contract_type: finalContractType,
-        currency,
-        duration: input.duration ?? 1,
-        duration_unit: input.durationUnit ?? 't'
+        currency
       };
+      if (input.dateExpiry && Number.isFinite(input.dateExpiry) && input.dateExpiry > Math.floor(Date.now() / 1000)) {
+        payload.date_expiry = Math.floor(input.dateExpiry);
+      } else {
+        payload.duration = input.duration ?? 1;
+        payload.duration_unit = input.durationUnit ?? 't';
+      }
       if (input.barrier !== undefined && input.barrier !== '') {
         payload.barrier = String(input.barrier);
       }
@@ -1018,4 +1072,196 @@ export async function syncOpenDerivOrdersForUser(
   });
   inFlightOrderSyncs.set(userId, syncPromise);
   return syncPromise;
+}
+
+export interface DerivProposalQuote {
+  id: string;
+  contractType: string;
+  symbol: string;
+  askPrice: number;
+  payout: number;
+  spot: number;
+  spotTime: number;
+  returnPct: number;
+  longcode: string;
+  displayValue: string;
+  highBarrier?: number | null;
+  lowBarrier?: number | null;
+  maxTicks?: number | null;
+  maxPayout?: number | null;
+  tickSizePercentage?: number | null;
+  source: 'deriv_account' | 'deriv_public';
+}
+
+export async function requestDerivProposal(params: {
+  userId?: string | null;
+  connectedAccountId?: string | null;
+  symbol: string;
+  contractType: string;
+  stake: number;
+  currency?: string;
+  duration?: number;
+  durationUnit?: 't' | 's' | 'm' | 'h' | 'd';
+  dateExpiry?: number;
+  barrier?: string | number;
+  multiplier?: number;
+  growthRate?: number;
+  allowEquals?: boolean;
+  takeProfitUsd?: number | null;
+}): Promise<DerivProposalQuote> {
+  let cType = params.contractType.toUpperCase();
+  if (params.allowEquals && (cType === 'CALL' || cType === 'PUT')) {
+    cType = cType === 'CALL' ? 'CALLE' : 'PUTE';
+  }
+  const currency = params.currency || 'USD';
+  const basePayload: Record<string, unknown> = {
+    proposal: 1,
+    amount: Math.max(0.35, Number(params.stake || 1)),
+    basis: 'stake',
+    contract_type: cType,
+    currency
+  };
+
+  if (cType === 'ACCU') {
+    basePayload.growth_rate = Number(Math.min(0.05, Math.max(0.01, Number(params.growthRate ?? 0.03))).toFixed(2));
+    if (typeof params.takeProfitUsd === 'number' && params.takeProfitUsd > 0) {
+      basePayload.limit_order = { take_profit: Number(params.takeProfitUsd.toFixed(2)) };
+    }
+  } else if (cType === 'MULTUP' || cType === 'MULTDOWN') {
+    basePayload.multiplier = Number(params.multiplier ?? 100);
+  } else {
+    if (params.dateExpiry && Number.isFinite(params.dateExpiry) && params.dateExpiry > Math.floor(Date.now() / 1000)) {
+      basePayload.date_expiry = Math.floor(params.dateExpiry);
+    } else {
+      basePayload.duration = Math.max(1, Number(params.duration ?? 5));
+      basePayload.duration_unit = params.durationUnit ?? 't';
+    }
+    if (params.barrier !== undefined && params.barrier !== '') {
+      basePayload.barrier = String(params.barrier);
+    }
+  }
+
+  let res: ProposalRes | null = null;
+  let source: 'deriv_account' | 'deriv_public' = 'deriv_public';
+
+  if (params.userId) {
+    const account = await getAuthorizedAccountForTrading(params.userId, params.connectedAccountId).catch(() => null);
+    if (account) {
+      try {
+        const sock = await getPooledTradingSocket(params.userId, account);
+        basePayload.currency = sock.currency || currency;
+        res = await requestProposalWithSymbolFallback(sock, params.symbol, basePayload);
+        source = 'deriv_account';
+      } catch {
+        res = null;
+      }
+    }
+  }
+
+  if (!res) {
+    const marketClient = derivConnectionManager.getMarketClient();
+    await marketClient.ensureConnected();
+    try {
+      res = await marketClient.request<ProposalRes>({
+        ...basePayload,
+        symbol: params.symbol
+      });
+    } catch (err) {
+      const msg = ((err as Error).message || '').toLowerCase();
+      if (msg.includes('underlying_symbol') || msg.includes('unexpected property')) {
+        res = await marketClient.request<ProposalRes>({
+          ...basePayload,
+          underlying_symbol: params.symbol
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  const p = res?.proposal;
+  if (!p?.id) {
+    throw new Error('Proposal unavailable for this market/contract configuration');
+  }
+  const askPrice = Number(p.ask_price ?? params.stake);
+  const payout = Number(p.payout ?? 0);
+  const returnPct = askPrice > 0 && payout > 0 ? Number((((payout - askPrice) / askPrice) * 100).toFixed(2)) : 0;
+
+  return {
+    id: p.id,
+    contractType: cType,
+    symbol: params.symbol,
+    askPrice,
+    payout,
+    spot: Number(p.spot ?? 0),
+    spotTime: Number(p.spot_time ?? Math.floor(Date.now() / 1000)),
+    returnPct,
+    longcode: String(p.longcode ?? ''),
+    displayValue: String(p.display_value ?? ''),
+    highBarrier: p.contract_details?.high_barrier !== undefined ? Number(p.contract_details.high_barrier) : null,
+    lowBarrier: p.contract_details?.low_barrier !== undefined ? Number(p.contract_details.low_barrier) : null,
+    maxTicks: p.contract_details?.maximum_ticks !== undefined ? Number(p.contract_details.maximum_ticks) : null,
+    maxPayout: p.contract_details?.maximum_payout !== undefined ? Number(p.contract_details.maximum_payout) : null,
+    tickSizePercentage:
+      p.contract_details?.tick_size_percentage !== undefined ? Number(p.contract_details.tick_size_percentage) : null,
+    source
+  };
+}
+
+export async function fetchContractsForSymbol(symbol: string, currency = 'USD', userId?: string | null) {
+  if (userId) {
+    const account = await getAuthorizedAccountForTrading(userId).catch(() => null);
+    if (account) {
+      try {
+        const sock = await getPooledTradingSocket(userId, account);
+        const cfReq = sock.isOtpGateway ? { contracts_for: symbol } : { contracts_for: symbol, currency };
+        const res = await sock.request<ContractsForRes>(cfReq);
+        return res.contracts_for?.available ?? [];
+      } catch {
+        // fallback to public market client
+      }
+    }
+  }
+  const marketClient = derivConnectionManager.getMarketClient();
+  await marketClient.ensureConnected();
+  const res = await marketClient.request<ContractsForRes>({ contracts_for: symbol, currency });
+  return res.contracts_for?.available ?? [];
+}
+
+export async function fetchOpenContractSnapshot(userId: string, connectedAccountId: string, contractId: number) {
+  const account = await getAuthorizedAccountForTrading(userId, connectedAccountId);
+  if (!account) {
+    throw new Error('Authorized Deriv account not found');
+  }
+  const sock = await getPooledTradingSocket(userId, account);
+  const pocRes = await sock.request<OpenContractRes>({
+    proposal_open_contract: 1,
+    contract_id: contractId
+  });
+  const poc = pocRes.proposal_open_contract;
+  if (!poc) {
+    throw new Error('Open contract details not returned by Deriv');
+  }
+  return {
+    contractId: poc.contract_id,
+    contractType: poc.contract_type ?? '',
+    symbol: poc.underlying_symbol || poc.underlying || '',
+    status: poc.status ?? 'open',
+    isSold: poc.is_sold === 1 || poc.is_expired === 1,
+    isValidToSell: poc.is_valid_to_sell === 1,
+    buyPrice: Number(poc.buy_price ?? 0),
+    bidPrice: Number(poc.bid_price ?? 0),
+    sellPrice: poc.sell_price !== undefined ? Number(poc.sell_price) : null,
+    payout: Number(poc.payout ?? 0),
+    profit: Number(poc.profit ?? 0),
+    profitPercentage: Number(poc.profit_percentage ?? 0),
+    entrySpot: Number(poc.entry_spot ?? 0),
+    currentSpot: Number(poc.current_spot ?? 0),
+    highBarrier: poc.high_barrier !== undefined ? Number(poc.high_barrier) : null,
+    lowBarrier: poc.low_barrier !== undefined ? Number(poc.low_barrier) : null,
+    tickCount: Number(poc.tick_count ?? 0),
+    dateStart: Number(poc.date_start ?? 0),
+    dateExpiry: Number(poc.date_expiry ?? 0),
+    tickStream: Array.isArray(poc.tick_stream) ? poc.tick_stream : []
+  };
 }

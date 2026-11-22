@@ -131,16 +131,27 @@ const DEFAULT_SITE_CONTROLS: SiteControlsSettings = {
     'Pipflowtrades connects directly to Official Deriv WebSocket endpoints for live market quotes, historical candles, account balance synchronization, and direct order execution through your authorized Deriv Demo or Real account. Trading synthetic and financial derivatives carries financial risk.',
   enabledTabs: [
     'dashboard',
-    'bot_builder',
+    'markets',
+    'trading_view',
+    'rise_fall',
+    'digits',
+    'accumulators',
     'charts',
+    'bot_builder',
     'freebots',
-    'bulk_trader',
     'analysistool',
+    'signals',
+    'automated_bots',
+    'wallets',
+    'portfolio',
     'reports',
+    'analytics',
+    'notifications',
+    'settings',
+    'bulk_trader',
     'trading_plan',
     'copy_trading',
-    'dtrader',
-    'trading_view'
+    'dtrader'
   ]
 };
 
@@ -283,7 +294,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           riskDisclaimerText: res.site_controls?.riskDisclaimerText || prev.riskDisclaimerText,
           enabledTabs:
             Array.isArray(res.site_controls?.enabledTabs) && res.site_controls!.enabledTabs!.length > 0
-              ? res.site_controls!.enabledTabs!
+              ? Array.from(new Set([...res.site_controls!.enabledTabs!, ...DEFAULT_SITE_CONTROLS.enabledTabs]))
               : prev.enabledTabs
         }));
       }

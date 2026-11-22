@@ -30,7 +30,16 @@ import {
   RotateCcw,
   Sun,
   Moon,
-  ArrowUpRight
+  ArrowUpRight,
+  Globe,
+  Hash,
+  Gauge,
+  Radio,
+  Cpu,
+  Wallet,
+  Briefcase,
+  Settings,
+  PieChart
 } from 'lucide-react';
 import { CurrencyFlag } from '../components/CurrencyFlag';
 import { PipflowLogo } from '../components/PipflowLogo';
@@ -45,34 +54,69 @@ export interface NavTabItem {
 
 export const DEFAULT_NAV_TABS: NavTabItem[] = [
   { id: 'dashboard', label: 'Dashboard', visible: true },
+  { id: 'markets', label: 'Markets', visible: true },
+  { id: 'trading_view', label: 'Trader', visible: true },
+  { id: 'rise_fall', label: 'Rise/Fall', visible: true },
+  { id: 'digits', label: 'Digits', visible: true },
+  { id: 'accumulators', label: 'Accumulators', visible: true },
+  { id: 'charts', label: 'Trading Charts', visible: true },
   { id: 'bot_builder', label: 'Bot Builder', visible: true },
-  { id: 'charts', label: 'Charts', visible: true },
-  { id: 'freebots', label: 'Trading Bots', visible: true },
-  { id: 'bulk_trader', label: 'Bulk Trader', visible: true },
-  { id: 'analysistool', label: 'Analysis Tool', visible: true },
-  { id: 'reports', label: 'Reports', visible: true },
-  { id: 'trading_plan', label: 'Risk Calculator', visible: true },
-  { id: 'copy_trading', label: 'Copy Trading', visible: true },
-  { id: 'dtrader', label: 'DTrader', visible: true },
-  { id: 'trading_view', label: 'TradingView', visible: true }
+  { id: 'freebots', label: 'Strategy Templates', visible: true },
+  { id: 'analysistool', label: 'AI Market Analyser', visible: true },
+  { id: 'signals', label: 'Trading Signals', visible: true },
+  { id: 'automated_bots', label: 'Automated Bots', visible: true },
+  { id: 'wallets', label: 'Wallets', visible: true },
+  { id: 'portfolio', label: 'Portfolio', visible: true },
+  { id: 'reports', label: 'Trade History', visible: true },
+  { id: 'analytics', label: 'Analytics', visible: true },
+  { id: 'notifications', label: 'Notifications', visible: true },
+  { id: 'settings', label: 'Account Settings', visible: true },
+  { id: 'bulk_trader', label: 'Bulk Trader', visible: false },
+  { id: 'trading_plan', label: 'Risk Calculator', visible: false },
+  { id: 'copy_trading', label: 'Copy Trading', visible: false },
+  { id: 'dtrader', label: 'DTrader', visible: false }
 ];
 
 function getTabIcon(id: string) {
   switch (id) {
     case 'dashboard':
       return LayoutGrid;
-    case 'bot_builder':
-      return Bot;
+    case 'markets':
+      return Globe;
+    case 'trading_view':
+      return TrendingUp;
+    case 'rise_fall':
+      return ArrowUpRight;
+    case 'digits':
+      return Hash;
+    case 'accumulators':
+      return Gauge;
     case 'charts':
       return LineChart;
-    case 'freebots':
+    case 'bot_builder':
       return Bot;
-    case 'bulk_trader':
+    case 'freebots':
       return Layers;
     case 'analysistool':
       return Activity;
+    case 'signals':
+      return Radio;
+    case 'automated_bots':
+      return Cpu;
+    case 'wallets':
+      return Wallet;
+    case 'portfolio':
+      return Briefcase;
     case 'reports':
       return FileBarChart2;
+    case 'analytics':
+      return PieChart;
+    case 'notifications':
+      return Bell;
+    case 'settings':
+      return Settings;
+    case 'bulk_trader':
+      return Layers;
     case 'trading_plan':
       return Calculator;
     case 'copy_trading':
@@ -132,7 +176,12 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [tabs, setTabs] = useState<NavTabItem[]>(() => {
     try {
       const saved = localStorage.getItem('pipflow_nav_tabs');
-      return saved ? (JSON.parse(saved) as NavTabItem[]) : DEFAULT_NAV_TABS;
+      if (!saved) return DEFAULT_NAV_TABS;
+      const parsed = JSON.parse(saved) as NavTabItem[];
+      if (!Array.isArray(parsed) || parsed.length === 0) return DEFAULT_NAV_TABS;
+      const existingIds = new Set(parsed.map((t) => t.id));
+      const missingDefaults = DEFAULT_NAV_TABS.filter((d) => !existingIds.has(d.id));
+      return [...parsed, ...missingDefaults];
     } catch {
       return DEFAULT_NAV_TABS;
     }
@@ -516,13 +565,61 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    onSelectTab('wallets');
+                    setMenuOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 text-left"
+                >
+                  <Wallet className="w-4 h-4" />
+                  <span>Wallets</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelectTab('portfolio');
+                    setMenuOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 text-left"
+                >
+                  <Briefcase className="w-4 h-4" />
+                  <span>Portfolio</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelectTab('automated_bots');
+                    setMenuOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 text-left"
+                >
+                  <Cpu className="w-4 h-4" />
+                  <span>Automated Bots</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
                     onSelectTab('reports');
                     setMenuOpen(false);
                   }}
                   className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 text-left"
                 >
                   <FileBarChart2 className="w-4 h-4" />
-                  <span>Reports</span>
+                  <span>Trade History</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelectTab('analytics');
+                    setMenuOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 text-left"
+                >
+                  <PieChart className="w-4 h-4" />
+                  <span>Analytics</span>
                 </button>
 
                 <button
@@ -535,6 +632,18 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
                 >
                   <Bell className="w-4 h-4" />
                   <span>Notifications</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelectTab('settings');
+                    setMenuOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2.5 py-2.5 px-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 text-left"
+                >
+                  <Settings className="w-4 h-4" />
+                  <span>Account Settings</span>
                 </button>
 
                 <button

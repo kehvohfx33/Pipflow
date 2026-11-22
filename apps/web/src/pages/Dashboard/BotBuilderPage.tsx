@@ -16,19 +16,30 @@ import {
   FileText,
   ShoppingBag,
   Zap,
-  X
+  X,
+  Pause,
+  ShieldAlert,
+  Cloud,
+  Trash2,
+  Blocks
 } from 'lucide-react';
 import { DEFAULT_BOT_CONFIG, SharedBotConfig, useAuth } from '../../contexts/AuthContext';
 import { apiFetch } from '../../services/api';
 import { fetchDerivInstrumentsDirect } from '../../services/derivBrowserWs';
+import { BOT_XML_TEMPLATES, BotXmlTemplate } from '../../data/botXmlTemplates';
+import { DerivBlocklyWorkspace, extractBotSummaryFromXml } from '../../components/deriv/DerivBlocklyWorkspace';
+import { RealAccountConfirmModal } from '../../components/deriv/RealAccountConfirmModal';
 
 interface BotBuilderPageProps {
   onBotStarted: () => void;
   onOpenCharts?: () => void;
+  initialXmlTemplate?: BotXmlTemplate | null;
+  initialSymbol?: string;
 }
 
 interface BotStatusTelemetry {
   running: boolean;
+  paused?: boolean;
   symbol?: string;
   botName?: string;
   stake?: number;
@@ -39,6 +50,15 @@ interface BotStatusTelemetry {
   sessionPnl?: number;
   lastAction?: string;
   lastQuote?: number | null;
+}
+
+interface SavedWorkspace {
+  id: string;
+  name: string;
+  symbol: string;
+  strategy_type: string;
+  xml_content: string;
+  updated_at: string;
 }
 
 interface InstrumentOption {
@@ -101,8 +121,14 @@ const MARKET_GROUPS: Record<string, { label: string; subMarkets: Record<string, 
   }
 };
 
-export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, onOpenCharts }) => {
+export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({
+  onBotStarted,
+  onOpenCharts,
+  initialXmlTemplate,
+  initialSymbol
+}) => {
   const {
+    darkTheme,
     activeDerivAccount,
     botConfig,
     setBotConfig,
@@ -110,6 +136,15 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
     refreshDerivAccounts,
     refreshProfile
   } = useAuth();
+
+  const [builderMode, setBuilderMode] = useState<'blockly' | 'quick'>('blockly');
+  const [blocklyXml, setBlocklyXml] = useState<string>(() => initialXmlTemplate?.xml || BOT_XML_TEMPLATES[0]?.xml || '');
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
+    () => initialXmlTemplate?.id || BOT_XML_TEMPLATES[0]?.id || ''
+  );
+  const [savedWorkspaces, setSavedWorkspaces] = useState<SavedWorkspace[]>([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
+  const [confirmRealOpen, setConfirmRealOpen] = useState(false);
 
   const [instruments, setInstruments] = useState<InstrumentOption[]>([]);
   const [zoomPct, setZoomPct] = useState(100);
@@ -130,6 +165,40 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
     setHistory((prev) => [...prev.slice(-19), botConfig]);
     setRedoStack([]);
     setBotConfig((prev) => ({ ...prev, ...patch }));
+  };
+
+  const applyXmlSummaryToConfig = (xml: string, fallbackName?: string) => {
+    const summary = extractBotSummaryFromXml(xml);
+    setBotConfig((prev) => ({
+      ...prev,
+      botName: fallbackName || prev.botName,
+      ...(summary.symbol ? { symbol: summary.symbol } : {}),
+      ...(summary.stake ? { stake: Math.max(0.35, summary.stake) } : {}),
+      ...(summary.duration ? { duration: summary.duration } : {}),
+      ...(summary.durationUnit ? { durationUnit: summary.durationUnit } : {})
+    }));
+  };
+
+  useEffect(() => {
+    if (initialXmlTemplate) {
+      setBuilderMode('blockly');
+      setSelectedTemplateId(initialXmlTemplate.id);
+      setBlocklyXml(initialXmlTemplate.xml);
+      applyXmlSummaryToConfig(initialXmlTemplate.xml, initialXmlTemplate.name);
+      setXmlStatus(`Loaded Deriv Bot XML template: ${initialXmlTemplate.name}`);
+    }
+  }, [initialXmlTemplate]);
+
+  useEffect(() => {
+    if (initialSymbol) {
+      setBotConfig((prev) => ({ ...prev, symbol: initialSymbol }));
+    }
+  }, [initialSymbol]);
+
+  const loadWorkspaces = () => {
+    apiFetch<{ workspaces?: SavedWorkspace[] }>('/bots/workspaces')
+      .then((res) => setSavedWorkspaces(Array.isArray(res?.workspaces) ? res.workspaces : []))
+      .catch(() => {});
   };
 
   const handleUndo = () => {
@@ -163,6 +232,7 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
       .catch(() => {
         fetchDerivInstrumentsDirect().then((list) => setInstruments(Array.isArray(list) ? list : [])).catch(() => {});
       });
+    loadWorkspaces();
     refreshStatus();
     const id = setInterval(refreshStatus, 2500);
     return () => clearInterval(id);
@@ -175,6 +245,11 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
     const symMatch = text.match(/<field name="SYMBOL_LIST">([^<]+)<\/field>/i);
     const stakeMatch = text.match(/<field name="AMOUNT"[^>]*>([\d.]+)<\/field>/i);
     const predMatch = text.match(/<field name="PREDICTION"[^>]*>(\d)<\/field>/i);
+    if (text.includes('<xml')) {
+      setBlocklyXml(text);
+      setBuilderMode('blockly');
+      applyXmlSummaryToConfig(text, file.name.replace(/\.xml$/i, ''));
+    }
     patchConfig({
       botName: file.name.replace(/\.xml$/i, ''),
       ...(symMatch?.[1] ? { symbol: symMatch[1].trim() } : {}),
@@ -185,7 +260,10 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
   };
 
   const handleExportXml = () => {
-    const xml = `<xml xmlns="https://developers.google.com/blockly/xml">
+    const xml =
+      builderMode === 'blockly' && blocklyXml.trim()
+        ? blocklyXml
+        : `<xml xmlns="https://developers.google.com/blockly/xml">
   <block type="trade_definition">
     <field name="MARKET_LIST">${botConfig.marketGroup}</field>
     <field name="SUBMARKET_LIST">${botConfig.subMarket}</field>
@@ -213,27 +291,75 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
     setXmlStatus(`Exported ${botConfig.botName}.xml`);
   };
 
-  const handleRunBot = async () => {
+  const handleSaveCloudWorkspace = async () => {
+    setBusy(true);
+    setXmlStatus('');
+    try {
+      const xmlToSave =
+        blocklyXml.trim() ||
+        `<xml xmlns="https://developers.google.com/blockly/xml"><block type="trade_definition"></block></xml>`;
+      const res = await apiFetch<{ workspace: SavedWorkspace }>('/bots/workspaces', {
+        method: 'POST',
+        body: JSON.stringify({
+          id: activeWorkspaceId || undefined,
+          name: botConfig.botName || 'Custom Deriv Bot',
+          symbol: botConfig.symbol,
+          strategyType: builderMode,
+          xmlContent: xmlToSave,
+          configJson: botConfig
+        })
+      });
+      if (res?.workspace?.id) {
+        setActiveWorkspaceId(res.workspace.id);
+      }
+      loadWorkspaces();
+      setXmlStatus(`Saved workspace "${botConfig.botName}" to your PipFlowTrade cloud library.`);
+    } catch (err) {
+      setXmlStatus((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeleteWorkspace = async (id: string) => {
+    try {
+      await apiFetch(`/bots/workspaces/${id}`, { method: 'DELETE' });
+      if (activeWorkspaceId === id) setActiveWorkspaceId(null);
+      loadWorkspaces();
+    } catch (err) {
+      setXmlStatus((err as Error).message);
+    }
+  };
+
+  const handleRunBot = async (confirmRealTrading = false) => {
+    if (activeDerivAccount?.account_type === 'real' && !confirmRealTrading) {
+      setConfirmRealOpen(true);
+      return;
+    }
     setBusy(true);
     setRunningMsg('');
     try {
+      const xmlSummary = builderMode === 'blockly' ? extractBotSummaryFromXml(blocklyXml) : {};
       const effectiveContract =
-        botConfig.purchaseAction === 'Over'
-          ? 'DIGITOVER'
-          : botConfig.purchaseAction === 'Under'
-            ? 'DIGITUNDER'
-            : botConfig.purchaseAction === 'Even'
-              ? 'DIGITEVEN'
-              : botConfig.purchaseAction === 'Odd'
-                ? 'DIGITODD'
-                : botConfig.tradeType;
+        builderMode === 'blockly' && xmlSummary.contractType
+          ? xmlSummary.contractType
+          : botConfig.purchaseAction === 'Over'
+            ? 'DIGITOVER'
+            : botConfig.purchaseAction === 'Under'
+              ? 'DIGITUNDER'
+              : botConfig.purchaseAction === 'Even'
+                ? 'DIGITEVEN'
+                : botConfig.purchaseAction === 'Odd'
+                  ? 'DIGITODD'
+                  : botConfig.tradeType;
 
       const res = await apiFetch<BotStatusTelemetry>('/bots/run', {
         method: 'POST',
         body: JSON.stringify({
-          symbol: botConfig.symbol,
+          workspaceId: activeWorkspaceId,
+          symbol: xmlSummary.symbol || botConfig.symbol,
           botName: botConfig.botName,
-          stake: botConfig.stake,
+          stake: xmlSummary.stake || botConfig.stake,
           tpPct: botConfig.tpPct,
           slPct: botConfig.slPct,
           stopLossUsd: botConfig.stopLoss,
@@ -241,13 +367,15 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
           contractType: effectiveContract,
           barrier: botConfig.initialPrediction,
           recoveryPrediction: botConfig.recoveryPrediction,
-          duration: botConfig.duration,
-          durationUnit: botConfig.durationUnit,
+          duration: xmlSummary.duration || botConfig.duration,
+          durationUnit: xmlSummary.durationUnit || botConfig.durationUnit,
+          growthRate: xmlSummary.growthRate,
           martingale: botConfig.martingale,
-          useMartingale: botConfig.useMartingale,
+          useMartingale: effectiveContract === 'ACCU' ? false : botConfig.useMartingale,
           allowBulkPurchase: botConfig.allowBulkPurchase,
           bulkTradesCount: botConfig.bulkTradesCount,
           fastExecution,
+          confirmRealTrading,
           entryCondition: {
             enabled: botConfig.entrySignalMode,
             lookback: botConfig.conditionLookback,
@@ -260,12 +388,26 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
       });
       setStatus(res);
       setRunningMsg(
-        `Instant execution active: "${botConfig.botName}" (${effectiveContract}) on ${botConfig.symbol}${
+        `Instant execution active: "${botConfig.botName}" (${effectiveContract}) on ${xmlSummary.symbol || botConfig.symbol}${
           activeDerivAccount ? ` · ${activeDerivAccount.account_type.toUpperCase()} Account` : ''
         }.`
       );
       onBotStarted();
       refreshDerivAccounts(false);
+    } catch (err) {
+      setRunningMsg((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handlePauseResumeBot = async () => {
+    setBusy(true);
+    try {
+      const endpoint = status.paused ? '/bots/resume' : '/bots/pause';
+      const res = await apiFetch<BotStatusTelemetry>(endpoint, { method: 'POST' });
+      setStatus(res);
+      setRunningMsg(res.paused ? 'Bot paused — pending ticks ignored.' : 'Bot resumed.');
     } catch (err) {
       setRunningMsg((err as Error).message);
     } finally {
@@ -279,6 +421,28 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
       await apiFetch('/bots/stop', { method: 'POST' });
       setStatus({ running: false });
       setRunningMsg('Bot stopped cleanly.');
+    } catch (err) {
+      setRunningMsg((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleEmergencyStop = async () => {
+    setBusy(true);
+    try {
+      const res = await apiFetch<{ closedCount: number; totalPnl: number }>('/bots/emergency-stop', {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      setStatus({ running: false });
+      setRunningMsg(
+        `Emergency stop executed: closed ${res.closedCount} trade(s) · Net P/L: ${
+          res.totalPnl >= 0 ? '+' : ''
+        }${res.totalPnl.toFixed(2)} USD`
+      );
+      refreshDerivAccounts(false);
+      refreshProfile();
     } catch (err) {
       setRunningMsg((err as Error).message);
     } finally {
@@ -446,20 +610,55 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
           className="space-y-4 max-w-4xl origin-top-left transition-transform"
           style={{ transform: zoomPct !== 100 ? `scale(${zoomPct / 100})` : undefined }}
         >
-          {/* Top Bar: Emerald AI Bot Generator + Live Control Chips */}
+          {/* Top Bar: Builder Mode Switcher + Emerald AI Bot Generator + Live Control Chips */}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900 p-0.5 text-xs font-bold">
+                <button
+                  type="button"
+                  onClick={() => setBuilderMode('blockly')}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md transition ${
+                    builderMode === 'blockly'
+                      ? 'bg-[#0a2351] text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <Blocks className="w-3.5 h-3.5" />
+                  <span>Blockly Visual</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBuilderMode('quick')}
+                  className={`px-3 py-1.5 rounded-md transition ${
+                    builderMode === 'quick'
+                      ? 'bg-[#0a2351] text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  Quick Strategy
+                </button>
+              </div>
+
               <button
                 type="button"
                 onClick={() => setAiModalOpen(true)}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-[#00a884] hover:bg-[#008f70] text-white text-xs sm:text-sm font-bold shadow-xs transition"
+                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-md bg-[#00a884] hover:bg-[#008f70] text-white text-xs font-bold shadow-xs transition"
               >
                 <Sparkles className="w-4 h-4" />
                 <span>AI Bot Generator</span>
               </button>
 
               {status.running ? (
-                <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handlePauseResumeBot}
+                    className="inline-flex items-center gap-1 px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold"
+                  >
+                    {status.paused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                    <span>{status.paused ? 'Resume' : 'Pause'}</span>
+                  </button>
                   <button
                     type="button"
                     disabled={busy}
@@ -472,8 +671,17 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
                   <button
                     type="button"
                     disabled={busy}
-                    onClick={handleCloseAllBotTrades}
+                    onClick={handleEmergencyStop}
                     className="inline-flex items-center gap-1 px-3 py-2 rounded-md bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold"
+                  >
+                    <ShieldAlert className="w-3.5 h-3.5" />
+                    <span>Emergency Stop</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handleCloseAllBotTrades}
+                    className="inline-flex items-center gap-1 px-3 py-2 rounded-md bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold"
                   >
                     <XCircle className="w-3.5 h-3.5" />
                     <span>Close Trades</span>
@@ -483,7 +691,7 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={handleRunBot}
+                  onClick={() => handleRunBot(false)}
                   className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md bg-[#0f4c64] hover:bg-[#0b3a4d] text-white text-xs font-bold"
                 >
                   <Play className="w-3.5 h-3.5 fill-current" />
@@ -493,7 +701,15 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
             </div>
 
             <div className="flex items-center gap-2 text-[11px] text-slate-500 font-mono">
-              <span>Zoom: {zoomPct}%</span>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={handleSaveCloudWorkspace}
+                className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 py-1 text-[11px] font-sans font-bold text-slate-700 dark:text-slate-200 hover:bg-slate-100"
+              >
+                <Cloud className="w-3.5 h-3.5 text-sky-500" />
+                <span>Save Cloud</span>
+              </button>
               <input
                 value={botConfig.botName}
                 onChange={(e) => patchConfig({ botName: e.target.value })}
@@ -508,7 +724,7 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
             <div className="rounded-lg border border-emerald-300 dark:border-emerald-800 bg-emerald-50/80 dark:bg-emerald-950/30 px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
               <div className="flex flex-wrap items-center gap-3 font-mono tabular-nums">
                 <span className="font-sans font-bold text-emerald-700 dark:text-emerald-300">
-                  ● RUNNING: {status.botName} ({status.symbol})
+                  ● {status.paused ? 'PAUSED' : 'RUNNING'}: {status.botName} ({status.symbol})
                 </span>
                 <span>Stake: ${Number(status.currentStake ?? botConfig.stake).toFixed(2)}</span>
                 <span>Trades: {status.tradesCount ?? 0}</span>
@@ -533,6 +749,83 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
             </div>
           )}
 
+          {builderMode === 'blockly' && (
+            <div className="space-y-3">
+              {/* XML Template Picker + Cloud Saved Workspaces Strip */}
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-bold text-slate-700 dark:text-slate-200">17 Deriv XML Templates:</span>
+                  <select
+                    value={selectedTemplateId}
+                    onChange={(e) => {
+                      const tpl = BOT_XML_TEMPLATES.find((t) => t.id === e.target.value);
+                      if (tpl) {
+                        setSelectedTemplateId(tpl.id);
+                        setBlocklyXml(tpl.xml);
+                        setActiveWorkspaceId(null);
+                        applyXmlSummaryToConfig(tpl.xml, tpl.name);
+                        setXmlStatus(`Loaded template "${tpl.name}" (${tpl.category})`);
+                      }
+                    }}
+                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 font-semibold max-w-[260px]"
+                  >
+                    {BOT_XML_TEMPLATES.map((tpl) => (
+                      <option key={tpl.id} value={tpl.id}>
+                        [{tpl.category}] {tpl.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {savedWorkspaces.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] text-slate-500 font-semibold">Saved Cloud Bots:</span>
+                    {savedWorkspaces.slice(0, 5).map((ws) => (
+                      <div
+                        key={ws.id}
+                        className={`inline-flex items-center rounded-lg border text-[11px] font-bold ${
+                          activeWorkspaceId === ws.id
+                            ? 'border-blue-600 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-sky-300'
+                            : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveWorkspaceId(ws.id);
+                            setBlocklyXml(ws.xml_content);
+                            applyXmlSummaryToConfig(ws.xml_content, ws.name);
+                            setXmlStatus(`Loaded cloud workspace "${ws.name}"`);
+                          }}
+                          className="px-2 py-1"
+                        >
+                          {ws.name}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteWorkspace(ws.id)}
+                          aria-label={`Delete ${ws.name}`}
+                          className="px-1.5 py-1 text-slate-400 hover:text-rose-500"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <DerivBlocklyWorkspace
+                xmlContent={blocklyXml}
+                onXmlChange={setBlocklyXml}
+                darkTheme={darkTheme}
+                heightClass="h-[540px]"
+              />
+            </div>
+          )}
+
+          {builderMode === 'quick' && (
+            <>
           {/* =====================================================================
               BLOCK 1: Dark-Teal (#0f4c64) "1. Trade parameters" Blockly Structure
               ===================================================================== */}
@@ -1129,6 +1422,8 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
               </div>
             </div>
           </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -1316,6 +1611,18 @@ export const BotBuilderPage: React.FC<BotBuilderPageProps> = ({ onBotStarted, on
           </div>
         </div>
       )}
+      <RealAccountConfirmModal
+        open={confirmRealOpen}
+        account={activeDerivAccount}
+        botName={botConfig.botName}
+        symbol={botConfig.symbol}
+        stake={botConfig.stake}
+        onCancel={() => setConfirmRealOpen(false)}
+        onConfirm={() => {
+          setConfirmRealOpen(false);
+          void handleRunBot(true);
+        }}
+      />
     </div>
   );
 };

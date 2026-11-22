@@ -12,6 +12,7 @@
 - **Token Security**: Owner-authorized read-only Deriv tokens are encrypted at rest with AES-256-GCM (`TOKEN_ENCRYPTION_KEY`) and are never returned to the frontend, logged, or exposed to administrators.
 
 ## 3. Administration Layer
-- Accessible via **10 consecutive clicks** on the `pipflow.site` logo OR via the private administrator URL (`/#/admin-${VITE_ADMIN_PRIVATE_SLUG}`).
-- Protected by server-side JWT + database `admin` role verification.
-- Logs all administrative actions (branding updates, global settings, virtual balance adjustments, bot password updates, announcements) in `administrator_audit_logs`.
+- Accessible via **20 consecutive clicks/taps** on the `PipflowLogo` button (any outside tap, timeout >2.5s, or interruption resets the counter) routing to `/_console`.
+- Protected by server-side JWT + PostgreSQL `users` (`role = 'admin'`) verification with zero hardcoded client credentials or `VITE_*` admin slugs.
+- Logs all administrative actions (branding updates, global settings, virtual balance adjustments, bot settings, announcements) in `administrator_audit_logs`.
+

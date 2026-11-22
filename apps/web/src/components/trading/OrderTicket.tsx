@@ -20,6 +20,7 @@ export interface VirtualOrderItem {
   deriv_contract_id?: number | null;
   execution_mode?: string | null;
   contract_type?: string | null;
+  payout?: number | null;
   opened_at?: string;
   closed_at?: string | null;
 }

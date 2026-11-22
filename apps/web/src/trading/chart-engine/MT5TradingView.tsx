@@ -39,6 +39,13 @@ interface MT5TradingViewProps {
   livePricesMap?: Record<string, number>;
   onSymbolChange?: (symbol: string) => void;
   onWatchSymbolsChange?: (symbols: string[]) => void;
+  presetSetup?: {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    sl: number;
+    tp: number;
+    key: number;
+  } | null;
 }
 
 interface LiveContractSnapshot {
@@ -54,7 +61,8 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
   liveTick,
   livePricesMap = {},
   onSymbolChange,
-  onWatchSymbolsChange
+  onWatchSymbolsChange,
+  presetSetup
 }) => {
   const {
     token,
@@ -147,6 +155,27 @@ export const MT5TradingView: React.FC<MT5TradingViewProps> = ({
       setSymbol(symbolProp);
     }
   }, [symbolProp]);
+
+  useEffect(() => {
+    if (!presetSetup) return;
+    setSymbol(presetSetup.symbol);
+    onSymbolChange?.(presetSetup.symbol);
+    setOrderMode('MT5');
+    setPreviewSide(presetSetup.side);
+    if (presetSetup.sl > 0) {
+      setSlEnabled(true);
+      setSlUnit('Price');
+      setSlInput(String(presetSetup.sl));
+    }
+    if (presetSetup.tp > 0) {
+      setTpEnabled(true);
+      setTpUnit('Price');
+      setTpInput(String(presetSetup.tp));
+    }
+    setOrderNotice(
+      `Loaded ${presetSetup.side} trade setup on ${presetSetup.symbol} · SL ${presetSetup.sl} / TP ${presetSetup.tp}`
+    );
+  }, [presetSetup?.key]);
 
   const selectSymbol = (sym: string) => {
     setSymbol(sym);

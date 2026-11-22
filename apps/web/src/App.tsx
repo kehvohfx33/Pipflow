@@ -17,6 +17,18 @@ import { ChartsPage } from './pages/Charts/ChartsPage';
 import { ReportsPage } from './pages/History/ReportsPage';
 import { LearningPage } from './pages/Learning/LearningPage';
 import { NotificationsPage } from './pages/Notifications/NotificationsPage';
+import { MarketsPage } from './pages/Markets/MarketsPage';
+import { RiseFallPage } from './pages/Trading/RiseFallPage';
+import { DigitsPage } from './pages/Trading/DigitsPage';
+import { AccumulatorsPage } from './pages/Trading/AccumulatorsPage';
+import { SignalsPage } from './pages/Trading/SignalsPage';
+import { AutomatedBotsPage } from './pages/Trading/AutomatedBotsPage';
+import { WalletsPage } from './pages/Wallet/WalletsPage';
+import { PortfolioPage } from './pages/Trading/PortfolioPage';
+import { AnalyticsPage } from './pages/Trading/AnalyticsPage';
+import { SettingsPage } from './pages/Settings/SettingsPage';
+import { RealAccountConfirmModal } from './components/deriv/RealAccountConfirmModal';
+import { BotXmlTemplate } from './data/botXmlTemplates';
 import { MT5TradingView } from './trading/chart-engine/MT5TradingView';
 import { AdminDashboard } from './admin/AdminDashboard';
 import { apiFetch } from './services/api';
@@ -91,10 +103,25 @@ const ResetPasswordRoute: React.FC = () => {
 };
 
 const SEO_PATH_TO_TAB: Record<string, string> = {
+  '/markets': 'markets',
+  '/trader': 'trading_view',
+  '/rise-fall': 'rise_fall',
+  '/digits': 'digits',
+  '/accumulators': 'accumulators',
   '/charts': 'charts',
+  '/bot-builder': 'bot_builder',
+  '/freebots': 'freebots',
   '/trading-view': 'trading_view',
   '/bots': 'freebots',
   '/analysis': 'analysistool',
+  '/signals': 'signals',
+  '/automated-bots': 'automated_bots',
+  '/wallets': 'wallets',
+  '/portfolio': 'portfolio',
+  '/reports': 'reports',
+  '/analytics': 'analytics',
+  '/notifications': 'notifications',
+  '/settings': 'settings',
   '/learning': 'learning'
 };
 
@@ -103,8 +130,6 @@ const MainWorkspace: React.FC = () => {
     token,
     user,
     activeDerivAccount,
-    botGateUnlocked,
-    setBotGateUnlocked,
     globalSettings,
     botConfig,
     fastExecution,
@@ -129,6 +154,15 @@ const MainWorkspace: React.FC = () => {
   const [activeSymbol, setActiveSymbolState] = useState(() => localStorage.getItem('pipflow_active_symbol') || 'R_25');
   const [watchSymbols, setWatchSymbols] = useState<string[]>([]);
   const [botRunning, setBotRunning] = useState(false);
+  const [confirmRealFooterOpen, setConfirmRealFooterOpen] = useState(false);
+  const [selectedXmlTemplate, setSelectedXmlTemplate] = useState<BotXmlTemplate | null>(null);
+  const [presetSetup, setPresetSetup] = useState<{
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    sl: number;
+    tp: number;
+    key: number;
+  } | null>(null);
 
   const setActiveTab = (tab: string) => {
     setActiveTabState(tab);
@@ -270,12 +304,12 @@ const MainWorkspace: React.FC = () => {
   }, [suspendedCount, logout]);
 
   useEffect(() => {
-    if (token && botGateUnlocked) {
+    if (token) {
       apiFetch<{ running: boolean }>('/bots/status', {}, true)
         .then((res) => setBotRunning(res.running))
         .catch(() => {});
     }
-  }, [token, botGateUnlocked]);
+  }, [token]);
 
   if (booting || oauthExchanging) {
     return <SplashScreen />;
@@ -309,74 +343,81 @@ const MainWorkspace: React.FC = () => {
     );
   }
 
+  const startFooterBot = async (confirmRealTrading = false) => {
+    const effectiveContract =
+      botConfig.purchaseAction === 'Over'
+        ? 'DIGITOVER'
+        : botConfig.purchaseAction === 'Under'
+          ? 'DIGITUNDER'
+          : botConfig.purchaseAction === 'Even'
+            ? 'DIGITEVEN'
+            : botConfig.purchaseAction === 'Odd'
+              ? 'DIGITODD'
+              : botConfig.tradeType;
+
+    await apiFetch(
+      '/bots/run',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          symbol: botConfig.symbol,
+          botName: botConfig.botName,
+          stake: botConfig.stake,
+          tpPct: botConfig.tpPct,
+          slPct: botConfig.slPct,
+          stopLossUsd: botConfig.stopLoss,
+          maxWins: botConfig.numberOfWins,
+          contractType: effectiveContract,
+          barrier: botConfig.initialPrediction,
+          recoveryPrediction: botConfig.recoveryPrediction,
+          duration: botConfig.duration,
+          durationUnit: botConfig.durationUnit,
+          martingale: botConfig.martingale,
+          useMartingale: botConfig.useMartingale,
+          allowBulkPurchase: botConfig.allowBulkPurchase,
+          bulkTradesCount: botConfig.bulkTradesCount,
+          fastExecution,
+          confirmRealTrading,
+          entryCondition: {
+            enabled: botConfig.entrySignalMode,
+            lookback: botConfig.conditionLookback,
+            comparator: botConfig.conditionComparator,
+            digit: botConfig.conditionDigit,
+            tradeEachTick: botConfig.tradeEachTick
+          },
+          connectedAccountId: activeDerivAccount?.id ?? null
+        })
+      },
+      true
+    );
+    setBotRunning(true);
+  };
+
   const handleToggleBot = async () => {
     if (!token) {
       setPublicMode(false);
-      return;
-    }
-    if (!botGateUnlocked) {
-      setActiveTab('freebots');
       return;
     }
     if (botRunning) {
       await apiFetch('/bots/stop', { method: 'POST' }, true);
       setBotRunning(false);
     } else {
+      if (activeDerivAccount?.account_type === 'real') {
+        setConfirmRealFooterOpen(true);
+        return;
+      }
       try {
-        const effectiveContract =
-          botConfig.purchaseAction === 'Over'
-            ? 'DIGITOVER'
-            : botConfig.purchaseAction === 'Under'
-              ? 'DIGITUNDER'
-              : botConfig.purchaseAction === 'Even'
-                ? 'DIGITEVEN'
-                : botConfig.purchaseAction === 'Odd'
-                  ? 'DIGITODD'
-                  : botConfig.tradeType;
-
-        await apiFetch(
-          '/bots/run',
-          {
-            method: 'POST',
-            body: JSON.stringify({
-              symbol: botConfig.symbol,
-              botName: botConfig.botName,
-              stake: botConfig.stake,
-              tpPct: botConfig.tpPct,
-              slPct: botConfig.slPct,
-              stopLossUsd: botConfig.stopLoss,
-              maxWins: botConfig.numberOfWins,
-              contractType: effectiveContract,
-              barrier: botConfig.initialPrediction,
-              recoveryPrediction: botConfig.recoveryPrediction,
-              duration: botConfig.duration,
-              durationUnit: botConfig.durationUnit,
-              martingale: botConfig.martingale,
-              useMartingale: botConfig.useMartingale,
-              allowBulkPurchase: botConfig.allowBulkPurchase,
-              bulkTradesCount: botConfig.bulkTradesCount,
-              fastExecution,
-              entryCondition: {
-                enabled: botConfig.entrySignalMode,
-                lookback: botConfig.conditionLookback,
-                comparator: botConfig.conditionComparator,
-                digit: botConfig.conditionDigit,
-                tradeEachTick: botConfig.tradeEachTick
-              },
-              connectedAccountId: activeDerivAccount?.id ?? null
-            })
-          },
-          true
-        );
-        setBotRunning(true);
-      } catch (err) {
-        if ((err as { code?: string }).code === 'BOT_GATE_LOCKED') {
-          localStorage.removeItem('pipflow_bot_gate');
-          setBotGateUnlocked(false);
-          setActiveTab('freebots');
-        }
+        await startFooterBot(false);
+      } catch {
+        // Error surfaced in status telemetry
       }
     }
+  };
+
+  const handleSendSetupToTrader = (sym: string, side: 'BUY' | 'SELL', sl: number, tp: number) => {
+    setActiveSymbol(sym);
+    setPresetSetup({ symbol: sym, side, sl, tp, key: Date.now() });
+    setActiveTab('trading_view');
   };
 
   return (
@@ -388,10 +429,47 @@ const MainWorkspace: React.FC = () => {
       onBackToLanding={() => setPublicMode(false)}
     >
       {activeTab === 'dashboard' && <DashboardPage onSelectTab={setActiveTab} />}
-      {activeTab === 'bot_builder' && (
-        <BotBuilderPage
-          onBotStarted={() => setBotRunning(true)}
-          onOpenCharts={() => setActiveTab('charts')}
+      {activeTab === 'markets' && (
+        <MarketsPage
+          livePricesMap={livePricesMap}
+          ticksBySymbol={ticksBySymbol}
+          onOpenSymbolIn={(tab, sym) => {
+            setActiveSymbol(sym);
+            setActiveTab(tab);
+          }}
+        />
+      )}
+      {activeTab === 'trading_view' && (
+        <MT5TradingView
+          symbol={activeSymbol}
+          liveTick={ticksBySymbol[activeSymbol] ?? null}
+          livePricesMap={livePricesMap}
+          onSymbolChange={setActiveSymbol}
+          onWatchSymbolsChange={setWatchSymbols}
+          presetSetup={presetSetup}
+        />
+      )}
+      {activeTab === 'rise_fall' && (
+        <RiseFallPage
+          symbol={activeSymbol}
+          onSymbolChange={setActiveSymbol}
+          liveTick={ticksBySymbol[activeSymbol] ?? null}
+          livePricesMap={livePricesMap}
+        />
+      )}
+      {activeTab === 'digits' && (
+        <DigitsPage
+          symbol={activeSymbol}
+          onSymbolChange={setActiveSymbol}
+          livePricesMap={livePricesMap}
+        />
+      )}
+      {activeTab === 'accumulators' && (
+        <AccumulatorsPage
+          symbol={activeSymbol}
+          onSymbolChange={setActiveSymbol}
+          liveTick={ticksBySymbol[activeSymbol] ?? null}
+          livePricesMap={livePricesMap}
         />
       )}
       {activeTab === 'charts' && (
@@ -403,10 +481,50 @@ const MainWorkspace: React.FC = () => {
           onOpenTradingView={() => setActiveTab('trading_view')}
         />
       )}
-      {activeTab === 'freebots' && <TradingBotsPage onBotStarted={() => setBotRunning(true)} />}
-      {activeTab === 'bulk_trader' && <BulkTraderPage />}
-      {activeTab === 'analysistool' && <AnalysisToolPage />}
+      {activeTab === 'bot_builder' && (
+        <BotBuilderPage
+          onBotStarted={() => setBotRunning(true)}
+          onOpenCharts={() => setActiveTab('charts')}
+          initialXmlTemplate={selectedXmlTemplate}
+          initialSymbol={activeSymbol}
+        />
+      )}
+      {activeTab === 'freebots' && (
+        <TradingBotsPage
+          onBotStarted={() => setBotRunning(true)}
+          onOpenXmlInBuilder={(tpl) => {
+            setSelectedXmlTemplate(tpl);
+            setActiveTab('bot_builder');
+          }}
+        />
+      )}
+      {activeTab === 'analysistool' && (
+        <AnalysisToolPage
+          initialSymbol={activeSymbol}
+          onSendSetupToTrader={handleSendSetupToTrader}
+        />
+      )}
+      {activeTab === 'signals' && (
+        <SignalsPage
+          onSendToTrader={handleSendSetupToTrader}
+          onOpenChart={(sym) => {
+            setActiveSymbol(sym);
+            setActiveTab('charts');
+          }}
+        />
+      )}
+      {activeTab === 'automated_bots' && (
+        <AutomatedBotsPage
+          onGoToBuilder={() => setActiveTab('bot_builder')}
+        />
+      )}
+      {activeTab === 'wallets' && <WalletsPage />}
+      {activeTab === 'portfolio' && <PortfolioPage livePricesMap={livePricesMap} />}
       {activeTab === 'reports' && <ReportsPage />}
+      {activeTab === 'analytics' && <AnalyticsPage />}
+      {activeTab === 'notifications' && <NotificationsPage />}
+      {activeTab === 'settings' && <SettingsPage />}
+      {activeTab === 'bulk_trader' && <BulkTraderPage />}
       {activeTab === 'trading_plan' && <RiskCalculatorPage />}
       {activeTab === 'copy_trading' && <CopyTradingPage />}
       {activeTab === 'dtrader' && (
@@ -418,17 +536,20 @@ const MainWorkspace: React.FC = () => {
           onOpenTradingView={() => setActiveTab('trading_view')}
         />
       )}
-      {activeTab === 'trading_view' && (
-        <MT5TradingView
-          symbol={activeSymbol}
-          liveTick={ticksBySymbol[activeSymbol] ?? null}
-          livePricesMap={livePricesMap}
-          onSymbolChange={setActiveSymbol}
-          onWatchSymbolsChange={setWatchSymbols}
-        />
-      )}
       {activeTab === 'learning' && <LearningPage />}
-      {activeTab === 'notifications' && <NotificationsPage />}
+
+      <RealAccountConfirmModal
+        open={confirmRealFooterOpen}
+        account={activeDerivAccount}
+        botName={botConfig.botName}
+        symbol={botConfig.symbol}
+        stake={botConfig.stake}
+        onCancel={() => setConfirmRealFooterOpen(false)}
+        onConfirm={() => {
+          setConfirmRealFooterOpen(false);
+          void startFooterBot(true);
+        }}
+      />
     </WorkspaceLayout>
   );
 };
